@@ -1,0 +1,182 @@
+# gdocs-mode
+
+Bidirectional sync between local Org mode buffers and remote Google Docs
+documents.
+
+A Google Doc opens as a local `.org` buffer; edits made locally can be pushed
+back, and remote changes are detected and pulled automatically. The goal is to
+give Org users the same editing experience for Google Docs that they already
+have for local files.
+
+> **Status: experimental.** Pull, push, and auto-sync all work end-to-end, but
+> the write path currently depends on browser session cookies rather than
+> OAuth (see [Authentication](#authentication)). Treat this as a working
+> prototype, not a hardened tool.
+
+## Features
+
+- **Pull** — fetches the current remote content and rewrites the local buffer.
+  Headings, paragraphs, bold/italic/code spans, bullet and numbered lists,
+  tables, and code blocks convert to their Org equivalents.
+- **Push** — converts the local Org buffer back to Google Docs format and
+  writes it remotely. Sections that existed before the last pull are updated in
+  place; new sections are appended. A push is refused if the remote document
+  changed since the last pull, so concurrent edits are never silently
+  overwritten.
+- **Auto-sync** — an idle timer polls the remote revision. If the remote
+  advanced and the local buffer is clean, it pulls automatically; if both sides
+  changed, it surfaces a one-shot conflict warning and takes no action.
+- **Org link interception** — opening a `docs.google.com/document/d/...` link
+  in Org opens it through `gdocs-mode` instead of the browser.
+
+## Requirements
+
+- Emacs **29.1+** (uses the built-in `sqlite-*` API for the cookie backend).
+- [`request`](https://github.com/tkf/emacs-request) **0.3.2+**.
+
+## Installation
+
+Clone the repository and point `use-package` at it:
+
+```elisp
+(use-package gdocs-mode
+  :load-path "~/path/to/gdocs-mode/"
+  :config
+  (setq gdocs-auth-function #'my/gdocs/firefox-cookies)) ; see Authentication
+```
+
+If you use [`elpaca`](https://github.com/progfolio/elpaca) or
+[`straight.el`](https://github.com/radian-software/straight.el), install
+directly from Git:
+
+```elisp
+;; elpaca
+(use-package gdocs-mode
+  :ensure (:host github :repo "vleonbonnet/gdocs-mode"))
+
+;; straight
+(use-package gdocs-mode
+  :straight (gdocs-mode :host github :repo "vleonbonnet/gdocs-mode"))
+```
+
+## Authentication
+
+The mode never talks to Google directly about credentials. Instead,
+`gdocs-auth-function` holds a function of no arguments that returns an alist of
+HTTP headers to attach to every request. It is called fresh on every request,
+so backends may compute timestamp-sensitive headers inside it. Two header
+shapes are recognised:
+
+| Backend                  | Returned alist                              |
+|--------------------------|---------------------------------------------|
+| Cookie (browser session) | `(("Cookie" . "SID=…; HSID=…; SSID=…; …"))` |
+| OAuth2                   | `(("Authorization" . "Bearer ya29…"))`      |
+
+The cookie backend works for both read and write. OAuth bearer tokens currently
+work only against the read-side REST API — the `/save` (push) endpoint still
+requires cookie auth that matches a real browser request. Wiring the documented
+OAuth `documents.batchUpdate` endpoint to remove the cookie dependency on push
+is the main piece of remaining work.
+
+### Bootstrap backend: Firefox cookies
+
+The quickest way to exercise the mode end-to-end is to derive a session from a
+logged-in Firefox profile. This reads `cookies.sqlite` directly via Emacs's
+built-in `sqlite-open`. It is a **development-tier mechanism** — no secrets
+manager, no rotation, no logout detection — and should not be used in shared or
+multi-user setups.
+
+```elisp
+(defun my/gdocs/firefox-cookies ()
+  "Return google.com cookies from Firefox as a Cookie header alist."
+  (let ((src (expand-file-name
+              ;; Adjust the profile path to your platform / profile id:
+              ;;   macOS:   ~/Library/Application Support/Firefox/Profiles/<id>.default-release/
+              ;;   Linux:   ~/.mozilla/firefox/<id>.default-release/
+              ;;   Windows: %APPDATA%/Mozilla/Firefox/Profiles/<id>.default-release/
+              "~/Library/Application Support/Firefox/Profiles/XXXXXXXX.default-release/cookies.sqlite"))
+        ;; Firefox holds an exclusive lock on the live DB, so work off a copy.
+        (tmp (make-temp-file "gdocs-cookies" nil ".sqlite"))
+        db rows cookies)
+    (unwind-protect
+        (progn
+          (copy-file src tmp t)
+          (setq db (sqlite-open tmp))
+          ;; Order DESC so the preferred host's row is visited last and wins.
+          (setq rows (sqlite-select
+                      db
+                      (concat "SELECT name, value, host FROM moz_cookies "
+                              "WHERE host LIKE '%google.com' "
+                              "ORDER BY CASE "
+                              "  WHEN host = 'docs.google.com' OR host = '.docs.google.com' THEN 1 "
+                              "  WHEN host = '.google.com' THEN 2 ELSE 3 END DESC")))
+          (sqlite-close db)
+          (setq db nil)
+          (dolist (row rows)
+            (setf (alist-get (car row) cookies nil nil #'equal) (cadr row)))
+          (list (cons "Cookie"
+                      (mapconcat (lambda (c) (format "%s=%s" (car c) (cdr c)))
+                                 cookies "; "))))
+      (when db (ignore-errors (sqlite-close db)))
+      (ignore-errors (delete-file tmp)))))
+```
+
+When the same cookie name appears for multiple hosts, `docs.google.com` wins
+over `.google.com`, mirroring the host priority the browser uses so that
+`SAPISID`/`SID` resolution matches what Firefox sends.
+
+For anything beyond local experimentation, write your own
+`gdocs-auth-function` that pulls credentials from a password manager, the macOS
+Keychain, or an OAuth refresh-token flow.
+
+## Usage
+
+| Command               | What it does                                                   |
+|-----------------------|----------------------------------------------------------------|
+| `gdocs-open`          | Open a Google Docs URL or document ID (or the link at point).  |
+| `gdocs-pull-locally`  | Fetch remote content and rewrite the local buffer.             |
+| `gdocs-push-remotely` | Push local Org changes back to the remote document.            |
+| `gdocs-out-of-date`   | Check whether the remote document has advanced.                |
+| `gdocs-mode`          | The Org minor mode that ties pull/push/auto-sync together.     |
+
+Open a document with `M-x gdocs-open` and paste the URL or document ID. The
+mode opens (or reuses) a local `.org` buffer named after the document title and
+performs an initial pull. `gdocs-mode` auto-enables in any Org buffer that
+carries a `GDOC_ID` property, and the mode line shows an indicator while it is
+active.
+
+### Buffer metadata
+
+These properties are maintained on the top-level node of every synced buffer:
+
+| Property         | Purpose                                       |
+|------------------|-----------------------------------------------|
+| `GDOC_ID`        | Identifies the remote document.               |
+| `GDOC_REVISION`  | Staleness anchor — last known remote revision.|
+| `GDOC_SYNCED_AT` | Timestamp of the last successful pull or push.|
+
+## Configuration
+
+| Variable                  | Default     | Purpose                                                  |
+|---------------------------|-------------|----------------------------------------------------------|
+| `gdocs-auth-function`     | `nil`       | Returns the HTTP auth headers (see above). **Required.** |
+| `gdocs-push-backend`      | `ot-encode` | Push strategy. `ot-encode` preserves structure/styling.  |
+| `gdocs-auto-sync-interval`| `5`         | Idle seconds between background pull checks.             |
+| `gdocs-log-level`         | `warn`      | One of `debug`, `info`, `warn`, `error`.                |
+| `gdocs-session-file`      | XDG cache   | Where the persistent `/save` SID + request id are kept. |
+
+## Caveats
+
+- **Cookie-only push.** The write path matches a real browser request and
+  depends on a live Firefox/OAuth session; there is no hardened credential
+  story yet.
+- **Format fidelity is best-effort.** Headings, paragraphs, inline emphasis,
+  lists, tables, and code blocks round-trip. Docs-specific features with no Org
+  equivalent (comments, suggestions, column layouts) are out of scope.
+- **Rate limiting.** Google's `/save` endpoint rejects malformed or
+  excessively bursty requests; the mode persists a session SID to look like a
+  single stable client.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
