@@ -8,10 +8,8 @@ back, and remote changes are detected and pulled automatically. The goal is to
 give Org users the same editing experience for Google Docs that they already
 have for local files.
 
-> **Status: experimental.** Pull, push, and auto-sync all work end-to-end, but
-> the write path currently depends on browser session cookies rather than
-> OAuth (see [Authentication](#authentication)). Treat this as a working
-> prototype, not a hardened tool.
+**Note:** this is still work in progress and some rich content of do not
+properly properly sync.
 
 ## Features
 
@@ -176,7 +174,3 @@ These properties are maintained on the top-level node of every synced buffer:
 - **Rate limiting.** Google's `/save` endpoint rejects malformed or
   excessively bursty requests; the mode persists a session SID to look like a
   single stable client.
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
