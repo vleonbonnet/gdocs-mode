@@ -115,6 +115,23 @@ duplicating OT positions in every fixture."
     `((ty . "as") (st . "text") (si . ,si) (ei . ,ei)
       (sm . ,(gdocs-test--style-modifier (plist-get range :styles))))))
 
+(defun gdocs-test--link-range-op (body text url &optional occurrence)
+  "Construct an `as st=link' op covering TEXT in BODY.
+The nested modifier intentionally mirrors the shape observed in modelChunk
+streams, including `lnks_link.ulnk_url'."
+  (let* ((start (gdocs-test--occurrence-start body text occurrence))
+         (si (1+ start))
+         (ei (+ si (length text) -1)))
+    `((ty . "as") (st . "link") (si . ,si) (ei . ,ei)
+      (sm . ((lnks_link . ((lnk_type . 0)
+                           (ulnk_url . ,url))))))))
+
+(defun gdocs-test--link-unset-op (si ei)
+  "Construct an explicit nested `ulnk_url' unset link op."
+  `((ty . "as") (st . "link") (si . ,si) (ei . ,ei)
+    (sm . ((lnks_link . ((lnk_type . 0)
+                         (ulnk_url . :json-false)))))))
+
 (defun gdocs-test--line-end-pos (body line)
   "Return the one-based OT position of LINE's terminating newline."
   (let ((from 0) (idx nil))
@@ -523,6 +540,145 @@ END is the inclusive final OT position."
     (should (equal (concat (gdocs-dm-runs-text runs) "\n")
                    (plist-get fixture :plain-text)))
     (should (equal (gdocs-dm-to-org doc) (plist-get fixture :org-text)))))
+
+(ert-deftest gdocs-test-pull-link-ranges-preserve-boundaries-and-unsets ()
+  "Link ranges split runs at destination changes and explicit unsets."
+  (let* ((body "one two three\n")
+         (ops (list (gdocs-test--insert-op body)
+                    (gdocs-test--link-range-op body "one"
+                                               "https://one.example")
+                    (gdocs-test--link-range-op body "two"
+                                               "https://two.example")
+                    ;; Remove the final two characters of the second link.
+                    (gdocs-test--link-unset-op 6 7)))
+         (doc (gdocs-dm-from-ops nil nil nil body ops))
+         (runs (plist-get (car (gdocs-dm-paragraphs doc)) :runs)))
+    (should (equal (mapcar #'gdocs-test--run-view runs)
+                   '(("one" nil "https://one.example")
+                     (" " nil nil)
+                     ("t" nil "https://two.example")
+                     ("wo three" nil nil))))
+    (should (equal (gdocs-dm-to-org doc)
+                   "[[https://one.example][one]] [[https://two.example][t]]wo three\n"))))
+
+(ert-deftest gdocs-test-pull-link-rendering-variants ()
+  "Pull renders labeled, bare, and mailto links with their destinations."
+  (let* ((body "Example https://example.com mail\n")
+         (ops (list (gdocs-test--insert-op body)
+                    (gdocs-test--link-range-op body "Example"
+                                               "https://example.com")
+                    (gdocs-test--link-range-op body "https://example.com"
+                                               "https://example.com")
+                    (gdocs-test--link-range-op body "mail"
+                                               "mailto:reader@example.com")))
+         (doc (gdocs-dm-from-ops nil nil nil body ops))
+         (round-tripped (gdocs-dm-from-org (gdocs-dm-to-org doc))))
+    (should (equal (gdocs-dm-to-org doc)
+                   "[[https://example.com][Example]] [[https://example.com]] [[mailto:reader@example.com][mail]]\n"))
+    (should (equal (gdocs-test--model-view doc)
+                   (gdocs-test--model-view round-tripped)))))
+
+(ert-deftest gdocs-test-pull-link-spanning-style-runs-renders-one-link ()
+  "A link covering styled sub-runs gets one logical Org link wrapper."
+  (let* ((body "Bold italic code\n")
+         (ops (list (gdocs-test--insert-op body)
+                    (gdocs-test--link-range-op body "Bold italic code"
+                                               "https://example.com")
+                    (gdocs-test--text-range-op
+                     body '(:text "Bold" :styles (:bold)))
+                    (gdocs-test--text-range-op
+                     body '(:text "italic" :styles (:italic)))
+                    (gdocs-test--text-range-op
+                     body '(:text "code" :styles (:code)))))
+         (doc (gdocs-dm-from-ops nil nil nil body ops))
+         (org (gdocs-dm-to-org doc)))
+    (should (equal org
+                   "[[https://example.com][*Bold* /italic/ ~code~]]\n"))
+    (should (= (gdocs-test--count-substring org "[[") 1))
+    (should (= (gdocs-test--count-substring org "]]") 1))))
+
+(ert-deftest gdocs-test-pull-code-styled-link-is-not-source-block ()
+  "A code-styled link remains an inline link when it fills a paragraph."
+  (let* ((body "code\n")
+         (ops (list (gdocs-test--insert-op body)
+                    (gdocs-test--link-range-op body "code"
+                                               "https://example.com")
+                    (gdocs-test--text-range-op
+                     body '(:text "code" :styles (:code)))))
+         (doc (gdocs-dm-from-ops nil nil nil body ops)))
+    (should (eq (plist-get (car (gdocs-dm-paragraphs doc)) :kind) :para))
+    (should (equal (gdocs-dm-to-org doc)
+                   "[[https://example.com][~code~]]\n"))))
+
+(ert-deftest gdocs-test-linked-and-unlinked-identical-style-stays-bounded ()
+  "A link boundary does not leak into adjacent text with the same style."
+  (let* ((body "linked plain\n")
+         (ops (list (gdocs-test--insert-op body)
+                    (gdocs-test--link-range-op body "linked"
+                                               "https://example.com")
+                    (gdocs-test--text-range-op
+                     body '(:text "linked plain" :styles (:bold)))))
+         (doc (gdocs-dm-from-ops nil nil nil body ops))
+         (org (gdocs-dm-to-org doc))
+         (round-tripped (gdocs-dm-from-org org)))
+    (should (equal org "*[[https://example.com][linked]] plain*\n"))
+    (should (equal (gdocs-test--model-view doc)
+                   (gdocs-test--model-view round-tripped)))))
+
+(ert-deftest gdocs-test-pull-link-escaping-round-trips ()
+  "Link targets and descriptions with Org-significant characters are safe."
+  (let* ((body "A]B*\n")
+         (url "https://example.com/a]b")
+         (ops (list (gdocs-test--insert-op body)
+                    (gdocs-test--link-range-op body "A]B*" url)))
+         (decoded (gdocs-dm-from-ops nil nil nil body ops))
+         (org (gdocs-dm-to-org decoded))
+         (round-tripped (gdocs-dm-from-org org)))
+    (should (equal org
+                   (concat "[[https://example.com/a\\]b][A"
+                           gdocs--org-link-description-sentinel
+                           "]"
+                           gdocs--org-link-description-sentinel
+                           "B\\*]]\n")))
+    (should (equal (gdocs-test--model-view decoded)
+                   (gdocs-test--model-view round-tripped)))
+    (let* ((ot (gdocs-dm-to-ot round-tripped))
+           (link-op (seq-find (lambda (op)
+                                (equal (alist-get 'st op) "link"))
+                              (cdr ot)))
+           (lnks (alist-get 'lnks_link (alist-get 'sm link-op))))
+      (should link-op)
+      (should (equal (alist-get 'ulnk_url lnks) url)))))
+
+(ert-deftest gdocs-test-link-description-specials-round-trip ()
+  "All inline Org delimiters remain literal inside a pulled link label."
+  (let* ((text (concat "* / _ + = ~ [ ] " (string ?\\)))
+         (url "https://example.com/special?a=[b]")
+         (doc (gdocs-dm-make-doc
+               :paragraphs
+               (list (list :kind :para
+                           :runs (list (gdocs-dm-make-run text nil url))))))
+         (org (gdocs-dm-to-org doc))
+         (round-tripped (gdocs-dm-from-org org))
+         (run (car (plist-get (car (gdocs-dm-paragraphs round-tripped))
+                              :runs))))
+    (should (equal text (plist-get run :text)))
+    (should (equal url (plist-get run :link)))))
+
+(ert-deftest gdocs-test-malformed-link-operation-is-ignored ()
+  "Malformed link modifiers do not attach a URL to unrelated text."
+  (let* ((body "abc\n")
+         (valid (gdocs-test--link-range-op body "a"
+                                           "https://valid.example"))
+         (malformed `((ty . "as") (st . "link") (si . 2) (ei . 3)
+                      (sm . ((lnks_link . ((ulnk_url . 42)))))))
+         (doc (gdocs-dm-from-ops nil nil nil body
+                                 (list (gdocs-test--insert-op body)
+                                       valid malformed)))
+         (runs (plist-get (car (gdocs-dm-paragraphs doc)) :runs)))
+    (should (equal (mapcar #'gdocs-test--run-view runs)
+                   '(("a" nil "https://valid.example")
+                     ("bc" nil nil))))))
 
 (ert-deftest gdocs-test-org-model-org-normalized-round-trip ()
   "Rendering a parsed Org model is stable after normalization."

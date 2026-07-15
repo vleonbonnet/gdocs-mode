@@ -629,7 +629,8 @@ the doc or any buffer. The caller's `gdocs-auth-function' is used."
 ;;          :glyph :bullet|:number  ; resolved from list def (only for :list)
 ;;          :anchor S        ; ps_hdid (only for headings)
 ;;          :runs (RUN ...))
-;; RUN   = (:text S :styles (:bold :italic :underline :strike :code) :link S)
+;; RUN   = (:text S :styles (:bold :italic :underline :strike :verbatim :code)
+;;          :link S)
 ;;
 ;; Tables are represented as a single :kind=:table paragraph whose :rows is a
 ;; list of rows; each row is a list of cells; each cell is a list of runs.
@@ -748,6 +749,96 @@ are 1-based inclusive (OT positions), so OT pos i → vec[i-1]."
                               (gdocs--styles-apply (aref vec (1- i)) styles)))))))
     vec))
 
+(defun gdocs--link-sm-action (sm)
+  "Decode the link modifier in SM.
+
+Return a plist whose :action is either :set, :clear, or :invalid.  Normal
+Google Docs links have the shape
+
+  ((lnks_link . ((lnk_type . 0) (ulnk_url . URL))))
+
+The editor uses a few equivalent representations when it removes a link:
+the `lnks_link' value may be JSON false or nil, or the nested `ulnk_url'
+may be explicitly unset.  Treat only those representations as a clear;
+anything else is invalid so a malformed operation cannot accidentally apply
+an unrelated URL."
+  (condition-case _err
+      (if (not (listp sm))
+          (list :action :invalid :reason "sm is not an object")
+        (let ((lnks (alist-get 'lnks_link sm 'unset)))
+          (cond
+           ;; Some model revisions mark the whole link field as explicitly
+           ;; unset.
+           ((or (eq lnks :json-false) (eq lnks :null) (null lnks))
+            (list :action :clear))
+           ((eq lnks 'unset)
+            ;; `lnks_link_i' is an explicitness marker seen in style
+            ;; modifiers; honor it only as a clear, never as a URL-bearing
+            ;; operation.
+            (let ((marker (alist-get 'lnks_link_i sm 'unset)))
+              (if (or (eq marker :json-false) (null marker))
+                  (list :action :clear)
+                (list :action :invalid
+                      :reason "missing sm.lnks_link"))))
+           ((listp lnks)
+            (let ((url (alist-get 'ulnk_url lnks 'unset)))
+              (cond
+               ((stringp url)
+                (if (string-empty-p url)
+                    (list :action :clear)
+                  (list :action :set :url url)))
+               ((or (eq url 'unset) (eq url :json-false)
+                    (eq url :null) (null url))
+                ;; A present link object without a URL is the nested form of
+                ;; an explicit unset.  It is not a request to retain the
+                ;; previous URL.
+                (list :action :clear))
+               (t
+                (list :action :invalid
+                      :reason "sm.lnks_link.ulnk_url is not a string")))))
+           (t
+            (list :action :invalid
+                  :reason "sm.lnks_link is not an object")))))
+    (error
+     (list :action :invalid :reason "malformed link modifier"))))
+
+(defun gdocs--decode-links (ops body-len)
+  "Build a vector of length BODY-LEN containing link destinations.
+
+`as st=\"link\"' ranges use the same one-based, inclusive positions as
+text-style ranges.  Operations are applied in stream order, so a later
+explicit unset removes a previously decoded link.  Invalid ranges or link
+modifiers are ignored with a warning; in particular, a bad operation never
+gets to reuse the URL from a neighboring range."
+  (let ((vec (make-vector body-len nil)))
+    (dolist (op ops)
+      (condition-case _err
+          (when (and (listp op)
+                     (equal (alist-get 'ty op) "as")
+                     (equal (alist-get 'st op) "link"))
+            (let* ((si (alist-get 'si op))
+                   (ei (alist-get 'ei op))
+                   (action (gdocs--link-sm-action (alist-get 'sm op nil)))
+                   (kind (plist-get action :action)))
+              (cond
+               ((not (and (integerp si) (integerp ei)
+                          (<= 1 si) (<= si ei) (<= ei body-len)))
+                (gdocs-log 'warn
+                           "Ignoring malformed Google Docs link range %S..%S"
+                           si ei))
+               ((eq kind :invalid)
+                (gdocs-log
+                 'warn
+                 "Ignoring malformed Google Docs link op at %d..%d: %s"
+                 si ei (or (plist-get action :reason) "unknown modifier")))
+               (t
+                (let ((url (and (eq kind :set) (plist-get action :url))))
+                  (cl-loop for i from si to ei
+                           do (aset vec (1- i) url)))))))
+        (error
+         (gdocs-log 'warn "Ignoring malformed Google Docs link operation"))))
+    vec))
+
 (defun gdocs--decode-para-attrs (ops)
   "Walk paragraph-style ops; return an alist OT-POS → (:heading N
 :anchor S :indent-left X :indent-first X :align V)."
@@ -861,9 +952,12 @@ absent opValue clears an anchor and is skipped."
     ;; Per recon: gt=9 → bullet; gt=10/13/15 → numbered.
     (if (eq gt 9) :bullet :number)))
 
-(defun gdocs--build-runs (body ts-vec start end)
-  "Slice runs from BODY[START..END-1] using TS-VEC styles. Returns a
-list of runs (:text :styles). Skips structural codepoints."
+(defun gdocs--build-runs (body ts-vec start end &optional link-vec)
+  "Slice runs from BODY[START..END-1] using TS-VEC and LINK-VEC.
+
+Returns runs with :text, :styles, and optional :link properties.  A run
+ends whenever either the active text styles or the link destination changes.
+Structural codepoints are skipped and never become visible run text."
   (let ((runs nil)
         (i start))
     (while (< i end)
@@ -876,6 +970,7 @@ list of runs (:text :styles). Skips structural codepoints."
         (setq i (1+ i)))
       (when (< i end)
         (let* ((cur-keys (gdocs--styles-active-keys (aref ts-vec i)))
+               (cur-link (and link-vec (aref link-vec i)))
                (run-start i))
           (cl-loop while (and (< i end)
                               (not (memq (aref body i)
@@ -884,13 +979,15 @@ list of runs (:text :styles). Skips structural codepoints."
                                                gdocs--ot-row-end
                                                gdocs--ot-cell-end)))
                               (equal cur-keys
-                                     (gdocs--styles-active-keys (aref ts-vec i))))
+                                     (gdocs--styles-active-keys (aref ts-vec i)))
+                              (equal cur-link
+                                     (and link-vec (aref link-vec i))))
                    do (cl-incf i))
           (let ((text (substring body run-start i)))
-            (push (gdocs-dm-make-run text cur-keys) runs)))))
+            (push (gdocs-dm-make-run text cur-keys cur-link) runs)))))
     (nreverse runs)))
 
-(defun gdocs--build-table-para (body ts-vec start end table-attr)
+(defun gdocs--build-table-para (body ts-vec start end table-attr &optional link-vec)
   "Construct a :table paragraph from BODY[START..END-1] — the slice
 between (but excluding) the 0x10/0x11 markers.
 
@@ -899,7 +996,8 @@ Layout (one row of a 2-cell table):
 
 0x12 starts a new row; 0x1c starts a new cell within the current row.
 Each cell ends with a literal \\n right before the next 0x1c, 0x12, or
-0x11 — strip that trailing newline."
+0x11 — strip that trailing newline.  LINK-VEC is passed through to cell
+run construction."
   (let ((rows nil) (cells nil) (cell-start nil)
         (i start))
     (cl-flet ((flush-cell
@@ -909,7 +1007,7 @@ Each cell ends with a literal \\n right before the next 0x1c, 0x12, or
                                     (= (aref body (1- upto)) ?\n))
                                (1- upto)
                              upto))
-                       (runs (gdocs--build-runs body ts-vec from to)))
+                       (runs (gdocs--build-runs body ts-vec from to link-vec)))
                   (push (list runs) cells)
                   (setq cell-start nil)))
               (flush-row ()
@@ -943,8 +1041,13 @@ Each cell ends with a literal \\n right before the next 0x1c, 0x12, or
    (t :para)))
 
 (defun gdocs--paragraph-is-code-block (runs)
-  "Return non-nil if every non-empty run in RUNS is :code-styled."
+  "Return non-nil if RUNS is an unlinked, all-`:code' paragraph.
+
+A linked code-styled paragraph is kept as inline content so its destination
+is not lost by the source-block renderer, which intentionally emits raw code
+text without inline markup."
   (and runs
+       (not (cl-some (lambda (r) (plist-get r :link)) runs))
        (cl-every (lambda (r)
                    (or (string-empty-p (or (plist-get r :text) ""))
                        (memq :code (plist-get r :styles))))
@@ -981,6 +1084,7 @@ Each cell ends with a literal \\n right before the next 0x1c, 0x12, or
 REVISION, DOC-ID and TITLE are stored as metadata."
   (let* ((body-len (length body))
          (ts-vec (gdocs--decode-text-styles ops body-len))
+         (link-vec (gdocs--decode-links ops body-len))
          (para-attrs (gdocs--decode-para-attrs ops))
          (list-bindings (gdocs--decode-list-bindings ops))
          (table-attrs (gdocs--decode-table-attrs ops))
@@ -1003,7 +1107,8 @@ REVISION, DOC-ID and TITLE are stored as metadata."
                  ((= cc gdocs--ot-table-close) (cl-decf depth))))
               (cl-incf j))
             ;; j now points 1 past the matching close.
-            (push (gdocs--build-table-para body ts-vec (1+ i) (1- j) ta)
+            (push (gdocs--build-table-para body ts-vec (1+ i) (1- j) ta
+                                           link-vec)
                   paragraphs)
             (setq i j)))
          (t
@@ -1013,7 +1118,7 @@ REVISION, DOC-ID and TITLE are stored as metadata."
                  (ot-nl-pos (1+ nl))     ; 1-based
                  (pa (cdr (assq ot-nl-pos para-attrs)))
                  (lb (cdr (assq ot-nl-pos list-bindings)))
-                 (runs (gdocs--build-runs body ts-vec i nl)))
+                 (runs (gdocs--build-runs body ts-vec i nl link-vec)))
             (push (gdocs--build-para pa lb nil runs list-defs) paragraphs)
             (setq i (1+ nl)))))))
     (gdocs-dm-make-doc :revision revision :doc-id doc-id :title title
@@ -1032,11 +1137,40 @@ REVISION, DOC-ID and TITLE are stored as metadata."
   "Mapping from style keyword to its org inline marker.
 Order here matters only for emit-stability of nested wrappers.")
 
-(defun gdocs--escape-org-inline (text)
-  "Lightly normalize TEXT for safe inline org emission. Strips OT
-structural codepoints just in case."
-  (replace-regexp-in-string
-   (rx (any 16 17 18 28)) "" text))
+(defconst gdocs--org-inline-escape-chars
+  '(?\\ ?* ?/ ?_ ?+ ?= ?~ ?\[ ?\])
+  "Org characters that need a backslash when emitted as literal text.")
+
+(defconst gdocs--org-link-description-sentinel (string #x200b)
+  "Invisible separator used to keep Org subscript/LaTeX syntax literal.")
+
+(defun gdocs--escape-org-inline (text &optional escape-special)
+  "Normalize TEXT for safe inline Org emission.
+
+OT structural codepoints are stripped.  Org emphasis, link, and escape
+characters are escaped or protected when ESCAPE-SPECIAL is non-nil, because
+TEXT is then a link description rather than already-encoded Org markup.  The
+renderer adds the actual style markers and link delimiters after this
+function returns."
+  (let ((text (replace-regexp-in-string
+               (rx (any 16 17 18 28)) "" text)))
+    (if escape-special
+        (mapconcat
+         (lambda (char)
+           (cond
+            ;; Org's backslash escape does not reliably suppress `_'
+            ;; subscript parsing, and a `\['/`\]` pair can become a LaTeX
+            ;; fragment.  Invisible separators preserve the exact visible
+            ;; description and are removed on the way back.
+            ((memq char '(?_ ?\\ ?\[ ?\]))
+             (concat gdocs--org-link-description-sentinel
+                     (string char)
+                     gdocs--org-link-description-sentinel))
+            ((memq char gdocs--org-inline-escape-chars)
+             (concat "\\" (string char)))
+            (t (string char))))
+         (string-to-list text) "")
+      text)))
 
 (defconst gdocs--org-style-order
   '(:bold :italic :underline :strike :verbatim :code)
@@ -1045,22 +1179,115 @@ Non-atomic styles (bold/italic/underline/strike) wrap atomic
 verbatim/code so that `*=foo=*' parses as bold-around-verbatim rather
 than the reverse (which org would treat as opaque).")
 
-(defun gdocs--render-run-text (run)
-  "Render the textual payload of RUN — escape + link wrapping, no styles."
+(defvar gdocs--render-link-description nil
+  "Non-nil while rendering the description of one logical Org link.")
+
+(defun gdocs--render-run-text (run &optional no-link escape-special)
+  "Render the textual payload of RUN — escape + optional link wrapping.
+
+When NO-LINK is non-nil, only the text is emitted.  This is used while a
+contiguous link group is rendered as one Org link; the default remains useful
+for callers rendering one run directly."
   (let* ((text (or (plist-get run :text) ""))
          (link (plist-get run :link))
-         (clean (gdocs--escape-org-inline text)))
-    (if link
-        (format "[[%s][%s]]" link
-                (if (string-empty-p clean) link clean))
+         (clean (gdocs--escape-org-inline
+                 text (or escape-special (and link (not no-link))))))
+    (if (and link (not no-link))
+        (if (and (null (plist-get run :styles))
+                 (string= text link))
+            (org-link-make-string link)
+          (org-link-make-string link
+                                (if (string-empty-p clean) link clean)))
       clean)))
+
+(defun gdocs--render-link-group (runs link)
+  "Render contiguous RUNS sharing LINK as one logical Org link.
+
+Rendering the description as a run group preserves style changes inside a
+link without repeating the link target for every style run."
+  (let* ((description (let ((gdocs--render-link-description t))
+                        (gdocs--render-runs-styled runs nil)))
+         (plain (gdocs-dm-runs-text runs))
+         (bare (and (not (cl-some (lambda (run)
+                                    (plist-get run :styles))
+                                  runs))
+                    (string= plain link))))
+    (if bare
+        (org-link-make-string link)
+      (org-link-make-string link
+                            (if (string-empty-p description) link description)))))
+
+(defun gdocs--common-run-style (runs)
+  "Return a style key spanning both linked and unlinked RUNS, if any.
+
+Only a style that crosses a link boundary is lifted outside link wrappers.
+When every run is linked, styles remain inside the link description, which is
+the more idiomatic Org representation for bold/italic link labels."
+  (when (and (seq-some (lambda (run) (plist-get run :link)) runs)
+             (seq-some (lambda (run) (null (plist-get run :link))) runs))
+    ;; Atomic verbatim/code markers cannot safely contain an Org link, so
+    ;; keep those styles inside their respective link groups.
+    (seq-find (lambda (key)
+                (and (not (null runs))
+                     (cl-every (lambda (run)
+                                 (memq key (plist-get run :styles)))
+                               runs)))
+              '(:bold :italic :underline :strike))))
+
+(defun gdocs--run-without-style (run key)
+  "Return a copy of RUN with style KEY removed."
+  (let ((copy (copy-sequence run)))
+    (plist-put copy :styles
+               (delq key (copy-sequence (plist-get run :styles))))
+    copy))
+
+(defun gdocs--render-runs-by-link (runs)
+  "Render RUNS after grouping adjacent runs by link destination.
+
+The link grouping keeps bold/italic/code sub-runs inside one logical link;
+styles that span both linked and unlinked text are lifted outside the link
+boundary first."
+  (let ((common-style (gdocs--common-run-style runs)))
+    (if common-style
+        ;; Keep a style that spans a link boundary outside the link.  This
+        ;; both preserves the original formatting and avoids Org treating a
+        ;; style marker immediately following a closing bracket as literal.
+        (let ((marker (cdr (assq common-style gdocs--org-style-markers)))
+              (inner (gdocs--render-runs-by-link
+                      (mapcar (lambda (run)
+                                (gdocs--run-without-style run common-style))
+                              runs))))
+          (format "%s%s%s" marker inner marker))
+      (let ((groups nil)
+            (current nil)
+            (current-link :gdocs-no-link))
+        (dolist (run runs)
+          (let ((link (plist-get run :link)))
+            (if (or (eq current-link :gdocs-no-link)
+                    (equal link current-link))
+                (progn
+                  (setq current-link link)
+                  (push run current))
+              (push (cons current-link (nreverse current)) groups)
+              (setq current-link link
+                    current (list run)))))
+        (when current
+          (push (cons current-link (nreverse current)) groups))
+        (mapconcat
+         (lambda (group)
+           (let ((link (car group))
+                 (group-runs (cdr group)))
+             (if link
+                 (gdocs--render-link-group group-runs link)
+               (gdocs--render-runs-styled group-runs nil))))
+         (nreverse groups) "")))))
 
 (defun gdocs--render-runs (runs)
   "Render a list of RUNS to org text.
-Adjacent runs that share a style are wrapped by a single emphasis pair
-rather than per-run pairs, so `(bold)(bold code)(bold)' renders as
-`*A~B~C*' instead of `*A**~B~**C*'."
-  (gdocs--render-runs-styled runs nil))
+Adjacent runs that share a link are rendered inside one bracket link, while
+adjacent runs that share a style are wrapped by a single emphasis pair rather
+than per-run pairs."
+  (gdocs--render-runs-by-link runs))
 
 (defun gdocs--render-runs-styled (runs already-wrapped)
   "Inner driver for `gdocs--render-runs'.
@@ -1072,7 +1299,10 @@ emitted; we won't re-emit them inside."
         (when (cl-some (lambda (r) (memq key (plist-get r :styles))) runs)
           (cl-return-from done
             (gdocs--render-runs-split-on key runs already-wrapped)))))
-    (mapconcat #'gdocs--render-run-text runs "")))
+    (mapconcat (lambda (run)
+                 (gdocs--render-run-text run t
+                                         gdocs--render-link-description))
+               runs "")))
 
 (defun gdocs--render-runs-split-on (key runs already-wrapped)
   "Group RUNS by whether each carries KEY; wrap KEY-bearing groups."
@@ -1092,9 +1322,10 @@ emitted; we won't re-emit them inside."
      (lambda (g)
        (let* ((has-key (car g))
               (group-runs (cdr g))
-              (inner (gdocs--render-runs-styled
-                      group-runs
-                      (if has-key (cons key already-wrapped) already-wrapped))))
+              (inner
+               (gdocs--render-runs-styled
+                group-runs
+                (if has-key (cons key already-wrapped) already-wrapped))))
          (if (and has-key
                   (not (string-empty-p (string-trim inner))))
              (let ((mk (cdr (assq key gdocs--org-style-markers))))
@@ -1256,6 +1487,33 @@ idiomatic org."
     (verbatim      . :verbatim))
   "Mapping of `org-element' inline emphasis tags to doc-model style keys.")
 
+(defun gdocs--unescape-org-inline (text &optional link-description)
+  "Remove the literal-text escapes emitted by `gdocs--escape-org-inline'.
+
+Only the characters that the renderer escapes are unescaped.  For link
+descriptions, the invisible separator used around subscript/LaTeX-sensitive
+characters is removed too.  Other backslashes remain ordinary user content,
+which avoids turning unrelated Org syntax (for example a LaTeX command) into
+a different document-model value."
+  (let ((i 0)
+        (n (length text))
+        (out nil))
+    (while (< i n)
+      (let ((char (aref text i)))
+        (cond
+         ((and link-description
+               (= char #x200b))
+          (cl-incf i))
+         ((and (= char ?\\)
+               (< (1+ i) n)
+               (memq (aref text (1+ i)) gdocs--org-inline-escape-chars))
+          (push (aref text (1+ i)) out)
+          (setq i (+ i 2)))
+         (t
+          (push char out)
+          (cl-incf i)))))
+    (apply #'string (nreverse out))))
+
 (defun gdocs--element-runs (el &optional inherited-styles inherited-link)
   "Walk inline ORG-ELEMENT EL and return a flat list of runs.
 INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers."
@@ -1263,7 +1521,9 @@ INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers."
    ((stringp el)
     (if (string-empty-p el)
         nil
-      (list (gdocs-dm-make-run el inherited-styles inherited-link))))
+      (list (gdocs-dm-make-run (gdocs--unescape-org-inline
+                                el (and inherited-link t))
+                               inherited-styles inherited-link))))
    ((null el) nil)
    ((consp el)
     (let* ((type (and (symbolp (car el)) (car el)))
@@ -1276,16 +1536,30 @@ INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers."
                (kind (plist-get props :type))
                (url (if (member kind '("https" "http" "mailto" "ftp"))
                         (format "%s:%s" kind path)
-                      path)))
-          (if contents
-              (cl-mapcan
-               (lambda (c) (gdocs--element-runs c inherited-styles url))
-               contents)
-            ;; Bare link with no description.
-            (list (gdocs-dm-make-run path inherited-styles url)))))
+                      path))
+               (runs (if contents
+                         (cl-mapcan
+                          (lambda (c)
+                            (gdocs--element-runs c inherited-styles url))
+                          contents)
+                       ;; Bare link with no description.
+                       (list (gdocs-dm-make-run (or url path)
+                                                inherited-styles url))))
+               ;; Org attaches whitespace after a link to the link's
+               ;; `:post-blank' property.  It belongs to the surrounding
+               ;; style/link context, not to the link destination.
+               (post-blank (org-element-property :post-blank el)))
+          (if (and (integerp post-blank) (> post-blank 0))
+              (append runs
+                      (list (gdocs-dm-make-run
+                             (make-string post-blank ?\s)
+                             inherited-styles inherited-link)))
+            runs)))
        ((eq type 'plain-text)
         (when (stringp props)
-          (list (gdocs-dm-make-run props inherited-styles inherited-link))))
+          (list (gdocs-dm-make-run (gdocs--unescape-org-inline
+                                    props (and inherited-link t))
+                                   inherited-styles inherited-link))))
        (style
         (let* ((styles (cons style inherited-styles))
                (runs
