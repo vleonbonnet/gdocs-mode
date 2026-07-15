@@ -14,18 +14,18 @@ properly properly sync.
 ## Features
 
 - **Pull** — fetches the current remote content and rewrites the local buffer.
-  Headings, paragraphs, bold/italic/code spans, bullet and numbered lists,
-  tables, and code blocks convert to their Org equivalents.
+Headings, paragraphs, bold/italic/code spans, bullet and numbered lists,
+tables, and code blocks convert to their Org equivalents.
 - **Push** — converts the local Org buffer back to Google Docs format and
-  writes it remotely. Sections that existed before the last pull are updated in
-  place; new sections are appended. A push is refused if the remote document
-  changed since the last pull, so concurrent edits are never silently
-  overwritten.
+writes it remotely. Sections that existed before the last pull are updated in
+place; new sections are appended. A push is refused if the remote document
+changed since the last pull, so concurrent edits are never silently
+overwritten.
 - **Auto-sync** — an idle timer polls the remote revision. If the remote
-  advanced and the local buffer is clean, it pulls automatically; if both sides
-  changed, it surfaces a one-shot conflict warning and takes no action.
+advanced and the local buffer is clean, it pulls automatically; if both sides
+changed, it surfaces a one-shot conflict warning and takes no action.
 - **Org link interception** — opening a `docs.google.com/document/d/...` link
-  in Org opens it through `gdocs-mode` instead of the browser.
+in Org opens it through `gdocs-mode` instead of the browser.
 
 ## Requirements
 
@@ -163,14 +163,29 @@ These properties are maintained on the top-level node of every synced buffer:
 | `gdocs-log-level`         | `warn`      | One of `debug`, `info`, `warn`, `error`.                |
 | `gdocs-session-file`      | XDG cache   | Where the persistent `/save` SID + request id are kept. |
 
+## Offline development tests
+
+The conversion and synchronization helpers have an offline ERT suite backed
+by sanitized synthetic OT and comments fixtures. It never contacts Google,
+reads browser cookies, or mutates user buffers/files:
+
+```sh
+make test
+```
+
+Run byte-compilation validation with `make byte-compile`, or run both checks
+with `make check`. The optional `make integration` target only selects the
+`integration` ERT tag after explicitly setting `GDOCS_MODE_RUN_INTEGRATION=1`;
+no live credentials or live integration tests are required by this repository.
+
 ## Caveats
 
 - **Cookie-only push.** The write path matches a real browser request and
-  depends on a live Firefox/OAuth session; there is no hardened credential
-  story yet.
+depends on a live Firefox/OAuth session; there is no hardened credential
+story yet.
 - **Format fidelity is best-effort.** Headings, paragraphs, inline emphasis,
-  lists, tables, and code blocks round-trip. Docs-specific features with no Org
-  equivalent (comments, suggestions, column layouts) are out of scope.
+lists, tables, and code blocks round-trip. Docs-specific features with no Org
+equivalent (comments, suggestions, column layouts) are out of scope.
 - **Rate limiting.** Google's `/save` endpoint rejects malformed or
-  excessively bursty requests; the mode persists a session SID to look like a
-  single stable client.
+excessively bursty requests; the mode persists a session SID to look like a
+single stable client.
