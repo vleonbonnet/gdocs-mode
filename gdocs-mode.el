@@ -1079,6 +1079,90 @@ text without inline markup."
       (setq out (plist-put out :kind :blank)))
     out))
 
+(defun gdocs--heading-kind-p (kind)
+  "Return non-nil when KIND receives canonical Org heading padding."
+  (memq kind '(:heading :title :subtitle)))
+
+(defun gdocs--normalize-paragraphs (paragraphs)
+  "Return the canonical paragraph sequence for PARAGRAPHS.
+
+Google Docs can represent visual whitespace as several consecutive empty
+paragraphs.  Org has no useful representation for the distinction, so this
+normalization intentionally keeps at most one `:blank' paragraph, removes
+leading and trailing empty paragraphs, and is lossy for repeated empties.
+
+An empty paragraph between two `:code' paragraphs has a defined meaning: it
+is an empty source line.  Such a paragraph is converted to an empty `:code'
+paragraph rather than allowing the renderer to close and reopen the source
+block.  This keeps source-block boundaries intact and makes the operation
+idempotent.  Other single empty paragraphs remain available to represent a
+meaningful paragraph break, for example between a paragraph and a list.  A
+single blank adjacent to a heading-like paragraph is retained here so the
+renderer can observe and reuse it instead of adding another one."
+  (let ((collapsed nil)
+        (previous-blank nil))
+    ;; First collapse adjacent blanks.  Do not mutate the model supplied by a
+    ;; caller: the same decoded model may also be used by the OT diff path.
+    (dolist (para paragraphs)
+      (if (eq (plist-get para :kind) :blank)
+          (unless previous-blank
+            (push para collapsed)
+            (setq previous-blank t))
+        (push para collapsed)
+        (setq previous-blank nil)))
+    (setq collapsed (nreverse collapsed))
+    ;; Blank paragraphs at either document edge are only visual padding.  In
+    ;; particular, don't let an OT body ending in several newlines turn into
+    ;; a visibly padded Org file.
+    (while (and collapsed
+                (eq (plist-get (car collapsed) :kind) :blank))
+      (setq collapsed (cdr collapsed)))
+    (setq collapsed (nreverse collapsed))
+    (while (and collapsed
+                (eq (plist-get (car collapsed) :kind) :blank))
+      (setq collapsed (cdr collapsed)))
+    (setq collapsed (nreverse collapsed))
+    ;; A generic blank between code paragraphs is part of the source block,
+    ;; not a paragraph separator outside it.  The first pass guarantees that
+    ;; there is at most one such entry to convert.
+    (let ((out nil)
+          (rest collapsed))
+      (while rest
+        (let* ((para (car rest))
+               (next (cadr rest))
+               (previous (car out)))
+          (if (and (eq (plist-get para :kind) :blank)
+                   (eq (plist-get previous :kind) :code)
+                   (eq (plist-get next :kind) :code))
+              (push (list :kind :code
+                          :runs (list (gdocs-dm-make-run ""))) out)
+            (push para out)))
+        (setq rest (cdr rest)))
+      (nreverse out))))
+
+(defun gdocs--normalize-paragraphs-for-ot (paragraphs)
+  "Return PARAGRAPHS canonicalized for remote OT emission/diffing.
+
+`gdocs--normalize-paragraphs' retains one blank adjacent to a heading so the
+Org renderer can reuse it.  That blank is presentation-only, however: the OT
+model represents the heading paragraph itself and must not receive a new
+remote empty paragraph just because Org needs visual padding.  Remove those
+heading-adjacent blanks after the common normalization pass."
+  (let ((normalized (gdocs--normalize-paragraphs paragraphs))
+        (out nil)
+        (rest nil))
+    (setq rest normalized)
+    (while rest
+      (let ((para (car rest))
+            (next (cadr rest))
+            (previous (car out)))
+        (unless (and (eq (plist-get para :kind) :blank)
+                     (or (gdocs--heading-kind-p (plist-get previous :kind))
+                         (gdocs--heading-kind-p (plist-get next :kind))))
+          (push para out)))
+      (setq rest (cdr rest)))
+    (nreverse out)))
+
 (defun gdocs-dm-from-ops (revision doc-id title body ops)
   "Decode BODY (the OT body string) + OPS into a doc-model.
 REVISION, DOC-ID and TITLE are stored as metadata."
@@ -1407,18 +1491,23 @@ keyword lines emitted from Title/Subtitle paragraphs."
            (string-match-p "\\`#\\+subtitle:" line))))
 
 (defun gdocs-dm-to-org (doc)
-  "Render a doc-model DOC to an org-mode string.
+  "Render a doc-model DOC to a canonical org-mode string.
 
 Code blocks: contiguous :kind=:code paragraphs are wrapped in a single
-\#+begin_src/#+end_src block. Lists, headings, tables and plain
-paragraphs each emit one line (terminated by \\n). A blank line is
-inserted before and after each heading so the result reads as
-idiomatic org."
-  (let ((paras (gdocs-dm-paragraphs doc))
-        (out nil)
-        (in-code nil)
+\\#+begin_src/\\#+end_src block. Lists, headings, tables and plain
+paragraphs each emit one line (terminated by \\n). Empty paragraphs are
+normalized before rendering. A heading, Title, or Subtitle receives exactly
+one blank line on each side where adjacent content exists; an existing blank
+paragraph satisfies that rule. Padding is applied to paragraph entries rather
+than to the final text, so it never appears inside a source block."
+  (let ((paras (gdocs--normalize-paragraphs (gdocs-dm-paragraphs doc)))
+        (entries nil)
+        (code-lines nil)
         (list-counters (make-vector 10 0))
         (last-list-id nil))
+    ;; First turn paragraphs into logical render entries. A source block is
+    ;; one entry, which makes the later heading-padding pass unable to insert
+    ;; a line between two of its source lines.
     (dolist (p paras)
       (let ((kind (plist-get p :kind)))
         ;; Reset numbered-list counters whenever we leave a list. A new
@@ -1428,16 +1517,17 @@ idiomatic org."
           (setq last-list-id nil))
         (cond
          ((eq kind :code)
-          (unless in-code
-            (push "#+begin_src text" out)
-            (setq in-code t))
           (push (mapconcat (lambda (r) (or (plist-get r :text) ""))
                            (plist-get p :runs) "")
-                out))
+                code-lines))
          (t
-          (when in-code
-            (push "#+end_src" out)
-            (setq in-code nil))
+          (when code-lines
+            (push (list :kind :code-block
+                        :lines (append (list "#+begin_src text")
+                                       (nreverse code-lines)
+                                       (list "#+end_src")))
+                  entries)
+            (setq code-lines nil))
           (let ((ordinal nil))
             (when (and (eq kind :list)
                        (eq (plist-get p :glyph) :number))
@@ -1454,19 +1544,38 @@ idiomatic org."
                     (cl-incf i)))
                 (aset list-counters nest (1+ (aref list-counters nest)))
                 (setq ordinal (aref list-counters nest))))
-            (push (gdocs--render-paragraph-line p ordinal) out))))))
-    (when in-code (push "#+end_src" out))
-    (let* ((lines (nreverse out))
-           (padded nil))
-      (dolist (line lines)
-        (when (and (gdocs--org-heading-line-p line)
-                   padded
-                   (not (equal (car padded) "")))
-          (push "" padded))
-        (push line padded)
-        (when (gdocs--org-heading-line-p line)
-          (push "" padded)))
-      (let ((final (nreverse padded)))
+            (let ((line (gdocs--render-paragraph-line p ordinal)))
+              (push (list :kind kind
+                          :heading (gdocs--org-heading-line-p line)
+                          :blank (string-empty-p line)
+                          :lines (list line))
+                    entries)))))))
+    (when code-lines
+      (push (list :kind :code-block
+                  :lines (append (list "#+begin_src text")
+                                 (nreverse code-lines)
+                                 (list "#+end_src")))
+            entries))
+    (setq entries (nreverse entries))
+    ;; Add padding from the logical neighboring entries. The look-ahead is
+    ;; important: an explicit blank paragraph after a heading must not be
+    ;; accompanied by another synthetic blank. Since normalized entries
+    ;; contain at most one blank, applying this pass again cannot add anything.
+    (let ((out nil))
+      (cl-loop for tail on entries
+               for entry = (car tail)
+               for next = (cadr tail)
+               do (let ((heading (plist-get entry :heading))
+                        (lines (plist-get entry :lines)))
+                    (when (and heading out
+                               (not (string-empty-p (car out))))
+                      (push "" out))
+                    (dolist (line lines)
+                      (push line out))
+                    (when (and heading next
+                               (not (plist-get next :blank)))
+                      (push "" out))))
+      (let ((final (nreverse out)))
         (concat (string-join final "\n")
                 (if final "\n" ""))))))
 
@@ -1669,10 +1778,92 @@ sometimes lifts inline children up into the headline)."
          (lines (if (and lines (string-empty-p (car (last lines))))
                     (butlast lines)
                   lines)))
+    ;; Keep an empty source block representable.  More importantly, an empty
+    ;; line *inside* a non-empty block remains a :code paragraph and must not
+    ;; be mistaken for a generic paragraph separator.
+    (unless lines (setq lines (list "")))
     (mapcar (lambda (line)
               (list :kind :code
                     :runs (list (gdocs-dm-make-run line))))
             lines)))
+
+(defun gdocs--org-element-line-number (el)
+  "Return the source line containing ORG-ELEMENT EL, or nil."
+  (let ((begin (and el (org-element-property :begin el))))
+    (and (integerp begin) (line-number-at-pos begin))))
+
+(defun gdocs--org-element-last-line-number (el)
+  "Return the last source line occupied by ORG-ELEMENT EL, or nil."
+  (let ((begin (and el (org-element-property :begin el)))
+        ;; Paragraph/list elements include their following blank lines in
+        ;; :end.  :contents-end stops before that post-blank region.
+        (end (and el (or (org-element-property :contents-end el)
+                         (org-element-property :end el)))))
+    (when (and (integerp begin) (integerp end))
+      ;; Element :end is conventionally one past its final character.  Step
+      ;; back so a trailing newline is attributed to the element rather than
+      ;; to an empty line following it.
+      (line-number-at-pos (max begin (1- end))))))
+
+(defun gdocs--org-annotate-paragraph (paragraph start-line
+                                                &optional end-line group)
+  "Attach transient source-span metadata to PARAGRAPH.
+
+The metadata is used only to recover meaningful blank paragraphs from Org
+source text.  It is removed before `gdocs-dm-from-org' returns its model."
+  (let ((copy (copy-sequence paragraph)))
+    (setq copy (plist-put copy :gdocs-source-start-line start-line))
+    (setq copy (plist-put copy :gdocs-source-end-line (or end-line start-line)))
+    (when group
+      (setq copy (plist-put copy :gdocs-source-group group)))
+    copy))
+
+(defun gdocs--org-heading-kind-p (paragraph)
+  "Return non-nil when PARAGRAPH is a heading-like keyword entry."
+  (gdocs--heading-kind-p (plist-get paragraph :kind)))
+
+(defun gdocs--org-with-meaningful-blanks (paragraphs)
+  "Insert meaningful source blank paragraphs into PARAGRAPHS.
+
+Org-element treats ordinary blank lines as formatting (`:post-blank') rather
+than elements.  The doc-model needs one explicit blank paragraph when that
+line separates ordinary content, otherwise rendering a pulled document with
+such a paragraph would not be idempotent.  Blank lines adjacent to headings,
+Title, or Subtitle entries are synthetic Org padding and are deliberately
+discarded.  Source-block spans are treated as one protected region so empty
+source lines remain :code paragraphs instead."
+  (let ((out nil)
+        (previous nil))
+    (dolist (paragraph paragraphs)
+      (let* ((current-start (plist-get paragraph :gdocs-source-start-line))
+             (previous-end (and previous
+                                (plist-get previous :gdocs-source-end-line)))
+             (current-group (plist-get paragraph :gdocs-source-group))
+             (previous-group (and previous
+                                  (plist-get previous :gdocs-source-group)))
+             (blank-gap (and current-start previous-end
+                             (> (- current-start previous-end) 1))))
+        (when (and previous blank-gap
+                   (not (and current-group previous-group
+                             (eq current-group previous-group)))
+                   (not (gdocs--org-heading-kind-p previous))
+                   (not (gdocs--org-heading-kind-p paragraph)))
+          (push (list :kind :blank :runs nil) out))
+        (push paragraph out)
+        (setq previous paragraph)))
+    ;; Remove the transient span keys without changing any user-visible model
+    ;; fields.  `plist-put' with nil would leave the keys present, so rebuild
+    ;; each plist explicitly.
+    (mapcar
+     (lambda (paragraph)
+       (let (clean)
+         (cl-loop for (key value) on paragraph by #'cddr
+                  unless (memq key '(:gdocs-source-start-line
+                                     :gdocs-source-end-line
+                                     :gdocs-source-group))
+                  do (setq clean (append clean (list key value))))
+         clean))
+     (nreverse out))))
 
 (defun gdocs--org-table-paragraph (table-el)
   "Convert an org-element \='table TABLE-EL into a :kind=:table paragraph.
@@ -1700,24 +1891,42 @@ Each cell becomes (RUNS) — one element holding a list of runs."
           :rows (nreverse rows)
           :cols max-cols)))
 
-(defun gdocs--walk-org-element (el)
-  "Convert a top-level org-element EL into zero or more paragraphs."
+(defun gdocs--walk-org-element (el &optional source-spans)
+  "Convert a top-level org-element EL into zero or more paragraphs.
+
+When SOURCE-SPANS is non-nil, attach transient source line metadata so the
+caller can distinguish meaningful blank lines from heading padding."
   (pcase (and (consp el) (car el))
     ('headline
      (let* ((props (cadr el))
             (level (plist-get props :level))
             (runs (gdocs--org-headline-runs el))
             (kind :heading)
-            (para (list :kind kind :level level :runs runs)))
+            (para (list :kind kind :level level :runs runs))
+            (para (if source-spans
+                      (gdocs--org-annotate-paragraph
+                       para (gdocs--org-element-line-number el))
+                    para)))
        (cons para
-             (cl-mapcan #'gdocs--walk-org-element (cddr el)))))
+             (cl-mapcan
+              (lambda (child)
+                (gdocs--walk-org-element child source-spans))
+              (cddr el)))))
     ('section
-     (cl-mapcan #'gdocs--walk-org-element (cddr el)))
+     (cl-mapcan
+      (lambda (child)
+        (gdocs--walk-org-element child source-spans))
+      (cddr el)))
     ('paragraph
      (let ((runs (gdocs--paragraph-content-runs el)))
-       (if runs
-           (list (list :kind :para :runs runs))
-         (list (list :kind :blank :runs nil)))))
+       (let ((para (if runs
+                       (list :kind :para :runs runs)
+                     (list :kind :blank :runs nil))))
+         (list (if source-spans
+                   (gdocs--org-annotate-paragraph
+                    para (gdocs--org-element-line-number el)
+                    (gdocs--org-element-last-line-number el))
+                 para)))))
     ('plain-list
      (let ((nest-base nil)
            (cur-glyph nil)
@@ -1740,34 +1949,75 @@ Each cell becomes (RUNS) — one element holding a list of runs."
                                    (substring
                                     (md5 (format "%S-%S-%d" el glyph (random)))
                                     0 12))))
-            (list :kind :list
-                  :glyph glyph
-                  :nest nest
-                  :list-id cur-id
-                  :runs (gdocs--org-item-runs item))))
+            (let ((para (list :kind :list
+                              :glyph glyph
+                              :nest nest
+                              :list-id cur-id
+                              :runs (gdocs--org-item-runs item))))
+              (if source-spans
+                  (gdocs--org-annotate-paragraph
+                   para (gdocs--org-element-line-number
+                         (or (seq-find
+                              (lambda (child)
+                                (and (consp child)
+                                     (eq (car child) 'paragraph)))
+                              (cddr item))
+                             item))
+                   (gdocs--org-element-last-line-number
+                    (or (seq-find
+                         (lambda (child)
+                           (and (consp child)
+                                (eq (car child) 'paragraph)))
+                         (cddr item))
+                        item)))
+                para))))
         items)))
-    ('src-block (gdocs--src-block-paragraphs el))
-    ('table (list (gdocs--org-table-paragraph el)))
+    ('src-block
+     (let* ((start (gdocs--org-element-line-number el))
+            (paragraphs (gdocs--src-block-paragraphs el))
+            ;; The source block's closing line is occupied even though it is
+            ;; not emitted as a doc-model paragraph.  Use it when deciding
+            ;; whether the following entry has a real blank gap.
+            (end (+ (or start 0) 1 (length paragraphs))))
+       (if source-spans
+           (mapcar (lambda (paragraph)
+                     (gdocs--org-annotate-paragraph paragraph start end el))
+                   paragraphs)
+         paragraphs)))
+    ('table
+     (let ((para (gdocs--org-table-paragraph el)))
+       (list (if source-spans
+                 (gdocs--org-annotate-paragraph
+                  para (gdocs--org-element-line-number el)
+                  (gdocs--org-element-last-line-number el))
+               para))))
     ('keyword
      (let* ((props (cadr el))
             (key (and (stringp (plist-get props :key))
                       (downcase (plist-get props :key))))
             (val (plist-get props :value)))
        (cond
-        ((equal key "title")
-         (list (list :kind :title
-                     :runs (when (and val (not (string-empty-p val)))
-                             (list (gdocs-dm-make-run val))))))
-        ((equal key "subtitle")
-         (list (list :kind :subtitle
-                     :runs (when (and val (not (string-empty-p val)))
-                             (list (gdocs-dm-make-run val))))))
+        ((member key '("title" "subtitle"))
+         (let ((para (list :kind (if (equal key "title") :title :subtitle)
+                           :runs (when (and val (not (string-empty-p val)))
+                                   (list (gdocs-dm-make-run val))))))
+           (list (if source-spans
+                     (gdocs--org-annotate-paragraph
+                      para (gdocs--org-element-line-number el)
+                      (gdocs--org-element-last-line-number el))
+                   para))))
         (t nil))))
     (_ nil)))
 
 (defun gdocs-dm-from-org (org-text)
-  "Parse ORG-TEXT (a string) into a doc-model. Drops the property drawer
-if present. Inverse of `gdocs-dm-to-org' (lossy for unsupported syntax)."
+  "Parse ORG-TEXT (a string) into a canonical doc-model.
+
+Drops the property drawer if present.  One source blank between ordinary
+entries is retained so a canonical rendered model is byte-stable when parsed
+and rendered again.  Blank lines used solely as padding around headings,
+Title, or Subtitle keywords are discarded; repeated empty paragraphs remain
+intentionally lossy.  Inverse of `gdocs-dm-to-org' (lossy for unsupported
+syntax)."
   (with-temp-buffer
     (let ((org-inhibit-startup t)) (insert org-text))
     (org-mode)
@@ -1778,7 +2028,11 @@ if present. Inverse of `gdocs-dm-to-org' (lossy for unsupported syntax)."
         (delete-region (match-beginning 0) (match-end 0))
         (when (looking-at "\n") (delete-char 1))))
     (let* ((tree (org-element-parse-buffer))
-           (paras (cl-mapcan #'gdocs--walk-org-element (cddr tree))))
+           (with-spans
+            (cl-mapcan
+             (lambda (el) (gdocs--walk-org-element el t))
+             (cddr tree)))
+           (paras (gdocs--org-with-meaningful-blanks with-spans)))
       (gdocs-dm-make-doc :revision nil :doc-id nil :title nil
                          :paragraphs paras))))
 
@@ -2047,7 +2301,8 @@ Bullet glyphs cycle ●/○/■ across levels; numbered uses no glyph string
 string and OPS is the list of `ae'/`as' ops needed to recreate styling.
 The caller is responsible for `ds' (clear old body) and `is' (insert
 BODY at position 1)."
-  (let* ((paragraphs (gdocs-dm-paragraphs doc))
+  (let* ((paragraphs (gdocs--normalize-paragraphs-for-ot
+                      (gdocs-dm-paragraphs doc)))
          (list-defs (gdocs--collect-list-ids paragraphs))
          (parts nil)
          (pos 1)
@@ -2114,14 +2369,22 @@ BODY at position 1)."
   "Return non-nil if P1 and P2 are equivalent at the user-visible level.
 Compares kind, runs, heading level, list nest/glyph, but NOT list-id —
 list ids differ between live-decoded and freshly-rendered docs."
-  (and (eq (plist-get p1 :kind) (plist-get p2 :kind))
-       (equal (plist-get p1 :level) (plist-get p2 :level))
-       (equal (plist-get p1 :nest) (plist-get p2 :nest))
-       (equal (plist-get p1 :glyph) (plist-get p2 :glyph))
-       (let ((r1 (plist-get p1 :runs))
-             (r2 (plist-get p2 :runs)))
-         (and (= (length r1) (length r2))
-              (cl-every #'gdocs--run-text-equal-p r1 r2)))))
+  (let ((kind (plist-get p1 :kind)))
+    (and (eq kind (plist-get p2 :kind))
+         ;; A missing heading level renders exactly like level 1, so it should
+         ;; not turn a spacing-only/render-normalization pass into an OT edit.
+         (equal (if (eq kind :heading)
+                    (or (plist-get p1 :level) 1)
+                  (plist-get p1 :level))
+                (if (eq kind :heading)
+                    (or (plist-get p2 :level) 1)
+                  (plist-get p2 :level)))
+         (equal (plist-get p1 :nest) (plist-get p2 :nest))
+         (equal (plist-get p1 :glyph) (plist-get p2 :glyph))
+         (let ((r1 (plist-get p1 :runs))
+               (r2 (plist-get p2 :runs)))
+           (and (= (length r1) (length r2))
+                (cl-every #'gdocs--run-text-equal-p r1 r2))))))
 
 (defun gdocs--paragraphs-common-prefix (a b)
   (let ((n 0))
@@ -2153,8 +2416,10 @@ list or table paragraphs — those carry entity ids whose live values we
 don't track yet, so re-emitting them in-place can desync references.
 
 Returns a list of OT save commands (possibly empty if docs are equal)."
-  (let* ((old-paras (gdocs-dm-paragraphs old-doc))
-         (new-paras (gdocs-dm-paragraphs new-doc))
+  (let* ((old-paras (gdocs--normalize-paragraphs-for-ot
+                     (gdocs-dm-paragraphs old-doc)))
+         (new-paras (gdocs--normalize-paragraphs-for-ot
+                     (gdocs-dm-paragraphs new-doc)))
          (pre (gdocs--paragraphs-common-prefix old-paras new-paras))
          (suf (gdocs--paragraphs-common-suffix
                (nthcdr pre old-paras) (nthcdr pre new-paras)))

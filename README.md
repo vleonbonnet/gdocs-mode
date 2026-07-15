@@ -27,6 +27,25 @@ changed, it surfaces a one-shot conflict warning and takes no action.
 - **Org link interception** — opening a `docs.google.com/document/d/...` link
 in Org opens it through `gdocs-mode` instead of the browser.
 
+### Spacing canonicalization
+
+Pull/render uses a structural spacing policy rather than rewriting the final
+text with a regular expression:
+
+- heading, `#+title:`, and `#+subtitle:` entries have exactly one blank line
+before and after them when neighboring content exists;
+- consecutive Google Docs empty paragraphs are reduced to one meaningful Org
+blank line, while leading/trailing empty paragraphs are discarded;
+- empty paragraphs between source-code paragraphs remain empty source lines,
+and heading padding is never inserted inside a source block;
+- lists stay contiguous unless the source contains a meaningful blank
+paragraph.
+
+Repeated empty paragraphs are intentionally handled lossily: Google Docs'
+arbitrary visual vertical spacing has no stable Org equivalent. The normalized
+paragraph model is also used by the OT emitter and paragraph diff, so a
+synthetic heading blank cannot become a new remote paragraph on every cycle.
+
 ## Requirements
 
 - Emacs **29.1+** (uses the built-in `sqlite-*` API for the cookie backend).

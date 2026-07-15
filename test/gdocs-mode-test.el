@@ -460,7 +460,133 @@ END is the inclusive final OT position."
                   (plist-get fixture :repeated-blank-model))))
          (org (gdocs-dm-to-org model)))
     (should (equal (gdocs-test--normalize-org org)
-                   "#+title: Same Name\n\n#+subtitle: A subtitle\n\nBefore\n\n\n** Heading\n\n\n\nAfter\n"))))
+                   "#+title: Same Name\n\n#+subtitle: A subtitle\n\nBefore\n\n** Heading\n\nAfter\n"))))
+
+(ert-deftest gdocs-test-canonical-heading-spacing-policy ()
+  "Heading-like entries use one idempotent blank line of padding."
+  (let ((para (lambda (kind text &optional level)
+                (list :kind kind
+                      :level level
+                      :runs (when text (list (gdocs-dm-make-run text))))))
+        (blank (lambda () (list :kind :blank :runs nil))))
+    (dolist (paragraphs-and-expected
+             (list
+              (cons (list (funcall para :para "Before")
+                          (funcall para :heading "Heading" 2)
+                          (funcall para :para "After"))
+                    "Before\n\n** Heading\n\nAfter\n")
+              (cons (list (funcall para :para "Before")
+                          (funcall blank)
+                          (funcall blank)
+                          (funcall para :heading "Heading" 2)
+                          (funcall blank)
+                          (funcall blank)
+                          (funcall para :para "After"))
+                    "Before\n\n** Heading\n\nAfter\n")
+              (cons (list (funcall para :heading "One" 1)
+                          (funcall para :heading "Two" 1))
+                    "* One\n\n* Two\n")))
+      (should (equal (gdocs-dm-to-org
+                      (gdocs-dm-make-doc
+                       :paragraphs (car paragraphs-and-expected)))
+                     (cdr paragraphs-and-expected))))))
+
+(ert-deftest gdocs-test-canonical-blank-model-and-org-round-trip ()
+  "Repeated, edge, and meaningful blanks have a stable lossy policy."
+  (let ((para (lambda (kind text)
+                (list :kind kind
+                      :runs (when text (list (gdocs-dm-make-run text)))))))
+    (let* ((model
+            (gdocs-dm-make-doc
+             :paragraphs
+             (list (funcall para :blank nil)
+                   (funcall para :blank nil)
+                   (funcall para :para "First")
+                   (funcall para :blank nil)
+                   (funcall para :blank nil)
+                   (funcall para :para "Second")
+                   (funcall para :blank nil)
+                   (funcall para :blank nil))))
+           (first (gdocs-dm-to-org model))
+           (second (gdocs-dm-to-org (gdocs-dm-from-org first))))
+      (should (equal first "First\n\nSecond\n"))
+      (should (equal first second)))
+    ;; A blank between ordinary content and a list is meaningful; without it
+    ;; list entries remain contiguous with the preceding paragraph.
+    (should (equal
+             (gdocs-dm-to-org
+              (gdocs-dm-from-org "Paragraph\n\n\n- one\n- two\n"))
+             "Paragraph\n\n- one\n- two\n"))
+    (should (equal
+             (gdocs-dm-to-org
+              (gdocs-dm-from-org "Paragraph\n- one\n- two\n"))
+             "Paragraph\n- one\n- two\n"))))
+
+(ert-deftest gdocs-test-canonical-title-subtitle-spacing ()
+  "Title and Subtitle keywords follow the same one-blank policy."
+  (let ((title (list :kind :title
+                     :runs (list (gdocs-dm-make-run "Document"))))
+        (subtitle (list :kind :subtitle
+                        :runs (list (gdocs-dm-make-run "A subtitle"))))
+        (para (list :kind :para
+                    :runs (list (gdocs-dm-make-run "Body")))))
+    (should (equal
+             (gdocs-dm-to-org (gdocs-dm-make-doc
+                               :paragraphs (list title para)))
+             "#+title: Document\n\nBody\n"))
+    (should (equal
+             (gdocs-dm-to-org (gdocs-dm-make-doc
+                               :paragraphs (list title subtitle para)))
+             "#+title: Document\n\n#+subtitle: A subtitle\n\nBody\n"))))
+
+(ert-deftest gdocs-test-canonical-source-block-and-boundaries ()
+  "Empty source lines stay inside one source block, without padding noise."
+  (let ((code (lambda (text)
+                (list :kind :code
+                      :runs (list (gdocs-dm-make-run text)))))
+        (heading (list :kind :heading :level 1
+                       :runs (list (gdocs-dm-make-run "Code")))))
+    (should (equal
+             (gdocs-dm-to-org
+              (gdocs-dm-make-doc
+               :paragraphs (list heading
+                                 (funcall code "alpha")
+                                 (funcall code "")
+                                 (funcall code "beta"))))
+             "* Code\n\n#+begin_src text\nalpha\n\nbeta\n#+end_src\n"))
+    ;; A generic blank between code paragraphs is normalized to the same
+    ;; empty source line rather than splitting the block.
+    (should (equal
+             (gdocs-dm-to-org
+              (gdocs-dm-make-doc
+               :paragraphs (list (funcall code "alpha")
+                                 (list :kind :blank :runs nil)
+                                 (list :kind :blank :runs nil)
+                                 (funcall code "beta"))))
+             "#+begin_src text\nalpha\n\nbeta\n#+end_src\n"))))
+
+(ert-deftest gdocs-test-canonical-spacing-does-not-create-diff-noise ()
+  "Canonical render/parse cycles compare equal at paragraph granularity."
+  (let* ((source "Before\n\n\n* Heading\n\n\nAfter\n")
+         (first (gdocs-dm-to-org (gdocs-dm-from-org source)))
+         (second (gdocs-dm-to-org (gdocs-dm-from-org first))))
+    (should (equal first "Before\n\n* Heading\n\nAfter\n"))
+    (should (equal first second))
+    (should-not (gdocs--diff-paragraphs first second))
+    ;; Explicit Google blanks around a heading normalize to the same model as
+    ;; synthetic Org padding, so an incremental push has no spacing-only ops.
+    (let* ((old (gdocs-dm-make-doc
+                 :paragraphs
+                 (list (list :kind :para
+                             :runs (list (gdocs-dm-make-run "Before")))
+                       (list :kind :blank :runs nil)
+                       (list :kind :heading :runs
+                             (list (gdocs-dm-make-run "Heading")))
+                       (list :kind :blank :runs nil)
+                       (list :kind :para
+                             :runs (list (gdocs-dm-make-run "After"))))))
+           (new (gdocs-dm-from-org first)))
+      (should-not (gdocs-dm-to-incremental-save-commands old new)))))
 
 (ert-deftest gdocs-test-render-list-variants-and-nesting ()
   "Bullet/number glyphs and nesting become stable Org list markers."
