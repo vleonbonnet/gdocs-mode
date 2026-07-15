@@ -191,6 +191,26 @@ streams, including `lnks_link.ulnk_url'."
              (plist-get fixture :list-bindings))
      (plist-get fixture :unknown-ops))))
 
+(defun gdocs-test--title-pipeline (drive-title body paragraph-styles)
+  "Run the pull pipeline for a synthetic BODY and paragraph styles."
+  (let* ((fixture (list :body body :paragraph-styles paragraph-styles))
+         (ops (gdocs-test--fixture-ops fixture))
+         (state (list :revision 12 :title drive-title :ot-body body)))
+    (gdocs--ot-decode-pipeline
+     "synthetic-title-document"
+     (gdocs-test--html-for-ops 12 ops)
+     state)))
+
+(defun gdocs-test--apply-pull (initial title body)
+  "Apply a synthetic pull BODY to INITIAL and return its resulting buffer text."
+  (with-temp-buffer
+    (insert initial)
+    (org-mode)
+    (cl-letf (((symbol-function 'gdocs--flash-regions) (lambda (_ranges) nil)))
+      (gdocs--apply-pull-into-buffer "synthetic-title-document"
+                                     (current-buffer) title body))
+    (buffer-string)))
+
 (defun gdocs-test--run-view (run)
   "Return the stable, user-visible shape of RUN."
   (list (plist-get run :text)
@@ -1045,14 +1065,54 @@ END is the inclusive final OT position."
     (should (string-match-p
              "^:PROPERTIES:\n:GDOC_ID: synthetic-basic-document\n"
              pull-body))
+    (should (string-match-p ":GDOC_TITLE: Synthetic Document" pull-body))
     (should (string-match-p ":GDOC_REVISION: 12" pull-body))
     (should (string-match-p "^#\\+date: \\[20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]"
                             pull-body))
-    ;; One title is document metadata and the other is the body Title style.
+    ;; The Drive name is in GDOC_TITLE; only the body Title style is visible.
     (should (= (gdocs-test--count-substring pull-body
                                             "#+title: Synthetic Document")
-               2))
+               1))
     (should (string-suffix-p "Body text\n" pull-body))))
+
+(ert-deftest gdocs-test-pipeline-drive-title-without-body-title ()
+  "A Drive name does not create a synthetic Org title keyword."
+  (let* ((result (gdocs-test--title-pipeline "Drive name" "Body\n" nil))
+         (pull-body (cdr result)))
+    (should (equal (car result) "Drive name"))
+    (should (string-match-p ":GDOC_TITLE: Drive name" pull-body))
+    (should-not (string-match-p "^#\\+title:" pull-body))))
+
+(ert-deftest gdocs-test-pipeline-body-title-is-independent-of-drive-name ()
+  "A body Title paragraph remains visible and may equal or differ from the Drive name."
+  (dolist (case '(("Same" "Same") ("Drive name" "Body title")))
+    (let* ((drive-title (car case))
+           (body-title (cadr case))
+           (result (gdocs-test--title-pipeline
+                    drive-title
+                    (concat body-title "\nBody\n")
+                    '((:line 1 :kind :title))))
+           (pull-body (cdr result)))
+      (should (string-match-p
+               (format ":GDOC_TITLE: %s" drive-title)
+               pull-body))
+      (should (= (gdocs-test--count-substring
+                  pull-body (format "#+title: %s" body-title))
+                 1)))))
+
+(ert-deftest gdocs-test-pipeline-preserves-title-and-subtitle-body-styles ()
+  "Title and Subtitle body paragraphs are both emitted without metadata duplicates."
+  (let* ((result (gdocs-test--title-pipeline
+                  "Drive name"
+                  "Body title\nBody subtitle\nBody\n"
+                  '((:line 1 :kind :title)
+                    (:line 2 :kind :subtitle))))
+         (pull-body (cdr result)))
+    (should (equal (gdocs-test--count-substring pull-body "#+title:") 1))
+    (should (equal (gdocs-test--count-substring pull-body "#+subtitle:") 1))
+    (should (string-suffix-p
+             "#+title: Body title\n\n#+subtitle: Body subtitle\n\nBody\n"
+             pull-body))))
 
 (ert-deftest gdocs-test-pull-body-and-body-start-detection ()
   "Pull metadata is separated from the body without touching user content."
@@ -1069,25 +1129,142 @@ END is the inclusive final OT position."
                      ("GDOC_REVISION" . "12"))))
     (should (equal (nth 1 parsed) "Synthetic title"))
     (should (equal (nth 2 parsed) "* Body heading\nBody\n")))
+  (let* ((body (concat ":PROPERTIES:\n"
+                       ":GDOC_ID: synthetic-id\n"
+                       ":GDOC_TITLE: Drive name\n"
+                       ":END:\n"
+                       "#+title: Body title\n\nBody\n"))
+         (parsed (gdocs--parse-pull-body body)))
+    (should-not (nth 1 parsed))
+    (should (equal (nth 2 parsed) "#+title: Body title\n\nBody\n")))
   (with-temp-buffer
     (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:END:\n"
             "#+title: Synthetic title\n\n\nBody\n")
     (org-mode)
     (should (equal (buffer-substring (gdocs--body-start-pos) (point-max))
-                   "Body\n"))))
+                   "Body\n")))
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n"
+            ":GDOC_TITLE: Drive name\n:END:\n"
+            "#+title: Body title\n\nBody\n")
+    (org-mode)
+    (should (equal (buffer-substring (gdocs--body-start-pos) (point-max))
+                   "#+title: Body title\n\nBody\n"))))
+
+(ert-deftest gdocs-test-legacy-title-migrates-without-body-title ()
+  "A legacy synthetic title is removed when the remote body has no Title style."
+  (let* ((initial (concat ":PROPERTIES:\n:GDOC_ID: synthetic-title-document\n:END:\n"
+                          "#+title: Drive name\n\nBody\n"))
+         (remote (concat ":PROPERTIES:\n"
+                         ":GDOC_ID: synthetic-title-document\n"
+                         ":GDOC_TITLE: Drive name\n"
+                         ":GDOC_REVISION: 12\n:END:\n"
+                         "Body\n"))
+         (result (gdocs-test--apply-pull initial "Drive name" remote)))
+    (should-not (string-match-p "^#\\+title:" result))
+    (should (string-match-p ":GDOC_TITLE: Drive name" result))
+    (should (string-match-p "Body\n\\'" result))))
+
+(ert-deftest gdocs-test-legacy-duplicate-titles-preserve-body-title ()
+  "Migration removes only synthetic metadata, including when both titles match."
+  (dolist (body-title '("Drive name" "Body title"))
+    (let* ((initial (concat ":PROPERTIES:\n:GDOC_ID: synthetic-title-document\n:END:\n"
+                            "#+title: Drive name\n\n"
+                            (format "#+title: %s\n\nBody\n" body-title)))
+           (remote (concat ":PROPERTIES:\n"
+                           ":GDOC_ID: synthetic-title-document\n"
+                           ":GDOC_TITLE: Drive name\n"
+                           ":GDOC_REVISION: 12\n:END:\n"
+                           (format "#+title: %s\n\nBody\n" body-title)))
+           (result (gdocs-test--apply-pull initial "Drive name" remote)))
+      (should (= (gdocs-test--count-substring result "#+title:") 1))
+      (should (string-match-p
+               (format "^#\\+title: %s$" (regexp-quote body-title))
+               result))
+      (should (string-match-p ":GDOC_TITLE: Drive name" result)))))
+
+(ert-deftest gdocs-test-pull-body-title-and-subtitle-are-pushable ()
+  "Pulling Title and Subtitle keeps both in the body sent to the OT encoder."
+  (let* ((pipeline (gdocs-test--title-pipeline
+                    "Drive name"
+                    "Body title\nBody subtitle\nBody\n"
+                    '((:line 1 :kind :title)
+                      (:line 2 :kind :subtitle))))
+         (result (gdocs-test--apply-pull
+                  ":PROPERTIES:\n:GDOC_ID: synthetic-title-document\n:END:\n"
+                  (car pipeline)
+                  (cdr pipeline))))
+    (should (string-match-p ":GDOC_TITLE: Drive name" result))
+    (let* ((body (with-temp-buffer
+                   (insert result)
+                   (org-mode)
+                   (gdocs--buffer-body-as-plain)))
+           (doc (gdocs-dm-from-org body))
+           (kinds (mapcar (lambda (p) (plist-get p :kind))
+                          (gdocs-dm-paragraphs doc)))
+           (ops (cdr (gdocs-dm-to-ot doc)))
+           (paragraph-headings
+            (mapcar (lambda (op) (alist-get 'ps_hd (alist-get 'sm op)))
+                    (seq-filter (lambda (op)
+                                  (equal (alist-get 'st op) "paragraph"))
+                                ops))))
+      (should (equal (seq-take kinds 3) '(:title :subtitle :para)))
+      (should (equal paragraph-headings '(100 101))))))
+
+(ert-deftest gdocs-test-title-keywords-strip-to-ot-plain-text ()
+  "Markup matching removes Title syntax but retains its body text and offsets."
+  (let* ((org "#+title: Body title\n\n#+subtitle: Body subtitle\n\nBody\n")
+         (stripped+offsets (gdocs--strip-org-markup org)))
+    (should (equal (car stripped+offsets)
+                   "Body title\n\nBody subtitle\n\nBody\n"))
+    (should (= (aref (cdr stripped+offsets) 0)
+               (length "#+title: ")))
+    (should (= (aref (cdr stripped+offsets)
+                     (string-match "Body subtitle" (car stripped+offsets)))
+               (string-match "Body subtitle" org)))))
+
+(ert-deftest gdocs-test-remote-org-body-retains-body-title-keywords ()
+  "The remote push view retains Title/Subtitle body syntax."
+  (let* ((body "Body title\nBody subtitle\nBody\n")
+         (fixture (list :body body
+                        :paragraph-styles '((:line 1 :kind :title)
+                                            (:line 2 :kind :subtitle))))
+         (ops (gdocs-test--fixture-ops fixture))
+         (html (gdocs-test--html-for-ops 12 ops))
+         (state (list :revision 12 :title "Drive name" :ot-body body)))
+    (should (equal (gdocs--ot-remote-org-body
+                    "synthetic-title-document" html state)
+                   "#+title: Body title\n\n#+subtitle: Body subtitle\n\nBody\n"))))
+
+(ert-deftest gdocs-test-pipeline-content-hash-matches-pushable-body ()
+  "The pull hash covers body Title syntax but excludes its synchronization wrapper."
+  (let* ((pipeline
+          (gdocs-test--title-pipeline
+           "Drive name"
+           "Body title\nBody\n"
+           (list (list :line 1 :kind :title))))
+         (body (cdr pipeline)))
+    (with-temp-buffer
+      (insert body)
+      (org-mode)
+      (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                     (gdocs--current-body-hash))))))
 
 (ert-deftest gdocs-test-content-hash-ignores-sync-metadata ()
-  "The body hash ignores the top drawer and title but tracks body edits."
+  "The body hash ignores synchronization metadata but tracks body Title edits."
   (with-temp-buffer
-    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:END:\n"
-            "#+title: First title\n\nBody\n")
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n"
+            ":GDOC_TITLE: Drive title\n:END:\n"
+            "#+title: Body title\n\nBody\n")
     (org-mode)
     (let ((hash (gdocs--current-body-hash)))
       (gdocs--put-top-property "GDOC_REVISION" "9")
+      (gdocs--put-top-property "GDOC_TITLE" "Renamed Drive title")
+      (should (equal hash (gdocs--current-body-hash)))
       (goto-char (point-min))
       (re-search-forward "^#\\+title:.*$" nil t)
-      (replace-match "#+title: Changed title" t t)
-      (should (equal hash (gdocs--current-body-hash)))
+      (replace-match "#+title: Changed body title" t t)
+      (should-not (equal hash (gdocs--current-body-hash)))
       (goto-char (point-max))
       (insert "changed")
       (should-not (equal hash (gdocs--current-body-hash))))))

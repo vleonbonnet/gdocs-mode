@@ -169,6 +169,7 @@ These properties are maintained on the top-level node of every synced buffer:
 | Property         | Purpose                                       |
 |------------------|-----------------------------------------------|
 | `GDOC_ID`        | Identifies the remote document.               |
+| `GDOC_TITLE`     | Stores the Google Drive document name. Body `#+title:` keywords remain Title-styled paragraphs and are pushable content. |
 | `GDOC_REVISION`  | Staleness anchor — last known remote revision.|
 | `GDOC_SYNCED_AT` | Timestamp of the last successful pull or push.|
 

@@ -120,8 +120,8 @@ Default `warn' keeps *Messages* quiet during normal pull/push; set to
   "Global mutex for sync operations.")
 
 (defvar-local gdocs--last-synced-hash nil
-  "SHA-256 of the buffer body (sans top property drawer and #+title
-line) at the moment of the last successful pull or push. Used by
+  "SHA-256 of the pushable buffer body (sans synchronization metadata)
+at the moment of the last successful pull or push. Used by
 `gdocs--auto-sync-tick' to detect unsynced local edits without relying
 on `buffer-modified-p' (which is unreliable in temp/indirect buffers
 and not set when content is inserted programmatically).")
@@ -228,17 +228,13 @@ request.el's chatty backend logs so *Messages* stays clean."
     (org-entry-put (point-min) key value)))
 
 (defun gdocs--update-top-metadata (title revision)
-  "Write title (as #+title) and revision/timestamp properties."
+  "Write the Drive TITLE and revision/timestamp properties.
+
+The Drive document name is synchronization metadata, not an Org keyword.
+Title-styled paragraphs are rendered separately by `gdocs-dm-to-org'."
   (save-excursion
     (when title
-      (goto-char (point-min))
-      (if (re-search-forward "^#\\+title:.*$" nil t)
-          (replace-match (format "#+title: %s" title) t t)
-        (goto-char (point-min))
-        (when (looking-at org-property-drawer-re)
-          (goto-char (match-end 0))
-          (forward-line))
-        (insert (format "#+title: %s\n" title))))
+      (gdocs--put-top-property "GDOC_TITLE" title))
     (when revision
       (gdocs--put-top-property "GDOC_REVISION" revision))
     (gdocs--put-top-property "GDOC_SYNCED_AT" (gdocs--now-iso))))
@@ -1461,10 +1457,9 @@ ORDINAL applies to numbered list items only — see `gdocs--render-list-bullet'.
     (pcase kind
       (:blank "")
       ;; Google Docs distinguishes the doc *name* (metadata, fetched
-      ;; from the HTML <title>) from Title-styled body paragraphs. We
-      ;; surface the doc name as the first `#+title:' line in the buffer
-      ;; wrapper, and each body Title paragraph as an additional
-      ;; `#+title:' keyword inline so round-trips preserve both.
+      ;; from the HTML <title>) from Title-styled body paragraphs. The
+      ;; document name is stored in GDOC_TITLE by the pull wrapper; this
+      ;; branch renders only the body paragraph.
       (:title (if (string-empty-p text) ""
                 (format "#+title: %s" text)))
       (:subtitle (if (string-empty-p text) ""
@@ -2480,9 +2475,11 @@ nil/zero/garbage input."
 
 (defun gdocs--ot-decode-pipeline (doc-id html state &optional creation-time-ms)
   "Pure transform: decode an OT-backed HTML + STATE into (TITLE . BODY).
-Returns (TITLE . BODY) — BODY includes the properties drawer, the
-`#+title:' line, and (when CREATION-TIME-MS is non-nil) a `#+date:'
-line, ready for `gdocs--apply-pull-into-buffer'."
+Returns (TITLE . BODY) — BODY includes the properties drawer,
+Title/Subtitle keywords that are part of the document body, and (when
+CREATION-TIME-MS is non-nil) a `#+date:' line, ready for
+`gdocs--apply-pull-into-buffer'. The Drive document name is stored as
+`GDOC_TITLE', never as a synthetic body keyword."
   (let* ((parsed (gdocs--parse-model-chunk-full html))
          (ops (plist-get parsed :ops))
          (revision (or (plist-get state :revision)
@@ -2495,15 +2492,17 @@ line, ready for `gdocs--apply-pull-into-buffer'."
          (date-str (gdocs--format-creation-date creation-time-ms))
          (header
           (concat
-           (when edit-title (format "#+title: %s\n" edit-title))
            (when date-str (format "#+date: %s\n" date-str))
-           (when (or edit-title date-str) "\n")))
+           (when date-str "\n")))
          (titled (concat header org-content))
-         (hash (secure-hash 'sha256 titled))
          (effective-title (or edit-title doc-id))
+         ;; Hash only the text that can be sent back to Google. The date,
+         ;; property drawer, and GDOC_TITLE are synchronization metadata.
+         (hash (secure-hash 'sha256 org-content))
          (props (format
-                 ":PROPERTIES:\n:GDOC_ID: %s\n:GDOC_REVISION: %s\n:GDOC_CONTENT_HASH: %s\n:GDOC_SYNCED_AT: %s\n:END:\n"
+                 ":PROPERTIES:\n:GDOC_ID: %s\n:GDOC_TITLE: %s\n:GDOC_REVISION: %s\n:GDOC_CONTENT_HASH: %s\n:GDOC_SYNCED_AT: %s\n:END:\n"
                  doc-id
+                 effective-title
                  (if revision (number-to-string revision) "")
                  hash
                  (gdocs--now-iso))))
@@ -2565,9 +2564,11 @@ Returns (STRIPPED . OFFSETS) where OFFSETS is a vector of length
 `(length STRIPPED)'; OFFSETS[i] is the index in TEXT of STRIPPED[i].
 
 Strips:
-- Heading prefix at line start: `^\\*+ ' (e.g. `* H' → `H').
-- PROPERTIES drawer: `:PROPERTIES:\\n...:END:\\n' removed entirely.
-- Unordered list marker at line start: `^\\s-*[-+] '.
+ - Heading prefix at line start: `^\\*+ ' (e.g. `* H' → `H').
+ - PROPERTIES drawer: `:PROPERTIES:\\n...:END:\\n' removed entirely.
+ - Body Title/Subtitle keyword prefixes: `#+title: ' / `#+subtitle: '
+   removed while their paragraph text is retained.
+ - Unordered list marker at line start: `^\\s-*[-+] '.
 - Ordered list marker at line start: `^\\s-*[0-9]+[.)] '.
 
 Leaves tables, code blocks, and inline markup alone — those need their
@@ -2591,6 +2592,18 @@ position in the org buffer."
         (let ((end (string-match "^:END:[ \t]*\n?" text i)))
           (setq i (if end (match-end 0) n)
                 at-line-start t)))
+       ;; Body Title/Subtitle keywords are Org syntax for paragraph styles;
+       ;; OT plain text contains only the paragraph text.
+       ((and at-line-start
+             (let* ((line-end (or (string-match "\n" text i) n))
+                    (line (substring text i line-end)))
+               (string-match-p
+                "\\`#\\+\\(?:title\\|subtitle\\):[ \t]*" line)))
+        (let* ((line-end (or (string-match "\n" text i) n))
+               (line (substring text i line-end)))
+          (string-match "\\`#\\+\\(?:title\\|subtitle\\):[ \t]*" line)
+          (setq i (+ i (match-end 0))
+                at-line-start nil)))
        ;; Heading marker at line start: ^\*+
        ((and at-line-start (= (aref text i) ?*))
         (let ((k i))
@@ -3004,16 +3017,19 @@ overlay removal if the frame can't report colors (e.g. batch/tty)."
       (when (markerp (cdr range)) (set-marker (cdr range) nil)))))
 
 (defun gdocs--parse-pull-body (body)
-  "Split a pull BODY into (DRAWER-ALIST TITLE CONTENT).
+  "Split a pull BODY into (DRAWER-ALIST LEGACY-TITLE CONTENT).
 
 DRAWER-ALIST is a list of (KEY . VALUE) strings from a leading
-`:PROPERTIES:'…`:END:' block; TITLE is the value of a leading
-`#+title:' line; CONTENT is everything after, with any blank lines
-between the header and the body skipped. All three parts are optional."
+`:PROPERTIES:'…`:END:' block. LEGACY-TITLE is the value of a leading
+`#+title:' line only when the drawer lacks `GDOC_TITLE', which identifies
+the old representation where the first title was synthetic metadata.
+CONTENT is everything after synchronization metadata, with blank lines
+between the header and the body skipped. A leading `#+title:' in a new
+`GDOC_TITLE'-bearing body is content and is never stripped."
   (with-temp-buffer
     (insert body)
     (goto-char (point-min))
-    (let ((drawer nil) (title nil))
+    (let ((drawer nil) (legacy-title nil))
       (when (looking-at "^:PROPERTIES:[ \t]*\n")
         (forward-line 1)
         (while (and (not (eobp))
@@ -3026,35 +3042,86 @@ between the header and the body skipped. All three parts are optional."
           (forward-line 1))
         (when (looking-at "^:END:[ \t]*$")
           (forward-line 1)))
-      (when (looking-at "^#\\+title:[ \t]*\\(.*\\)$")
+      ;; Before GDOC_TITLE existed, the pull wrapper put the Drive name in
+      ;; this position. Preserve that parser behavior for old serialized pull
+      ;; bodies, while treating a title keyword in the new representation as
+      ;; an actual body paragraph.
+      (when (and drawer
+                 (not (assoc "GDOC_TITLE" drawer))
+                 (looking-at "^#\\+title:[ \t]*\\(.*\\)$"))
         (let ((m (match-string-no-properties 1)))
           (when (and m (not (string-empty-p (string-trim m))))
-            (setq title (string-trim m))))
+            (setq legacy-title (string-trim m))))
         (forward-line 1))
       (when (looking-at "^#\\+date:[ \t]*.*$")
         (forward-line 1))
       (while (and (not (eobp)) (looking-at "^[ \t]*\n"))
         (forward-line 1))
-      (list (nreverse drawer) title
+      (list (nreverse drawer) legacy-title
             (buffer-substring-no-properties (point) (point-max))))))
 
-(defun gdocs--body-start-pos ()
-  "Return the position where the doc body starts in the current buffer
-\(after the top-level property drawer and #+title line, mirroring
-`gdocs--buffer-body-as-plain'). The pattern matches a blank line only
-when it ends in a newline, so we never spin at end-of-buffer."
+(defun gdocs--top-property-value (key)
+  "Return top-level property KEY in the current Org buffer, or nil."
+  (and (derived-mode-p 'org-mode)
+       (save-excursion
+         (goto-char (point-min))
+         (org-entry-get (point-min) key t))))
+
+(defun gdocs--legacy-leading-title-region ()
+  "Return the old synthetic title region, or nil.
+
+Legacy synchronized buffers have a `GDOC_ID' but no `GDOC_TITLE'; their
+first `#+title:' after the top property drawer is the Drive document name.
+The returned region includes the blank padding immediately following that
+line, but never a second title paragraph."
   (save-excursion
     (goto-char (point-min))
-    (when (looking-at org-property-drawer-re)
-      (goto-char (match-end 0))
-      (forward-line))
-    (when (looking-at "^#\\+title:.*\n")
-      (goto-char (match-end 0)))
-    (when (looking-at "^#\\+date:.*\n")
-      (goto-char (match-end 0)))
-    (while (and (not (eobp)) (looking-at "^[ \t]*\n"))
-      (forward-line 1))
-    (point)))
+    (when (and (gdocs--top-property-value "GDOC_ID")
+               (not (gdocs--top-property-value "GDOC_TITLE")))
+      (when (looking-at org-property-drawer-re)
+        (goto-char (match-end 0))
+        (forward-line))
+      (when (looking-at "^#\\+title:[^\n]*\n?")
+        (let ((start (point)))
+          (goto-char (match-end 0))
+          (while (and (not (eobp)) (looking-at "^[ \t]*\n"))
+            (forward-line 1))
+          (cons start (point)))))))
+
+(defun gdocs--migrate-legacy-title ()
+  "Remove the synthetic title from an old synchronized buffer.
+
+Only the first leading title is removed. A second, identical or different,
+`#+title:' remains available as the body Title paragraph."
+  (when-let ((region (gdocs--legacy-leading-title-region)))
+    (delete-region (car region) (cdr region))
+    t))
+
+(defun gdocs--skip-buffer-synchronization-metadata ()
+  "Move to the start of pushable body content in the current buffer.
+
+Skip the top property drawer, an old synthetic title when this is a legacy
+buffer, the generated date keyword, and leading presentation blanks. A
+`#+title:' is retained when `GDOC_TITLE' is present because it is then a
+pushable body Title paragraph."
+  (goto-char (point-min))
+  (when (looking-at org-property-drawer-re)
+    (goto-char (match-end 0))
+    (forward-line))
+  (when (and (gdocs--top-property-value "GDOC_ID")
+             (not (gdocs--top-property-value "GDOC_TITLE"))
+             (looking-at "^#\\+title:.*\n?"))
+    (goto-char (match-end 0)))
+  (when (looking-at "^#\\+date:.*\n")
+    (goto-char (match-end 0)))
+  (while (and (not (eobp)) (looking-at "^[ \t]*\n"))
+    (forward-line 1))
+  (point))
+
+(defun gdocs--body-start-pos ()
+  "Return the position where pushable document content starts."
+  (save-excursion
+    (gdocs--skip-buffer-synchronization-metadata)))
 
 (defun gdocs--apply-diff-regions (body-start regions)
   "Apply diff REGIONS to the current buffer's body.
@@ -3086,11 +3153,14 @@ Edits are applied in reverse order so earlier offsets stay valid."
 (defun gdocs--apply-pull-into-buffer (doc-id buf title body)
   "Update BUF so its body matches BODY, preserving point and metadata.
 
-Diffs the current body (everything after the top property drawer and
-#+title line) against BODY at paragraph granularity and edits only the
-changed regions. Replaced/inserted text is briefly highlighted via
-`gdocs--flash-regions'. Falls back to a full body replace if the diff
-would touch the whole document anyway."
+The Drive name is stored in `GDOC_TITLE'. Body Title/Subtitle keywords in
+BODY are ordinary pushable content. Old buffers whose first title is the
+synthetic metadata title are migrated before the body diff, so a second
+title remains intact even when its text equals the Drive name.
+
+Replaced/inserted text is briefly highlighted via `gdocs--flash-regions'.
+Falls back to a full body replace if the diff would touch the whole document
+anyway."
   (unless (and body (not (string-empty-p body)))
     (error "GDocs pull returned empty content"))
   (when (buffer-live-p buf)
@@ -3100,10 +3170,17 @@ would touch the whole document anyway."
              (point-marker (copy-marker (point) t))
              (parsed (gdocs--parse-pull-body body))
              (drawer (nth 0 parsed))
-             (parsed-title (nth 1 parsed))
+             (legacy-title (nth 1 parsed))
              (content (nth 2 parsed))
-             (effective-title (or parsed-title title)))
+             (effective-title (or title
+                                  (cdr (assoc "GDOC_TITLE" drawer))
+                                  legacy-title
+                                  doc-id)))
         (unless (derived-mode-p 'org-mode) (org-mode))
+        ;; The old representation had a synthetic leading #+title but no
+        ;; GDOC_TITLE property. Remove exactly that line before installing
+        ;; the new metadata; a second title is body content.
+        (gdocs--migrate-legacy-title)
         ;; Write top-level properties. GDOC_ID is forced to the doc-id
         ;; we were called with (canonical); other keys come from the
         ;; pull's drawer if present.
@@ -3111,19 +3188,9 @@ would touch the whole document anyway."
         (dolist (pair drawer)
           (unless (string= (car pair) "GDOC_ID")
             (gdocs--put-top-property (car pair) (cdr pair))))
-        (when effective-title
-          (save-excursion
-            (goto-char (point-min))
-            (if (re-search-forward "^#\\+title:.*$" nil t)
-                (replace-match (format "#+title: %s" effective-title) t t)
-              (gdocs--update-top-metadata effective-title nil))
-            ;; Ensure exactly one blank line between the title and the
-            ;; body. `body-start-pos' already skips them, but if there's
-            ;; no blank the body sits flush against the title.
-            (goto-char (point-min))
-            (when (re-search-forward "^#\\+title:.*\n" nil t)
-              (unless (looking-at "^[ \t]*\n")
-                (insert "\n")))))
+        ;; A successful pull always refreshes the Drive name and sync time.
+        ;; This deliberately does not create a visible #+title keyword.
+        (gdocs--update-top-metadata effective-title nil)
         (let* ((body-start (gdocs--body-start-pos))
                (current-content (buffer-substring-no-properties
                                  body-start (point-max))))
@@ -3158,6 +3225,10 @@ would touch the whole document anyway."
         (goto-char (marker-position point-marker))
         (set-marker point-marker nil)
         (org-cycle-hide-drawers 'all)
+        ;; Recompute after migration/body edits so legacy pull payloads
+        ;; cannot leave a hash for the old synthetic-title representation.
+        (gdocs--put-top-property "GDOC_CONTENT_HASH"
+                                 (gdocs--current-body-hash))
         (gdocs--mark-synced)
         (when (and (buffer-file-name) (not saved-mod))
           (save-buffer))))))
@@ -3166,7 +3237,10 @@ would touch the whole document anyway."
 ;;; Public commands — push
 
 (defun gdocs--current-body-hash ()
-  "SHA-256 of the buffer's pushable body (drawer + #+title stripped)."
+  "SHA-256 of the buffer's pushable body.
+
+Synchronization metadata, including `GDOC_TITLE', is excluded. A body
+`#+title:' remains part of the hashed text."
   (secure-hash 'sha256 (gdocs--buffer-body-as-plain)))
 
 (defun gdocs--mark-synced ()
@@ -3175,26 +3249,15 @@ Call inside `with-current-buffer' after every successful pull or push."
   (setq gdocs--last-synced-hash (gdocs--current-body-hash)))
 
 (defun gdocs--buffer-body-as-plain ()
-  "Dump buffer minus top property drawer and #+title to plain text.
+  "Dump the pushable body, excluding synchronization metadata.
 
-Also strips any trailing heading whose drawer carries `:GDOC_LOCAL: t'
+The top property drawer, legacy synthetic title, and generated date are
+excluded. A `#+title:' is retained when it belongs to the body. Also strips
+any trailing heading whose drawer carries `:GDOC_LOCAL: t'
 \(currently the auto-generated `* Comments' subtree, which is a
 read-only projection of Google's comments and must not be pushed)."
   (save-excursion
-    (goto-char (point-min))
-    (when (looking-at org-property-drawer-re)
-      (goto-char (match-end 0))
-      (forward-line))
-    ;; Also skip a leading #+title: line and any blank lines after it.
-    ;; The `\n' in the blank-line pattern is required so we don't loop at
-    ;; end-of-buffer where `looking-at' would match empty content forever.
-    (when (looking-at "^#\\+title:.*\n")
-      (goto-char (match-end 0)))
-    (when (looking-at "^#\\+date:.*\n")
-      (goto-char (match-end 0)))
-    (while (and (not (eobp)) (looking-at "^[ \t]*\n"))
-      (forward-line 1))
-    (let* ((body-start (point))
+    (let* ((body-start (gdocs--body-start-pos))
            (end (gdocs--find-local-subtree-start body-start))
            (text (buffer-substring-no-properties body-start end))
            (text (replace-regexp-in-string "\r\n" "\n" text))
@@ -3415,9 +3478,9 @@ of OT ops (alists). Returns parsed JSON response (XSSI-stripped)."
 (defun gdocs--ot-remote-org-body (doc-id html state)
   "Render the remote doc as the org view we diff pushes against.
 Pure transform: decodes the modelChunk in HTML through the same
-pipeline as the pull, then strips the leading `#+'-prefixed and blank
-lines so the result is the body text the push diff expects (heading
-markers and list markers preserved; org metadata stripped)."
+pipeline as the pull. The doc-model renderer emits only body content, so
+Title/Subtitle keywords must remain in the result: they are pushable body
+paragraphs, not synchronization metadata."
   (let* ((parsed (gdocs--parse-model-chunk-full html))
          (ops (plist-get parsed :ops))
          (revision (or (plist-get state :revision)
@@ -3426,13 +3489,8 @@ markers and list markers preserved; org metadata stripped)."
          (edit-title (plist-get state :title))
          (doc (gdocs-dm-from-ops revision doc-id edit-title
                                  (or ot-body "") ops))
-         (org (gdocs-dm-to-org doc))
-         (lines (split-string org "\n")))
-    (while (and lines
-                (or (string-prefix-p "#+" (car lines))
-                    (string-empty-p (string-trim (car lines)))))
-      (setq lines (cdr lines)))
-    (string-join lines "\n")))
+         (org (gdocs-dm-to-org doc)))
+    org))
 
 ;;; -------------------------------------------------------------------------
 ;;; Async HTTP layer
@@ -4937,15 +4995,23 @@ single-region diff, and the locate result (if any). Default OUT-FILE is
           (erase-buffer)
           (insert (format ":PROPERTIES:\n:GDOC_ID: %s\n:END:\n" doc-id))
           (goto-char (point-min))
-          (gdocs-pull-locally doc-id)
-          (let* ((new-title (save-excursion
-                              (goto-char (point-min))
-                              (when (re-search-forward "^#\\+title: \\(.*\\)$" nil t)
-                                (string-trim (match-string 1)))))
-                 (target-name (format "%s.org"
-                                      (if (and new-title (not (string-empty-p new-title)))
-                                          new-title doc-id))))
-            (rename-buffer target-name t))
+          (gdocs-pull-locally
+           doc-id
+           (lambda (_body err)
+             (when (and (not err) (buffer-live-p buffer))
+               (with-current-buffer buffer
+                 (let ((new-title (gdocs--top-property-value "GDOC_TITLE")))
+                   (when (and new-title (not (string-empty-p new-title)))
+                     (rename-buffer (format "%s.org" new-title) t)))))))
+          ;; The pull is asynchronous. Use an already stored GDOC_TITLE when
+          ;; reopening a prepared buffer, otherwise keep the ID placeholder
+          ;; until the fetched Drive metadata arrives in the callback.
+          (let ((new-title (gdocs--top-property-value "GDOC_TITLE")))
+            (rename-buffer
+             (format "%s.org"
+                     (if (and new-title (not (string-empty-p new-title)))
+                         new-title doc-id))
+             t))
           (gdocs-mode 1)
           (switch-to-buffer buffer))))))
 
