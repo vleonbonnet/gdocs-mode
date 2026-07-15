@@ -302,7 +302,8 @@ string payloads are represented by their lengths."
             (json-encode (vector (vector "sr" bundles 1700000000000))))))
 
 (defun gdocs-test--anchor-op (start end id)
-  "Construct a synthetic `doco_anchor' style op."
+  "Construct a synthetic `doco_anchor' style op.
+END is the inclusive final OT position."
   `((ty . "as") (st . "doco_anchor") (si . ,start) (ei . ,end)
     (sm . ((das_a . ((cv . ((op . "set")
                             (opValue . (,id))))))))))
@@ -561,7 +562,7 @@ string payloads are represented by their lengths."
 ;;; Comments
 
 (ert-deftest gdocs-test-comment-anchor-extraction ()
-  "Doco anchor ops decode their kix ID and inclusive/exclusive range."
+  "Doco anchor ops decode their kix ID and inclusive range."
   (let* ((op (gdocs-test--anchor-op 6 7 "kix.synthetic-final-letter"))
          (anchors (gdocs--decode-doco-anchors (list op))))
     (should (equal anchors
@@ -597,6 +598,104 @@ string payloads are represented by their lengths."
                     (plist-get fixture :ot-body)
                     anchor-map comments)))
     (should (equal rendered "A *word*[fn:1]\n"))))
+
+(ert-deftest gdocs-test-comment-inclusive-ei-does-not-split-words ()
+  "An inclusive EI places refs after the final letter of a word."
+  (dolist (word '("coverage" "code areas"))
+    (let* ((anchor "kix.inclusive-word")
+           (ot-body (concat word "\n"))
+           (si 1)
+           (ei (length word))
+           ;; [SI, EI) omits the final letter; [SI, EI] includes it.
+           (exclusive (substring ot-body (1- si) (1- ei)))
+           (inclusive (substring ot-body (1- si) ei)))
+      (should (equal exclusive (substring word 0 -1)))
+      (should (equal inclusive word))
+      (should
+       (equal
+        (gdocs--inline-comment-refs
+         ot-body ot-body
+         (list (cons anchor (cons si ei)))
+         (list (list 1 :text "synthetic" :anchor anchor)))
+        (concat word "[fn:1]\n"))))))
+
+(ert-deftest gdocs-test-comment-anchor-does-not-snap-to-word-boundary ()
+  "An explicitly partial range remains partial rather than being expanded."
+  (let* ((prefix "prefix ")
+         (word "coverage")
+         (partial (substring word 0 -1))
+         (ot-body (concat prefix word " suffix\n"))
+         (anchor "kix.partial-word")
+         (si (1+ (length prefix)))
+         (ei (+ si (length partial) -1)))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       ot-body ot-body
+       (list (cons anchor (cons si ei)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      (concat prefix partial "[fn:1]" (substring word -1) " suffix\n")))))
+
+(ert-deftest gdocs-test-comment-inclusive-ei-preserves-punctuation ()
+  "Punctuation included by EI remains before the inline ref."
+  (dolist (sentence '("sentence." "question?"))
+    (let ((anchor "kix.inclusive-punctuation"))
+      (should
+       (equal
+        (gdocs--inline-comment-refs
+         (concat sentence "\n")
+         (concat sentence "\n")
+         (list (cons anchor (cons 1 (length sentence))))
+         (list (list 1 :text "synthetic" :anchor anchor)))
+        (concat sentence "[fn:1]\n"))))))
+
+(ert-deftest gdocs-test-comment-inclusive-ei-places-ref-outside-emphasis ()
+  "Inline refs after styled text stay outside Org emphasis markers."
+  (let ((anchor "kix.emphasized-word"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "*coverage*\n"
+       "coverage\n"
+       (list (cons anchor (cons 1 8)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "*coverage*[fn:1]\n"))))
+
+(ert-deftest gdocs-test-comment-trailing-selected-space-is-not-anchor-end ()
+  "Trailing selected horizontal whitespace is ignored for placement."
+  (let ((anchor "kix.trailing-space"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "coverage \n"
+       "coverage \n"
+       (list (cons anchor (cons 1 9)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "coverage[fn:1] \n"))))
+
+(ert-deftest gdocs-test-comment-structural-codepoint-near-ei ()
+  "Structural OT codepoints do not move an anchor one character early."
+  (let ((marker (string gdocs--ot-cell-end))
+        (anchor "kix.structural-boundary"))
+    ;; First, EI is a visible character after a structural marker.
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "coverage\n"
+       (concat "coverag" marker "e\n")
+       (list (cons anchor (cons 1 9)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "coverage[fn:1]\n"))
+    ;; An anchor can also end on a structural position (for example, at a
+    ;; table-cell boundary).  It still belongs after the preceding text.
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "coverage\n"
+       (concat "coverage" marker "\n")
+       (list (cons anchor (cons 1 9)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "coverage[fn:1]\n"))))
 
 (ert-deftest gdocs-test-comment-ambiguous-context-is-not-placed ()
   "Repeated context does not receive a misleading inline footnote."

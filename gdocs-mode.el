@@ -263,43 +263,111 @@ pull rather than guess)."
     different))
 
 
+(defun gdocs--horizontal-whitespace-p (char)
+  "Return non-nil when CHAR is horizontal whitespace.
+The OT stream can contain regular spaces, tabs, or Unicode space
+characters such as NBSP.  Newlines are deliberately not included: a
+selected paragraph boundary is a real anchor boundary, not padding to
+discard."
+  (and char
+       (or (eq char ?\s)
+           (eq char ?\t)
+           (eq (get-char-code-property char 'general-category) 'Zs))))
+
+(defun gdocs--debug-context-suffix (text)
+  "Return a short suffix of TEXT suitable for debug diagnostics.
+Never log an entire document context merely because an anchor could not
+be placed."
+  (let* ((text (or text ""))
+         (limit 32)
+         (start (max 0 (- (length text) limit))))
+    (if (zerop start)
+        text
+      (concat "..." (substring text start)))))
+
 (defun gdocs--inline-comment-refs (org-body ot-body anchor-map comments)
   "Insert `[fn:N]' refs into ORG-BODY at each comment's anchor position.
 ANCHOR-MAP is the alist (KIX-ID . (SI . EI)) returned by
 `gdocs--decode-doco-anchors'. COMMENTS is the list returned by
-`gdocs--parse-docos-sync-response'. Only the first comment per anchor
-gets an inline ref — replies share the thread anchor and listing them
-all inline would clutter the prose. The ref lands at the end of the
-anchored span; a unique-match check skips placement when the context is
-ambiguous (an extra reply [fn:N+1] showing up inline is harmless but
-wrong)."
-  (let* ((plain+map (gdocs--ot-plain-and-map ot-body))
+`gdocs--parse-docos-sync-response'. Anchor positions are one-based OT
+positions and `EI' is the inclusive final position of the anchored range.
+Only the first comment per anchor gets an inline ref — replies share the
+thread anchor and listing them all inline would clutter the prose. The ref
+lands at the end of the anchored span; a unique-match check skips placement
+when the context is ambiguous (an extra reply [fn:N+1] showing up inline is
+harmless but wrong)."
+  (let* ((ot-body (or ot-body ""))
+         (plain+map (gdocs--ot-plain-and-map ot-body))
          (plain (car plain+map))
          (map (cdr plain+map))
          (ot->plain (let ((tbl (make-hash-table :test 'eql)))
                       (dotimes (j (length map))
                         (puthash (aref map j) j tbl))
                       tbl))
+         (ot-length (length ot-body))
          (seen (make-hash-table :test 'equal))
          (placements nil))
     (dolist (c comments)
       (let* ((n (car c))
              (anchor (plist-get (cdr c) :anchor))
              (rng (and anchor (cdr (assoc anchor anchor-map))))
+             (si (car-safe rng))
              (ei (cdr-safe rng)))
-        (when (and rng (not (gethash anchor seen)))
+        (cond
+         ((not rng)
+          (gdocs-log 'debug
+                     "inline-ref fn:%d anchor=%S: no decoded range — skipped"
+                     n anchor))
+         ((gethash anchor seen) nil)
+         (t
           (puthash anchor t seen)
-          ;; EI is the OT position one past the last anchored codepoint.
-          ;; Walk back until a mapped plain index is found (structural
-          ;; codepoints in OT have no plain counterpart, so a few EI
-          ;; values land on nothing — skip past them).
-          (let ((probe (1- ei)) (plain-end nil))
-            (while (and (>= probe 1) (not plain-end))
-              (let ((j (gethash probe ot->plain)))
-                (when j (setq plain-end (1+ j))))
-              (cl-decf probe))
-            (when plain-end
-              (push (list :n n :plain-end plain-end) placements))))))
+          ;; Doco anchors use EI as the inclusive final OT position.  Map
+          ;; EI itself, rather than EI-1, into the inverse plain-text map;
+          ;; the latter is what split a final letter off the anchor.  A
+          ;; structural codepoint has no plain counterpart, so only in that
+          ;; specific case walk back over adjacent structural positions.
+          (let* ((plain-index (and (integerp ei) (gethash ei ot->plain)))
+                 (mapped-ei ei))
+            (unless (integerp plain-index)
+              (when (and (integerp ei)
+                         (>= ei 1) (<= ei ot-length)
+                         (memq (aref ot-body (1- ei))
+                               gdocs--ot-structural-codepoints))
+                (setq mapped-ei (1- ei))
+                (while (and (>= mapped-ei 1)
+                            (memq (aref ot-body (1- mapped-ei))
+                                  gdocs--ot-structural-codepoints))
+                  (cl-decf mapped-ei))
+                (setq plain-index (and (>= mapped-ei 1)
+                                       (gethash mapped-ei ot->plain)))
+                (when (integerp plain-index)
+                  (gdocs-log
+                   'debug
+                   "inline-ref fn:%d anchor=%S range=%S..%S: EI %d is structural; using preceding OT position %d"
+                   n anchor si ei ei mapped-ei))))
+            (if (integerp plain-index)
+                (let ((plain-end (1+ plain-index)))
+                  ;; A user may select the spaces after a word.  They are
+                  ;; not part of the visible anchor location, but punctuation
+                  ;; is: only horizontal whitespace is trimmed here.
+                  (let ((untrimmed-end plain-end))
+                    (while (and (> plain-end 0)
+                                (gdocs--horizontal-whitespace-p
+                                 (aref plain (1- plain-end))))
+                      (cl-decf plain-end))
+                    (when (< plain-end untrimmed-end)
+                      (gdocs-log
+                       'debug
+                       "inline-ref fn:%d anchor=%S range=%S..%S: trimmed %d trailing horizontal whitespace codepoint%s"
+                       n anchor si ei (- untrimmed-end plain-end)
+                       (if (= (- untrimmed-end plain-end) 1) "" "s"))))
+                  (push (list :n n :anchor anchor :si si :ei ei
+                              :plain-end plain-end)
+                        placements))
+              (gdocs-log
+               'debug
+               "inline-ref fn:%d anchor=%S range=%S..%S: EI has no plain-text mapping (OT length %d) — skipped"
+               n anchor si ei ot-length)))))))
     (setq placements
           (sort placements (lambda (a b)
                              (> (plist-get a :plain-end)
@@ -309,24 +377,33 @@ wrong)."
       (dolist (pl placements)
         (let* ((pe (plist-get pl :plain-end))
                (n (plist-get pl :n))
+               (anchor (plist-get pl :anchor))
+               (si (plist-get pl :si))
+               (ei (plist-get pl :ei))
                (full-context (substring plain 0 pe))
                ;; Walk back through candidate context windows, shortest
                ;; first, expanding until we get a unique match. Min 4 chars
                ;; (otherwise a single word fragment matches everywhere);
                ;; max 64 chars (longer doesn't help and risks spanning
                ;; structural boundaries the org body re-renders differently).
-               (found nil))
+               (found nil)
+               (last-window 0)
+               (last-count 0)
+               (last-context nil))
           (catch 'placed
             (dolist (window-len '(8 12 16 24 32 48 64))
-              (when (and (not found) (>= (length full-context) (min 4 window-len)))
+              (when (and (not found)
+                         (>= (length full-context) (min 4 window-len)))
                 (let* ((wl (min window-len (length full-context)))
                        (context (substring full-context (- (length full-context) wl)))
                        (re (gdocs--inline-ref-context-re context))
                        (last nil) (count 0))
+                  (setq last-window wl last-context context)
                   (goto-char (point-min))
                   (while (re-search-forward re nil t)
                     (cl-incf count)
                     (setq last (match-end 0)))
+                  (setq last-count count)
                   (when (= count 1)
                     (setq found t)
                     (goto-char last)
@@ -338,8 +415,11 @@ wrong)."
                       (forward-char 1))
                     (insert (format "[fn:%d]" n))
                     (throw 'placed t)))))
-            (gdocs-log 'debug "inline-ref fn:%d: no unique match (plain-end %d) — skipped"
-                       n pe))))
+            (gdocs-log
+             'debug
+             "inline-ref fn:%d anchor=%S range=%S..%S plain-end=%d window=%d matches=%d context-suffix=%S — no unique match; skipped"
+             n anchor si ei pe last-window last-count
+             (gdocs--debug-context-suffix last-context)))))
       (buffer-string))))
 
 (defun gdocs--inline-ref-context-re (context)
@@ -519,9 +599,9 @@ the doc or any buffer. The caller's `gdocs-auth-function' is used."
     (with-temp-file summary-out
       (let ((print-length nil) (print-level nil))
         (pp `(:revision ,revision
-              :n-ops ,(length ops)
-              :type-counts ,type-counts
-              :attr-keys ,attr-keys)
+                        :n-ops ,(length ops)
+                        :type-counts ,type-counts
+                        :attr-keys ,attr-keys)
             (current-buffer))))
     (message "gdocs-recon: rev=%S ops=%d types=%S → %s"
              revision (length ops) type-counts out)
@@ -747,6 +827,8 @@ NESTS is alist N → (:gt N :gs S :gf S)."
 
 (defun gdocs--decode-doco-anchors (ops)
   "Extract comment anchors from OPS. Returns an alist (KIX-ID . (SI . EI)).
+SI and EI are one-based OT positions; EI is the inclusive final position
+of the range, not a one-past-the-end position.
 Comments are anchored via `as st=\"doco_anchor\"' ops whose
 `sm.das_a.cv' carries `op=set' and `opValue=[\"kix.<id>\"]'. The JSON
 serialises `opValue' as a single-element array, so the decoded value is
@@ -1260,7 +1342,7 @@ trailing newline that org-element keeps at the end of each paragraph."
                   runs))
     ;; Drop empty runs.
     (seq-remove (lambda (r) (string-empty-p (or (plist-get r :text) "")))
-                  runs)))
+                runs)))
 
 (defun gdocs--org-headline-runs (hl)
   "Return runs for a headline element HL by parsing its :raw-value
@@ -1273,16 +1355,16 @@ sometimes lifts inline children up into the headline)."
         (org-mode)
         (let* ((tree (org-element-parse-buffer))
                (par (seq-find (lambda (e)
-                                  (and (consp e) (eq (car e) 'paragraph)))
-                                (cddr tree))))
+                                (and (consp e) (eq (car e) 'paragraph)))
+                              (cddr tree))))
           (if par (gdocs--paragraph-content-runs par)
             (list (gdocs-dm-make-run raw nil nil))))))))
 
 (defun gdocs--org-item-runs (item)
   "Return runs for a plain-list item ITEM."
   (let ((par (seq-find (lambda (e)
-                           (and (consp e) (eq (car e) 'paragraph)))
-                         (cddr item))))
+                         (and (consp e) (eq (car e) 'paragraph)))
+                       (cddr item))))
     (when par (gdocs--paragraph-content-runs par))))
 
 (defun gdocs--item-glyph (item)
@@ -1367,7 +1449,7 @@ Each cell becomes (RUNS) — one element holding a list of runs."
            (cur-glyph nil)
            (cur-id nil)
            (items (seq-filter (lambda (c) (and (consp c) (eq (car c) 'item)))
-                                    (cddr el))))
+                              (cddr el))))
        (mapcar
         (lambda (item)
           (let* ((raw-nest (gdocs--item-nest item))
@@ -1914,7 +1996,10 @@ Returns a cons (PLAIN . MAP) where:
   of PLAIN[i] (1-based: OT pos 1 = first codepoint of the body).
 
 Lookup: a plain-text position P corresponds to OT position MAP[P].
-For an edit that replaces PLAIN[A..B), the OT range is MAP[A]..MAP[B-1]+1."
+For an edit that replaces PLAIN[A..B), the OT range is MAP[A]..MAP[B-1]+1.
+Comment anchors use a different convention: their `ei' is the inclusive
+final OT position and must be mapped directly (without subtracting one)
+through the OT-to-plain inverse of MAP."
   (let* ((n (length (or ot-body "")))
          (plain (make-string n 0))
          (map (make-vector n 0))
@@ -2633,12 +2718,12 @@ the `di' tuple."
              (parsed (json-read-from-string stripped))
              (er-arr (and (listp parsed)
                           (seq-find (lambda (x)
-                                        (and (listp x) (equal (car x) "er")))
-                                      parsed)))
+                                      (and (listp x) (equal (car x) "er")))
+                                    parsed)))
              (di-arr (and (listp parsed)
                           (seq-find (lambda (x)
-                                        (and (listp x) (equal (car x) "di")))
-                                      parsed))))
+                                      (and (listp x) (equal (car x) "di")))
+                                    parsed))))
         (cons (and er-arr (car (last er-arr)))
               (and di-arr (cadr di-arr))))
     (error (cons nil nil))))
@@ -3944,7 +4029,7 @@ no unique match — logs a debug summary so callers can see why."
                      (setq give-up t)
                    (setq window (min max-window (* window 2)))))
                 ((string-match full-re plain
-                                (max (1+ unbiased) (match-end 0)))
+                               (max (1+ unbiased) (match-end 0)))
                  (if (>= window max-window)
                      (setq give-up t)
                    (setq window (min max-window (* window 2)))))

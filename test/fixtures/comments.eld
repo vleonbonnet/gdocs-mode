@@ -2,7 +2,7 @@
        :anchor "kix.synthetic-final-letter"
        :ot-body "A word\n"
        :org-body "A *word*\n"
-       :anchor-range (:start 6 :end 7)
+       :anchor-range (:start 6 :end 6)
        :threads
        ((:id "thread.synthetic.one"
              :anchor "kix.synthetic-final-letter"
