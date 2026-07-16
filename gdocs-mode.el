@@ -34,12 +34,10 @@
 ;; Staleness: GDOC_REVISION scraped from the /edit page is the
 ;; anchor. GDOC_CONTENT_HASH is recorded for human/debug diffing only.
 ;;
-;; Push strategy (v1, lossy): whole-document replace via the cookie-
-;; authenticated /save endpoint that the browser uses. Delete the full
-;; OT span, insert the buffer body as plain text. Inline formatting,
-;; heading levels, lists, tables won't round-trip through push — those
-;; need per-run style commands and are deferred to v2. Pull preserves
-;; everything; only push is plain-text.
+;; Push strategy: the default OT encoder rebuilds text styling and supported
+;; structural entities for the cookie-authenticated /save endpoint. The
+;; legacy plain backend remains lossy. Inline images are pull-only and
+;; image-bearing documents are refused rather than replaced.
 ;;
 ;; Auth is decoupled. Configure `gdocs-auth-function' to return an
 ;; alist of HTTP headers. Cookie sessions today, OAuth tomorrow.
@@ -617,7 +615,8 @@ the doc or any buffer. The caller's `gdocs-auth-function' is used."
 ;; structural attributes (heading level, list binding, anchor) and a list of
 ;; runs. Each run is a (:text :styles :link) plist.
 ;;
-;; DOC   = (:revision N :doc-id S :title S :paragraphs (PARA ...) :lists ALIST)
+;; DOC   = (:revision N :doc-id S :title S :paragraphs (PARA ...)
+;;          :lists ALIST :inline-objects (OBJECT ...) :unsupported (REASON ...))
 ;; PARA  = (:kind :para|:heading|:title|:subtitle|:blank|:list|:code|:table
 ;;          :level N         ; heading level 1..5 (only for :heading)
 ;;          :list-id S       ; list entity id (only for :list)
@@ -625,16 +624,20 @@ the doc or any buffer. The caller's `gdocs-auth-function' is used."
 ;;          :glyph :bullet|:number  ; resolved from list def (only for :list)
 ;;          :anchor S        ; ps_hdid (only for headings)
 ;;          :runs (RUN ...))
+;;          :inline-object OBJECT ; only for a standalone inline object)
 ;; RUN   = (:text S :styles (:bold :italic :underline :strike :verbatim :code)
-;;          :link S)
+;;          :link S :inline-object OBJECT)
+;; OBJECT = (:kind :inline-object :entity-id S :object-kind :image
+;;           :content-id S :width NUMBER :height NUMBER :ot-position N)
 ;;
 ;; Tables are represented as a single :kind=:table paragraph whose :rows is a
 ;; list of rows; each row is a list of cells; each cell is a list of runs.
 
 (defun gdocs-dm-make-doc (&rest props)
   "Construct a doc-model. PROPS is a plist of :revision :doc-id :title
-:paragraphs :lists."
-  (let ((doc (list :paragraphs nil :lists nil)))
+:paragraphs :lists :inline-objects :unsupported."
+  (let ((doc (list :paragraphs nil :lists nil
+                   :inline-objects nil :unsupported nil)))
     (cl-loop for (k v) on props by #'cddr
              do (setq doc (plist-put doc k v)))
     doc))
@@ -643,6 +646,18 @@ the doc or any buffer. The caller's `gdocs-auth-function' is used."
 (defsubst gdocs-dm-lists (doc) (plist-get doc :lists))
 (defsubst gdocs-dm-revision (doc) (plist-get doc :revision))
 (defsubst gdocs-dm-title (doc) (plist-get doc :title))
+(defsubst gdocs-dm-inline-objects (doc) (plist-get doc :inline-objects))
+(defsubst gdocs-dm-unsupported (doc) (plist-get doc :unsupported))
+
+(defun gdocs--doc-has-inline-object-p (doc)
+  "Return non-nil if DOC contains an inline object in any model shape."
+  (or (gdocs-dm-inline-objects doc)
+      (cl-some
+       (lambda (paragraph)
+         (or (eq (plist-get paragraph :kind) :inline-object)
+             (cl-some (lambda (run) (plist-get run :inline-object))
+                      (plist-get paragraph :runs))))
+       (gdocs-dm-paragraphs doc))))
 
 (defun gdocs-dm-make-run (text &optional styles link)
   "Build a run with TEXT and optional STYLES (list of keywords) and LINK."
@@ -912,6 +927,122 @@ NESTS is alist N → (:gt N :gs S :gf S)."
           (push (cons id nests) defs))))
     (nreverse defs)))
 
+(defun gdocs--inline-image-object-from-ae (op)
+  "Decode an image object definition from inline entity OP.
+
+Google's `ae et=\"inline\"' operation stores image metadata below
+`epm.ee_eo'.  The entity is not associated with a body position here;
+that association is made by its separate `te' operation."
+  (let* ((id (alist-get 'id op))
+         (epm (alist-get 'epm op))
+         (eo (and (listp epm) (alist-get 'ee_eo epm)))
+         (content-id (and (listp eo) (alist-get 'i_cid eo)))
+         (width (and (listp eo) (alist-get 'i_wth eo)))
+         (height (and (listp eo) (alist-get 'i_ht eo))))
+    (when (and (stringp id) (stringp content-id))
+      (list :kind :inline-object
+            :entity-id id
+            :object-kind :image
+            :content-id content-id
+            :width (and (numberp width) width)
+            :height (and (numberp height) height)))))
+
+(defun gdocs--decode-inline-objects (ops body)
+  "Decode inline image entities in OPS against OT BODY.
+
+An `ae et=\"inline\"' operation defines an entity.  Its `te' operation
+contains the authoritative one-based `spi' position and matching entity
+ID; `body[spi - 1]' must be the literal `*' placeholder.  Entity or
+operation order is deliberately ignored.  The result is a plist with
+`:objects', a position-indexed `:object-vector', and `:unsupported'
+reasons."
+  (let ((definitions (make-hash-table :test #'equal))
+        (attachments nil)
+        (reasons nil)
+        (body-len (length (or body ""))))
+    (dolist (op ops)
+      (when (listp op)
+        (cond
+         ((and (equal (alist-get 'ty op) "ae")
+               (equal (alist-get 'et op) "inline"))
+          (let* ((id (alist-get 'id op))
+                 (object (gdocs--inline-image-object-from-ae op)))
+            (cond
+             ((not (stringp id))
+              (push "inline entity has no string ID" reasons))
+             ((gethash id definitions)
+              (push (format "inline entity %s is defined more than once" id)
+                    reasons))
+             (object (puthash id object definitions))
+             (t
+              (puthash id :unsupported definitions)
+              (push (format "inline entity %s has no recognized image metadata"
+                            id)
+                    reasons)))))
+         ((equal (alist-get 'ty op) "te")
+          (push (list (alist-get 'id op) (alist-get 'spi op)) attachments)))))
+    (setq attachments (nreverse attachments))
+    (let ((objects nil)
+          (object-vector (make-vector body-len nil))
+          (seen-ids (make-hash-table :test #'equal))
+          (seen-positions (make-hash-table :test #'eql)))
+      (dolist (attachment attachments)
+        (let* ((id (nth 0 attachment))
+               (spi (nth 1 attachment))
+               (definition (and (stringp id) (gethash id definitions)))
+               (object (and (listp definition) definition)))
+          (cond
+           ((not (stringp id))
+            (push "inline attachment has no string entity ID" reasons))
+           ((null definition)
+            (push (format "inline attachment %s has no entity definition" id)
+                  reasons))
+           ((eq definition :unsupported)
+            ;; The malformed definition already contributed the detailed
+            ;; reason above; retain this attachment as unsupported too.
+            (push (format "inline attachment %s cannot be decoded" id) reasons))
+           ((not (integerp spi))
+            (push (format "inline attachment %s has no integer spi" id)
+                  reasons))
+           ((or (< spi 1) (> spi body-len))
+            (push (format "inline attachment %s has out-of-range spi %S"
+                          id spi)
+                  reasons))
+           ((/= (aref body (1- spi)) ?*)
+            (push (format "inline attachment %s spi %S is not an image placeholder"
+                          id spi)
+                  reasons))
+           ((gethash id seen-ids)
+            (push (format "inline entity %s is attached more than once" id)
+                  reasons))
+           ((gethash spi seen-positions)
+            (push (format "inline placeholder position %S has multiple entities"
+                          spi)
+                  reasons))
+           (t
+            (setq object (plist-put (copy-sequence object) :ot-position spi))
+            (puthash id t seen-ids)
+            (puthash spi t seen-positions)
+            (aset object-vector (1- spi) object)
+            (push object objects)))))
+      ;; Every inline definition must have exactly one attachment.  This is
+      ;; what prevents a missing or reordered `te' from being guessed from
+      ;; the number or order of literal asterisks in the body.
+      (maphash
+       (lambda (id definition)
+         (unless (gethash id seen-ids)
+           (unless (eq definition :unsupported)
+             (push (format "inline entity %s has no unambiguous te attachment"
+                           id)
+                   reasons))))
+       definitions)
+      (list :objects (sort objects
+                           (lambda (a b)
+                             (< (plist-get a :ot-position)
+                                (plist-get b :ot-position))))
+            :object-vector object-vector
+            :unsupported (nreverse reasons)))))
+
 (defun gdocs--decode-doco-anchors (ops)
   "Extract comment anchors from OPS. Returns an alist (KIX-ID . (SI . EI)).
 SI and EI are one-based OT positions; EI is the inclusive final position
@@ -948,12 +1079,16 @@ absent opValue clears an anchor and is skipped."
     ;; Per recon: gt=9 → bullet; gt=10/13/15 → numbered.
     (if (eq gt 9) :bullet :number)))
 
-(defun gdocs--build-runs (body ts-vec start end &optional link-vec)
+(defun gdocs--build-runs
+    (body ts-vec start end &optional link-vec inline-object-vec)
   "Slice runs from BODY[START..END-1] using TS-VEC and LINK-VEC.
 
 Returns runs with :text, :styles, and optional :link properties.  A run
 ends whenever either the active text styles or the link destination changes.
-Structural codepoints are skipped and never become visible run text."
+Structural codepoints are skipped and never become visible run text.
+INLINE-OBJECT-VEC maps zero-based OT body indexes to decoded inline-object
+plists. An object occupies its one OT placeholder position and is emitted as
+a first-class run rather than as text."
   (let ((runs nil)
         (i start))
     (while (< i end)
@@ -965,25 +1100,35 @@ Structural codepoints are skipped and never become visible run text."
                               gdocs--ot-row-end gdocs--ot-cell-end)))
         (setq i (1+ i)))
       (when (< i end)
-        (let* ((cur-keys (gdocs--styles-active-keys (aref ts-vec i)))
-               (cur-link (and link-vec (aref link-vec i)))
-               (run-start i))
-          (cl-loop while (and (< i end)
-                              (not (memq (aref body i)
-                                         (list gdocs--ot-table-open
-                                               gdocs--ot-table-close
-                                               gdocs--ot-row-end
-                                               gdocs--ot-cell-end)))
-                              (equal cur-keys
-                                     (gdocs--styles-active-keys (aref ts-vec i)))
-                              (equal cur-link
-                                     (and link-vec (aref link-vec i))))
-                   do (cl-incf i))
-          (let ((text (substring body run-start i)))
-            (push (gdocs-dm-make-run text cur-keys cur-link) runs)))))
+        (let ((object (and inline-object-vec
+                           (aref inline-object-vec i))))
+          (if object
+              (progn
+                (push (list :inline-object object) runs)
+                (cl-incf i))
+            (let* ((cur-keys (gdocs--styles-active-keys (aref ts-vec i)))
+                   (cur-link (and link-vec (aref link-vec i)))
+                   (run-start i))
+              (cl-loop while (and (< i end)
+                                  (not (memq (aref body i)
+                                             (list gdocs--ot-table-open
+                                                   gdocs--ot-table-close
+                                                   gdocs--ot-row-end
+                                                   gdocs--ot-cell-end)))
+                                  (not (and inline-object-vec
+                                            (aref inline-object-vec i)))
+                                  (equal cur-keys
+                                         (gdocs--styles-active-keys
+                                          (aref ts-vec i)))
+                                  (equal cur-link
+                                         (and link-vec (aref link-vec i))))
+                       do (cl-incf i))
+              (let ((text (substring body run-start i)))
+                (push (gdocs-dm-make-run text cur-keys cur-link) runs)))))))
     (nreverse runs)))
 
-(defun gdocs--build-table-para (body ts-vec start end table-attr &optional link-vec)
+(defun gdocs--build-table-para
+    (body ts-vec start end table-attr &optional link-vec inline-object-vec)
   "Construct a :table paragraph from BODY[START..END-1] — the slice
 between (but excluding) the 0x10/0x11 markers.
 
@@ -1003,7 +1148,8 @@ run construction."
                                     (= (aref body (1- upto)) ?\n))
                                (1- upto)
                              upto))
-                       (runs (gdocs--build-runs body ts-vec from to link-vec)))
+                       (runs (gdocs--build-runs body ts-vec from to link-vec
+                                                inline-object-vec)))
                   (push (list runs) cells)
                   (setq cell-start nil)))
               (flush-row ()
@@ -1044,6 +1190,7 @@ is not lost by the source-block renderer, which intentionally emits raw code
 text without inline markup."
   (and runs
        (not (cl-some (lambda (r) (plist-get r :link)) runs))
+       (not (cl-some (lambda (r) (plist-get r :inline-object)) runs))
        (cl-every (lambda (r)
                    (or (string-empty-p (or (plist-get r :text) ""))
                        (memq :code (plist-get r :styles))))
@@ -1051,13 +1198,21 @@ text without inline markup."
 
 (defun gdocs--build-para (pa lb ta runs list-defs)
   "Assemble one paragraph plist from attrs."
-  (let* ((kind (gdocs--paragraph-kind pa lb))
+  (let* ((inline-object (and (= (length runs) 1)
+                             (plist-get (car runs) :inline-object)))
+         (kind (if inline-object :inline-object
+                 (gdocs--paragraph-kind pa lb)))
          (heading (and pa (plist-get pa :heading)))
          (anchor (and pa (plist-get pa :anchor)))
          (list-id (and lb (plist-get lb :list-id)))
          (nest (or (and lb (plist-get lb :nest)) 0))
          (glyph (and lb (gdocs--list-glyph-kind list-defs list-id nest)))
          (out (list :kind kind :runs runs)))
+    (when inline-object
+      (dolist (key '(:entity-id :object-kind :content-id :width :height
+                                :ot-position))
+        (when (plist-member inline-object key)
+          (setq out (plist-put out key (plist-get inline-object key))))))
     (when (and (eq kind :heading) heading)
       (setq out (plist-put out :level heading)))
     (when (and anchor (memq kind '(:heading :title :subtitle)))
@@ -1169,6 +1324,8 @@ REVISION, DOC-ID and TITLE are stored as metadata."
          (list-bindings (gdocs--decode-list-bindings ops))
          (table-attrs (gdocs--decode-table-attrs ops))
          (list-defs (gdocs--decode-list-defs ops))
+         (inline-analysis (gdocs--decode-inline-objects ops body))
+         (inline-object-vec (plist-get inline-analysis :object-vector))
          (paragraphs nil)
          (i 0))
     (while (< i body-len)
@@ -1188,7 +1345,7 @@ REVISION, DOC-ID and TITLE are stored as metadata."
               (cl-incf j))
             ;; j now points 1 past the matching close.
             (push (gdocs--build-table-para body ts-vec (1+ i) (1- j) ta
-                                           link-vec)
+                                           link-vec inline-object-vec)
                   paragraphs)
             (setq i j)))
          (t
@@ -1198,12 +1355,15 @@ REVISION, DOC-ID and TITLE are stored as metadata."
                  (ot-nl-pos (1+ nl))     ; 1-based
                  (pa (cdr (assq ot-nl-pos para-attrs)))
                  (lb (cdr (assq ot-nl-pos list-bindings)))
-                 (runs (gdocs--build-runs body ts-vec i nl link-vec)))
+                 (runs (gdocs--build-runs body ts-vec i nl link-vec
+                                          inline-object-vec)))
             (push (gdocs--build-para pa lb nil runs list-defs) paragraphs)
             (setq i (1+ nl)))))))
     (gdocs-dm-make-doc :revision revision :doc-id doc-id :title title
                        :paragraphs (nreverse paragraphs)
-                       :lists list-defs)))
+                       :lists list-defs
+                       :inline-objects (plist-get inline-analysis :objects)
+                       :unsupported (plist-get inline-analysis :unsupported))))
 
 ;;; Phase A.3 — Doc-model → org renderer
 
@@ -1262,23 +1422,50 @@ than the reverse (which org would treat as opaque).")
 (defvar gdocs--render-link-description nil
   "Non-nil while rendering the description of one logical Org link.")
 
+(defun gdocs--inline-object-number (value)
+  "Format inline-object dimension VALUE for an Org placeholder."
+  (if (numberp value)
+      (format "%.6g" value)
+    "unknown"))
+
+(defun gdocs--inline-object-spec (object)
+  "Return the unambiguous, remote-marked Org payload for OBJECT."
+  (format "image %s %sx%s content-id=%s"
+          (or (plist-get object :entity-id) "unknown-entity")
+          (gdocs--inline-object-number (plist-get object :width))
+          (gdocs--inline-object-number (plist-get object :height))
+          (or (plist-get object :content-id) "unknown-content")))
+
+(defun gdocs--render-inline-object (object &optional embedded)
+  "Render OBJECT as an explicit Org remote-object placeholder.
+
+Standalone objects use a custom Org keyword.  EMBEDDED objects use an Org
+export snippet so the marker remains unambiguous even when the Google object
+shares a paragraph with ordinary text."
+  (let ((spec (gdocs--inline-object-spec object)))
+    (if embedded
+        (format "@@gdocs-inline-object:%s@@" spec)
+      (format "#+gdocs_inline_object: %s" spec))))
+
 (defun gdocs--render-run-text (run &optional no-link escape-special)
   "Render the textual payload of RUN — escape + optional link wrapping.
 
 When NO-LINK is non-nil, only the text is emitted.  This is used while a
 contiguous link group is rendered as one Org link; the default remains useful
 for callers rendering one run directly."
-  (let* ((text (or (plist-get run :text) ""))
-         (link (plist-get run :link))
-         (clean (gdocs--escape-org-inline
-                 text (or escape-special (and link (not no-link))))))
-    (if (and link (not no-link))
-        (if (and (null (plist-get run :styles))
-                 (string= text link))
-            (org-link-make-string link)
-          (org-link-make-string link
-                                (if (string-empty-p clean) link clean)))
-      clean)))
+  (if (plist-get run :inline-object)
+      (gdocs--render-inline-object (plist-get run :inline-object) t)
+    (let* ((text (or (plist-get run :text) ""))
+           (link (plist-get run :link))
+           (clean (gdocs--escape-org-inline
+                   text (or escape-special (and link (not no-link))))))
+      (if (and link (not no-link))
+          (if (and (null (plist-get run :styles))
+                   (string= text link))
+              (org-link-make-string link)
+            (org-link-make-string link
+                                  (if (string-empty-p clean) link clean)))
+        clean))))
 
 (defun gdocs--render-link-group (runs link)
   "Render contiguous RUNS sharing LINK as one logical Org link.
@@ -1456,6 +1643,11 @@ ORDINAL applies to numbered list items only — see `gdocs--render-list-bullet'.
          (text (gdocs--render-runs runs)))
     (pcase kind
       (:blank "")
+      (:inline-object (gdocs--render-inline-object para))
+      (:unsupported
+       (gdocs--render-unsupported-directive
+        (list (or (plist-get para :unsupported-reason)
+                  "unsupported content"))))
       ;; Google Docs distinguishes the doc *name* (metadata, fetched
       ;; from the HTML <title>) from Title-styled body paragraphs. The
       ;; document name is stored in GDOC_TITLE by the pull wrapper; this
@@ -1484,6 +1676,13 @@ keyword lines emitted from Title/Subtitle paragraphs."
        (or (string-match-p "\\`\\*+ " line)
            (string-match-p "\\`#\\+title:" line)
            (string-match-p "\\`#\\+subtitle:" line))))
+
+(defun gdocs--render-unsupported-directive (reasons)
+  "Render REASONS as one visible, non-prose Org directive."
+  (format "#+gdocs_unsupported: %s"
+          (replace-regexp-in-string
+           "[ \t\n\r]+" " "
+           (string-trim (string-join reasons "; ")))))
 
 (defun gdocs-dm-to-org (doc)
   "Render a doc-model DOC to a canonical org-mode string.
@@ -1570,9 +1769,19 @@ than to the final text, so it never appears inside a source block."
                     (when (and heading next
                                (not (plist-get next :blank)))
                       (push "" out))))
-      (let ((final (nreverse out)))
-        (concat (string-join final "\n")
-                (if final "\n" ""))))))
+      (let* ((final (nreverse out))
+             (explicit-unsupported
+              (seq-some (lambda (para)
+                          (eq (plist-get para :kind) :unsupported))
+                        paras))
+             (rendered (concat (string-join final "\n")
+                               (if final "\n" ""))))
+        (if (and (gdocs-dm-unsupported doc)
+                 (not explicit-unsupported))
+            (concat (gdocs--render-unsupported-directive
+                     (gdocs-dm-unsupported doc))
+                    "\n" rendered)
+          rendered)))))
 
 ;;; Phase B.1 — org → doc-model parser
 ;;
@@ -1590,6 +1799,41 @@ than to the final text, so it never appears inside a source block."
     (code          . :code)
     (verbatim      . :verbatim))
   "Mapping of `org-element' inline emphasis tags to doc-model style keys.")
+
+(defun gdocs--inline-object-dimension (token)
+  "Parse an inline-object dimension TOKEN, or return nil."
+  (when (and (stringp token)
+             (string-match-p "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" token))
+    (string-to-number token)))
+
+(defun gdocs--parse-inline-object-spec (value)
+  "Parse the payload of a `gdocs_inline_object' Org placeholder.
+
+The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT'."
+  (let* ((fields (split-string (string-trim (or value ""))
+                               "[ \t]+" t))
+         (dimensions (nth 2 fields))
+         (content-field (nth 3 fields))
+         (width-token nil)
+         (height-token nil))
+    (when (and (equal (car fields) "image")
+               (stringp (nth 1 fields))
+               (stringp dimensions)
+               (string-match
+                "\\`\\([^x]+\\)x\\([^x]+\\)\\'" dimensions))
+      (setq width-token (match-string 1 dimensions)
+            height-token (match-string 2 dimensions))
+      (when (and (gdocs--inline-object-dimension width-token)
+                 (gdocs--inline-object-dimension height-token)
+                 (or (null content-field)
+                     (string-prefix-p "content-id=" content-field)))
+        (list :kind :inline-object
+              :entity-id (nth 1 fields)
+              :object-kind :image
+              :content-id (and content-field
+                               (substring content-field (length "content-id=")))
+              :width (gdocs--inline-object-dimension width-token)
+              :height (gdocs--inline-object-dimension height-token))))))
 
 (defun gdocs--unescape-org-inline (text &optional link-description)
   "Remove the literal-text escapes emitted by `gdocs--escape-org-inline'.
@@ -1635,6 +1879,14 @@ INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers."
            (contents (cddr el))
            (style (cdr (assq type gdocs--org-element-styles))))
       (cond
+       ((and (eq type 'export-snippet)
+             (string= (downcase (format "%s"
+                                        (or (plist-get props :backend)
+                                            (plist-get props :back-end))))
+                      "gdocs-inline-object"))
+        (let ((object (gdocs--parse-inline-object-spec
+                       (plist-get props :value))))
+          (when object (list (list :inline-object object)))))
        ((eq type 'link)
         (let* ((path (plist-get props :path))
                (kind (plist-get props :type))
@@ -1719,7 +1971,9 @@ trailing newline that org-element keeps at the end of each paragraph."
                         r)))
                   runs))
     ;; Drop empty runs.
-    (seq-remove (lambda (r) (string-empty-p (or (plist-get r :text) "")))
+    (seq-remove (lambda (r)
+                  (and (not (plist-get r :inline-object))
+                       (string-empty-p (or (plist-get r :text) ""))))
                 runs)))
 
 (defun gdocs--org-headline-runs (hl)
@@ -2001,6 +2255,22 @@ caller can distinguish meaningful blank lines from heading padding."
                       para (gdocs--org-element-line-number el)
                       (gdocs--org-element-last-line-number el))
                    para))))
+        ((equal key "gdocs_inline_object")
+         (let* ((object (gdocs--parse-inline-object-spec val))
+                (para (or object
+                          (list :kind :unsupported
+                                :runs nil
+                                :unsupported-reason
+                                "malformed gdocs_inline_object placeholder"))))
+           (list (if source-spans
+                     (gdocs--org-annotate-paragraph
+                      para (gdocs--org-element-line-number el)
+                      (gdocs--org-element-last-line-number el))
+                   para))))
+        ((equal key "gdocs_unsupported")
+         (list (list :kind :unsupported
+                     :runs nil
+                     :unsupported-reason (or val "unsupported content"))))
         (t nil))))
     (_ nil)))
 
@@ -2028,8 +2298,23 @@ syntax)."
              (lambda (el) (gdocs--walk-org-element el t))
              (cddr tree)))
            (paras (gdocs--org-with-meaningful-blanks with-spans)))
-      (gdocs-dm-make-doc :revision nil :doc-id nil :title nil
-                         :paragraphs paras))))
+      (gdocs-dm-make-doc
+       :revision nil :doc-id nil :title nil
+       :paragraphs paras
+       :inline-objects
+       (cl-loop for paragraph in paras
+                append (cond
+                        ((eq (plist-get paragraph :kind) :inline-object)
+                         (list paragraph))
+                        (t
+                         (cl-loop for run in (plist-get paragraph :runs)
+                                  when (plist-get run :inline-object)
+                                  collect (plist-get run :inline-object)))))
+       :unsupported
+       (cl-loop for paragraph in paras
+                when (eq (plist-get paragraph :kind) :unsupported)
+                collect (or (plist-get paragraph :unsupported-reason)
+                            "unsupported Org content"))))))
 
 ;;; Phase B.2 — Doc-model → OT op-stream emitter
 ;;
@@ -2296,6 +2581,12 @@ Bullet glyphs cycle ●/○/■ across levels; numbered uses no glyph string
 string and OPS is the list of `ae'/`as' ops needed to recreate styling.
 The caller is responsible for `ds' (clear old body) and `is' (insert
 BODY at position 1)."
+  (when (gdocs--doc-has-inline-object-p doc)
+    (user-error
+     "gdocs: inline image placeholders are remote-only; image OT operations are not supported"))
+  (when (gdocs-dm-unsupported doc)
+    (user-error "gdocs: document contains unsupported content: %s"
+                (car (gdocs-dm-unsupported doc))))
   (let* ((paragraphs (gdocs--normalize-paragraphs-for-ot
                       (gdocs-dm-paragraphs doc)))
          (list-defs (gdocs--collect-list-ids paragraphs))
@@ -2355,10 +2646,14 @@ BODY at position 1)."
                     (nreverse para-ops))))))
 
 (defun gdocs--run-text-equal-p (r1 r2)
-  (and (equal (plist-get r1 :text) (plist-get r2 :text))
-       (equal (sort (plist-get r1 :styles) :lessp #'string<)
-              (sort (plist-get r2 :styles) :lessp #'string<))
-       (equal (plist-get r1 :link) (plist-get r2 :link))))
+  (let ((o1 (plist-get r1 :inline-object))
+        (o2 (plist-get r2 :inline-object)))
+    (if (or o1 o2)
+        (equal o1 o2)
+      (and (equal (plist-get r1 :text) (plist-get r2 :text))
+           (equal (sort (plist-get r1 :styles) :lessp #'string<)
+                  (sort (plist-get r2 :styles) :lessp #'string<))
+           (equal (plist-get r1 :link) (plist-get r2 :link))))))
 
 (defun gdocs--paragraph-equal-p (p1 p2)
   "Return non-nil if P1 and P2 are equivalent at the user-visible level.
@@ -3267,6 +3562,44 @@ read-only projection of Google's comments and must not be pushed)."
            (text (replace-regexp-in-string "\\[fn:[0-9]+\\]" "" text)))
       text)))
 
+(defun gdocs--remote-inline-object-analysis (state)
+  "Return inline-object analysis for push STATE.
+
+The live edit-state parser retains the complete raw operation stream in
+`:ot-ops'.  A caller that already decoded the state may instead provide
+`:inline-objects' and `:unsupported' directly."
+  (if (plist-get state :ot-ops)
+      (gdocs--decode-inline-objects (plist-get state :ot-ops)
+                                    (or (plist-get state :ot-body) ""))
+    (list :objects (plist-get state :inline-objects)
+          :unsupported (plist-get state :unsupported))))
+
+(defun gdocs--assert-push-safe (state &optional local-body)
+  "Refuse a push that could lose a remote or local inline object.
+
+There is intentionally no exception for unrelated text edits: the current
+push backends can only emit text/style/list/table operations and cannot
+preserve an image through a full replacement or every incremental edit."
+  (let* ((analysis (gdocs--remote-inline-object-analysis state))
+         (objects (plist-get analysis :objects))
+         (unsupported (plist-get analysis :unsupported))
+         (local (or local-body "")))
+    (when unsupported
+      (user-error
+       "gdocs: refusing push: inline-object mapping is unsupported (%s); pull remains available but image edits are not supported"
+       (car unsupported)))
+    (when objects
+      (user-error
+       "gdocs: refusing push: remote document contains %d inline image%s; pull remains available but image deletion, movement, replacement, and upload are not supported"
+       (length objects)
+       (if (= (length objects) 1) "" "s")))
+    (when (or (string-match-p (regexp-quote "#+gdocs_inline_object:") local)
+              (string-match-p (regexp-quote "#+gdocs_unsupported:") local)
+              (string-match-p (regexp-quote "@@gdocs-inline-object:") local))
+      (user-error
+       "gdocs: refusing push: local body contains a remote inline-object placeholder; image creation/replacement is not supported"))
+    t))
+
 (defun gdocs--find-local-subtree-start (start)
   "Return the buffer position where a `:GDOC_LOCAL: t'-marked top-level
 heading begins, or `point-max' if none. Search begins at START."
@@ -4062,6 +4395,7 @@ CALLBACK = `(funcall CB FINAL-REV ERR)'."
     (doc-id state local-body remote-body buffer callback)
   "Async sibling of `gdocs--apply-push'.
 CALLBACK = `(funcall CB NEW-REV ERR)'. BUFFER is where property writes go."
+  (gdocs--assert-push-safe state local-body)
   (let* ((ot-body (plist-get state :ot-body))
          (ot-len (gdocs--ot-body-length ot-body))
          (local-stripped (car (gdocs--strip-heading-drawers local-body)))
@@ -4758,6 +5092,7 @@ Strategies, in order:
 Each in-place op is a single-op POST (multi-op bundles trigger Google's
 abuse heuristic — see Push protocol). The final new revision and content
 hash are written back to buffer metadata."
+  (gdocs--assert-push-safe state local-body)
   (let* ((ot-body (plist-get state :ot-body))
          (ot-len (gdocs--ot-body-length ot-body))
          (local-stripped (car (gdocs--strip-heading-drawers local-body)))
@@ -4879,7 +5214,10 @@ completion or error."
                             remote-rev local-rev)))
           (t
            (condition-case sig
-               (let ((remote-body (gdocs--ot-remote-org-body doc-id html state)))
+               (let ((remote-body
+                      (progn
+                        (gdocs--assert-push-safe state local-body)
+                        (gdocs--ot-remote-org-body doc-id html state))))
                  (cond
                   ((string= (car (gdocs--strip-heading-drawers local-body))
                             remote-body)

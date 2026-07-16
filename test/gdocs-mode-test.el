@@ -51,6 +51,16 @@
       (insert-file-contents file)
       (read (current-buffer)))))
 
+(defun gdocs-test--inline-case (name)
+  "Return the sanitized inline-image case named NAME."
+  (let ((file (cdr (assoc name
+                          '(("one-image-between-paragraphs" . "inline-image-one")
+                            ("multiple-images-not-entity-order" . "inline-image-multiple")
+                            ("literal-asterisk-paragraph" . "inline-image-literal-star")
+                            ("image-and-literal-asterisk" . "inline-image-mixed")
+                            ("ambiguous-image-attachment" . "inline-image-ambiguous"))))))
+    (and file (gdocs-test--fixture file))))
+
 (defun gdocs-test--fixture-html (fixture)
   "Turn the model chunks in FIXTURE into synthetic edit-page HTML."
   (mapconcat
@@ -431,9 +441,107 @@ END is the inclusive final OT position."
     (should (equal (gdocs-dm-to-org doc) (plist-get fixture :expected-org)))
     (should (equal (mapcar #'gdocs-test--paragraph-view
                            (gdocs-dm-paragraphs doc))
-                   '((:para nil nil nil (("Before" nil nil)))
-                     (:para nil nil nil (("￼" nil nil)))
-                     (:para nil nil nil (("After" nil nil))))))))
+                     '((:para nil nil nil (("Before" nil nil)))
+                      (:para nil nil nil (("￼" nil nil)))
+                      (:para nil nil nil (("After" nil nil))))))))
+
+(ert-deftest gdocs-test-inline-image-decodes-and-renders-explicitly ()
+  "A te.spi image attachment becomes a first-class remote placeholder."
+  (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
+         (body (plist-get fixture :body))
+         (doc (gdocs-dm-from-ops nil nil nil body (plist-get fixture :ops)))
+         (object (car (gdocs-dm-inline-objects doc)))
+         (paragraph (nth 1 (gdocs-dm-paragraphs doc)))
+         (org (gdocs-dm-to-org doc)))
+    (should (eq (plist-get object :kind) :inline-object))
+    (should (eq (plist-get object :object-kind) :image))
+    (should (equal (plist-get object :entity-id)
+                   "kix.synthetic-image-one"))
+    (should (equal (plist-get object :content-id)
+                   "s-blob-v1-IMAGE-synthetic-one"))
+    (should (= (plist-get object :ot-position) 8))
+    (should (= (plist-get object :width) 468.0))
+    (should (= (plist-get object :height) 102.0))
+    (should (eq (plist-get paragraph :kind) :inline-object))
+    (should (string-match-p
+             "^#\\+gdocs_inline_object: image kix.synthetic-image-one 468x102 content-id=s-blob-v1-IMAGE-synthetic-one$"
+             org))
+    (should-not (string-match-p "^\\*$" org))
+    (should (equal org
+                   (gdocs-dm-to-org (gdocs-dm-from-org org))))))
+
+(ert-deftest gdocs-test-embedded-inline-image-marker-round-trips ()
+  "An inline object sharing a paragraph uses a parseable Org token."
+  (let* ((object '(:kind :inline-object
+                   :entity-id "kix.synthetic-embedded"
+                   :object-kind :image
+                   :content-id "s-blob-v1-IMAGE-synthetic-embedded"
+                   :width 10.0 :height 20.0 :ot-position 8))
+         (doc (gdocs-dm-make-doc
+               :inline-objects (list object)
+               :paragraphs
+               (list (list :kind :para
+                           :runs (list (gdocs-dm-make-run "Before")
+                                       (list :inline-object object)
+                                       (gdocs-dm-make-run "After"))))))
+         (org (gdocs-dm-to-org doc))
+         (round-tripped (gdocs-dm-from-org org)))
+    (should (equal org
+                   "Before@@gdocs-inline-object:image kix.synthetic-embedded 10x20 content-id=s-blob-v1-IMAGE-synthetic-embedded@@After\n"))
+    (should (= (length (gdocs-dm-inline-objects round-tripped)) 1))
+    (should (equal (gdocs-dm-runs-text
+                    (plist-get (car (gdocs-dm-paragraphs round-tripped))
+                               :runs))
+                   "BeforeAfter"))
+    (should-error (gdocs-dm-to-ot doc) :type 'user-error)))
+
+(ert-deftest gdocs-test-inline-images-use-te-positions-not-entity-order ()
+  "Multiple images are sorted by OT position, not ae or te order."
+  (let* ((fixture (gdocs-test--inline-case "multiple-images-not-entity-order"))
+         (doc (gdocs-dm-from-ops nil nil nil
+                                 (plist-get fixture :body)
+                                 (plist-get fixture :ops)))
+         (objects (gdocs-dm-inline-objects doc)))
+    (should (equal (mapcar (lambda (object)
+                             (list (plist-get object :entity-id)
+                                   (plist-get object :ot-position)))
+                           objects)
+                   '(("kix.synthetic-image-one" 5)
+                     ("kix.synthetic-image-two" 11))))))
+
+(ert-deftest gdocs-test-literal-asterisk-remains-text ()
+  "An ordinary star paragraph is not an inline object without te."
+  (let* ((fixture (gdocs-test--inline-case "literal-asterisk-paragraph"))
+         (doc (gdocs-dm-from-ops nil nil nil
+                                 (plist-get fixture :body)
+                                 (plist-get fixture :ops))))
+    (should-not (gdocs-dm-inline-objects doc))
+    (should-not (gdocs-dm-unsupported doc))
+    (should (equal (gdocs-dm-to-org doc) "Before\n*\nAfter\n"))))
+
+(ert-deftest gdocs-test-image-and-literal-asterisk-stay-distinct ()
+  "Only the te-attached star becomes a remote image placeholder."
+  (let* ((fixture (gdocs-test--inline-case "image-and-literal-asterisk"))
+         (doc (gdocs-dm-from-ops nil nil nil
+                                 (plist-get fixture :body)
+                                 (plist-get fixture :ops)))
+         (org (gdocs-dm-to-org doc)))
+    (should (= (length (gdocs-dm-inline-objects doc)) 1))
+    (should (equal org
+                   (concat "Image\n"
+                           "#+gdocs_inline_object: image kix.synthetic-image-mixed 468x102 content-id=s-blob-v1-IMAGE-synthetic-mixed\n"
+                           "Literal\n*\nAfter\n")))))
+
+(ert-deftest gdocs-test-ambiguous-inline-image-mapping-is-unsupported ()
+  "An image without an authoritative te attachment is not guessed."
+  (let* ((fixture (gdocs-test--inline-case "ambiguous-image-attachment"))
+         (doc (gdocs-dm-from-ops nil nil nil
+                                 (plist-get fixture :body)
+                                 (plist-get fixture :ops))))
+    (should-not (gdocs-dm-inline-objects doc))
+    (should (gdocs-dm-unsupported doc))
+    (should (string-match-p "^#\\+gdocs_unsupported: "
+                            (gdocs-dm-to-org doc)))))
 
 ;;; Doc-model formatting
 
@@ -1083,6 +1191,37 @@ END is the inclusive final OT position."
     (should (string-match-p ":GDOC_TITLE: Drive name" pull-body))
     (should-not (string-match-p "^#\\+title:" pull-body))))
 
+(ert-deftest gdocs-test-pull-image-bearing-document-succeeds ()
+  "Pull decodes an image-bearing model without emitting a star paragraph."
+  (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
+         (body (plist-get fixture :body))
+         (ops (plist-get fixture :ops))
+         (state (list :revision 17 :title "Synthetic image document"
+                      :ot-body body))
+         (result (gdocs--ot-decode-pipeline
+                  "synthetic-image-document"
+                  (gdocs-test--html-for-ops 17 ops)
+                  state))
+         (pull-body (cdr result)))
+    (should (string-match-p
+             "^#\\+gdocs_inline_object: image kix.synthetic-image-one 468x102 content-id=s-blob-v1-IMAGE-synthetic-one$"
+             pull-body))
+    (should-not (string-match-p "^\\*$" pull-body))))
+
+(ert-deftest gdocs-test-buffer-body-preserves-remote-image-marker ()
+  "The pushable body keeps the explicit remote image marker intact."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-image-document\n:END:\n\n"
+            "Before\n"
+            "#+gdocs_inline_object: image kix.synthetic-image-one 468x102 content-id=s-blob-v1-IMAGE-synthetic-one\n"
+            "After\n")
+    (org-mode)
+    (should (equal
+             (gdocs--buffer-body-as-plain)
+             (concat "Before\n"
+                     "#+gdocs_inline_object: image kix.synthetic-image-one 468x102 content-id=s-blob-v1-IMAGE-synthetic-one\n"
+                     "After\n")))))
+
 (ert-deftest gdocs-test-pipeline-body-title-is-independent-of-drive-name ()
   "A body Title paragraph remains visible and may equal or differ from the Drive name."
   (dolist (case '(("Same" "Same") ("Drive name" "Body title")))
@@ -1362,8 +1501,40 @@ END is the inclusive final OT position."
                  remote
                  (plist-get region :start)
                  (plist-get region :rem-end))))
-    ;; The structural marker sits between the space and the edited word.
-    (should (equal range '(4 . 8)))))
+     ;; The structural marker sits between the space and the edited word.
+     (should (equal range '(4 . 8)))))
+
+(ert-deftest gdocs-test-image-bearing-push-is-refused-before-ot-ops ()
+  "An image-bearing remote document cannot enter any push backend."
+  (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
+         (body (plist-get fixture :body))
+         (state (list :revision 17 :ot-body body
+                      :ot-ops (plist-get fixture :ops)))
+         (message nil))
+    (condition-case err
+        (gdocs--apply-push "synthetic-image-document" state
+                           "Before\nAfter\n" "Before\nAfter\n")
+      (user-error (setq message (error-message-string err))))
+    (should (string-match-p "refusing push" message))
+    (should (string-match-p "inline image" message))
+    (should (string-match-p "pull remains available" message))
+    (condition-case err
+        (gdocs--apply-push-async
+         "synthetic-image-document" state "Before\nAfter\n"
+         "Before\nAfter\n" nil (lambda (&rest _args) nil))
+      (user-error (setq message (error-message-string err))))
+    (should (string-match-p "refusing push" message))))
+
+(ert-deftest gdocs-test-local-image-marker-cannot-recreate-an-image ()
+  "A local remote-object marker is not silently emitted as plain text."
+  (let ((message nil))
+    (condition-case err
+        (gdocs--assert-push-safe
+         '(:ot-body "plain\n" :ot-ops nil)
+         "#+gdocs_inline_object: image kix.synthetic 1x1 content-id=s-blob-v1-IMAGE-synthetic\n")
+      (user-error (setq message (error-message-string err))))
+    (should (string-match-p "refusing push" message))
+    (should (string-match-p "creation/replacement" message))))
 
 (ert-deftest gdocs-test-push-preflight-refuses-missing-revision ()
   "A buffer without a revision is rejected before any network probe."
