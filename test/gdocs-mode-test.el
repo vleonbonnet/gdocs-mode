@@ -441,9 +441,9 @@ END is the inclusive final OT position."
     (should (equal (gdocs-dm-to-org doc) (plist-get fixture :expected-org)))
     (should (equal (mapcar #'gdocs-test--paragraph-view
                            (gdocs-dm-paragraphs doc))
-                     '((:para nil nil nil (("Before" nil nil)))
-                      (:para nil nil nil (("￼" nil nil)))
-                      (:para nil nil nil (("After" nil nil))))))))
+                   '((:para nil nil nil (("Before" nil nil)))
+                     (:para nil nil nil (("￼" nil nil)))
+                     (:para nil nil nil (("After" nil nil))))))))
 
 (ert-deftest gdocs-test-inline-image-decodes-and-renders-explicitly ()
   "A te.spi image attachment becomes a first-class remote placeholder."
@@ -473,10 +473,10 @@ END is the inclusive final OT position."
 (ert-deftest gdocs-test-embedded-inline-image-marker-round-trips ()
   "An inline object sharing a paragraph uses a parseable Org token."
   (let* ((object '(:kind :inline-object
-                   :entity-id "kix.synthetic-embedded"
-                   :object-kind :image
-                   :content-id "s-blob-v1-IMAGE-synthetic-embedded"
-                   :width 10.0 :height 20.0 :ot-position 8))
+                         :entity-id "kix.synthetic-embedded"
+                         :object-kind :image
+                         :content-id "s-blob-v1-IMAGE-synthetic-embedded"
+                         :width 10.0 :height 20.0 :ot-position 8))
          (doc (gdocs-dm-make-doc
                :inline-objects (list object)
                :paragraphs
@@ -1206,6 +1206,8 @@ END is the inclusive final OT position."
     (should (string-match-p
              "^#\\+gdocs_inline_object: image kix.synthetic-image-one 468x102 content-id=s-blob-v1-IMAGE-synthetic-one$"
              pull-body))
+    (should (string-match-p ":GDOC_UNSUPPORTED: 1 inline image"
+                            pull-body))
     (should-not (string-match-p "^\\*$" pull-body))))
 
 (ert-deftest gdocs-test-buffer-body-preserves-remote-image-marker ()
@@ -1501,8 +1503,8 @@ END is the inclusive final OT position."
                  remote
                  (plist-get region :start)
                  (plist-get region :rem-end))))
-     ;; The structural marker sits between the space and the edited word.
-     (should (equal range '(4 . 8)))))
+    ;; The structural marker sits between the space and the edited word.
+    (should (equal range '(4 . 8)))))
 
 (ert-deftest gdocs-test-image-bearing-push-is-refused-before-ot-ops ()
   "An image-bearing remote document cannot enter any push backend."
@@ -1524,6 +1526,174 @@ END is the inclusive final OT position."
          "Before\nAfter\n" nil (lambda (&rest _args) nil))
       (user-error (setq message (error-message-string err))))
     (should (string-match-p "refusing push" message))))
+
+(ert-deftest gdocs-test-capability-preflight-allows-supported-text-only ()
+  "A supported text-only incremental edit passes capability preflight."
+  (let* ((gdocs-push-backend 'plain)
+         (body "Before\n")
+         (state (list :revision 7 :ot-body body
+                      :ot-ops (list (gdocs-test--insert-op body))))
+         (local "Changed\n")
+         (plan (gdocs--push-plan-for-diff state local body)))
+    (should (eq (plist-get plan :kind) :incremental))
+    (should (gdocs--push-preflight state local plan))))
+
+(ert-deftest gdocs-test-capability-report-unknown-entity-refuses-replacement ()
+  "An unknown entity is reported structurally and blocks replacement."
+  (let* ((body "Text\n")
+         (ops (list (gdocs-test--insert-op body)
+                    '((ty . "ae") (et . "equation")
+                      (id . "remote-secret-equation-id"))))
+         (state (list :revision 7 :ot-body body :ot-ops ops))
+         (doc (gdocs-dm-from-ops 7 "synthetic" nil body ops))
+         (report (seq-find (lambda (entry)
+                             (eq (plist-get entry :kind) :unknown-entity))
+                           (gdocs-dm-unsupported doc)))
+         (plan (gdocs--push-plan-for-diff state "Changed\n" body))
+         (message nil))
+    (should report)
+    (should (equal (plist-get report :entity-type) "equation"))
+    (should-not (plist-get report :ot-start))
+    (should-not (plist-get report :preserve-untouched))
+    (should (plist-get report :refuse-push))
+    (condition-case err
+        (gdocs--push-preflight state "Changed\n" plan)
+      (user-error (setq message (error-message-string err))))
+    (should (string-match-p "1 unknown entity" message))
+    (should-not (string-match-p "remote-secret-equation-id" message))
+    (should-not (string-match-p "equation" message))))
+
+(ert-deftest gdocs-test-capability-range-preservation-policy ()
+  "An image outside an edit range is allowed, but an intersecting edit is not."
+  (let* ((gdocs-push-backend 'plain)
+         (fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
+         (body (plist-get fixture :body))
+         (ops (plist-get fixture :ops))
+         (state (list :revision 17 :ot-body body :ot-ops ops))
+         (remote (gdocs--ot-remote-org-body
+                  "synthetic-image-document"
+                  (gdocs-test--html-for-ops 17 ops) state))
+         (unrelated (replace-regexp-in-string "Before" "Changed" remote))
+         (safe-plan (gdocs--push-plan-for-diff state unrelated remote))
+         (marker (string-match "#\\+gdocs_inline_object:[^\n]*\n" remote))
+         (intersecting (concat (substring remote 0 marker)
+                               (substring remote
+                                          (+ marker
+                                             (length (match-string 0 remote))))))
+         (unsafe-plan (gdocs--push-plan-for-diff
+                       state intersecting remote))
+         (message nil))
+    (should (eq (plist-get safe-plan :kind) :incremental))
+    (should (gdocs--push-preflight state unrelated safe-plan))
+    (should (eq (plist-get unsafe-plan :kind) :incremental))
+    (condition-case err
+        (gdocs--push-preflight state intersecting unsafe-plan)
+      (user-error (setq message (error-message-string err))))
+    (should (string-match-p "intersects" message))
+    (should (string-match-p "1 inline image" message))))
+
+(ert-deftest gdocs-test-capability-preflight-redecodes-fresh-remote-state ()
+  "Raw capabilities from a fresh remote state override stale local summaries."
+  (let ((gdocs--sync-mutex t)
+        (gdocs-push-backend 'ot-encode)
+        (applied nil)
+        (unknown-ops (list (gdocs-test--insert-op "Remote\n")
+                           '((ty . "ae") (et . "equation")
+                             (id . "new-remote-object")))))
+    (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+               (lambda (_doc callback)
+                 (funcall callback
+                          (list :revision 8 :token "token" :ouid "ouid"
+                                :ot-body "Remote\n" :ot-ops unknown-ops
+                                ;; Deliberately stale/empty local capability data.
+                                :unsupported nil)
+                          "synthetic-html" nil)))
+              ((symbol-function 'gdocs--ot-remote-org-body)
+               (lambda (&rest _args) "Remote\n"))
+              ((symbol-function 'gdocs--apply-push-async)
+               (lambda (&rest _args) (setq applied t))))
+      (gdocs--push-remotely-async-1 "synthetic-id" nil "8" "Changed\n")
+      (should-not applied)
+      (should-not gdocs--sync-mutex))))
+
+(ert-deftest gdocs-test-capability-error-summary-is-sanitized ()
+  "Capability errors report counts and kinds, never raw entity payloads."
+  (let* ((body "Text\n")
+         (ops (list (gdocs-test--insert-op body)
+                    '((ty . "ae") (et . "equation") (id . "secret-one") )
+                    '((ty . "ae") (et . "equation") (id . "secret-two") )))
+         (state (list :revision 7 :ot-body body :ot-ops ops))
+         (message nil))
+    (condition-case err
+        (gdocs--push-preflight
+         state "Changed\n"
+         '(:kind :full-replace))
+      (user-error (setq message (error-message-string err))))
+    (should (string-match-p "2 unknown entities" message))
+    (should-not (string-match-p "secret-one\|secret-two\|equation" message))))
+
+(ert-deftest gdocs-test-capability-reports-structural-and-paragraph-constructs ()
+  "Unhandled structural codepoints and paragraph attributes are reported."
+  (let* ((body (concat "A" (string #x13) "\n"))
+         (ops (list (gdocs-test--insert-op body)
+                    '((ty . "as") (st . "paragraph")
+                      (si . 3) (ei . 3)
+                      (sm . ((ps_pb . t))))))
+         (doc (gdocs-dm-from-ops 7 "synthetic" nil body ops))
+         (reports (gdocs-dm-unsupported doc))
+         (structural (seq-find (lambda (report)
+                                 (eq (plist-get report :kind)
+                                     :structural-codepoint))
+                               reports))
+         (paragraph (seq-find (lambda (report)
+                                (eq (plist-get report :kind)
+                                    :unsupported-paragraph))
+                              reports)))
+    (should structural)
+    (should (= (plist-get structural :ot-start) 2))
+    (should (plist-get structural :preserve-untouched))
+    (should paragraph)
+    (should (equal (plist-get paragraph :feature-type) "ps_pb"))))
+
+(ert-deftest gdocs-test-auto-sync-never-selects-lossy-override ()
+  "Auto-sync invokes the normal guarded push entry point only."
+  (let ((gdocs-mode t)
+        (gdocs--sync-mutex nil)
+        (gdocs--last-synced-hash "stale")
+        (called nil))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nChanged\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-state-async)
+                 (lambda (_doc callback)
+                   (funcall callback '(:revision 1) nil)))
+                ((symbol-function 'gdocs-push-remotely)
+                 (lambda (&rest args) (setq called args))))
+        (gdocs--auto-sync-tick))
+      (should (equal called '("synthetic-id"))))))
+
+(ert-deftest gdocs-test-debug-capability-output-is-sanitized ()
+  "Debug output includes capability counts without raw entity identifiers."
+  (let* ((body "Text\n")
+         (ops (list (gdocs-test--insert-op body)
+                    '((ty . "ae") (et . "equation")
+                      (id . "secret-debug-entity"))))
+         (html (gdocs-test--html-for-ops 7 ops))
+         (out (make-temp-file "gdocs-debug-capability-")))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 7\n:END:\n\nChanged\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-page-sync)
+                 (lambda (_doc) html)))
+        (gdocs-debug-push-state "synthetic-id" out)))
+    (unwind-protect
+        (with-temp-buffer
+          (insert-file-contents out)
+          (should (search-forward "unsupported capability summary: 1 unknown entity"
+                                  nil t))
+          (goto-char (point-min))
+          (should-not (search-forward "secret-debug-entity" nil t)))
+      (delete-file out))))
 
 (ert-deftest gdocs-test-local-image-marker-cannot-recreate-an-image ()
   "A local remote-object marker is not silently emitted as plain text."

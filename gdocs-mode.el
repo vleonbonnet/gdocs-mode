@@ -36,8 +36,9 @@
 ;;
 ;; Push strategy: the default OT encoder rebuilds text styling and supported
 ;; structural entities for the cookie-authenticated /save endpoint. The
-;; legacy plain backend remains lossy. Inline images are pull-only and
-;; image-bearing documents are refused rather than replaced.
+;; legacy plain backend remains lossy. Unsupported remote capabilities are
+;; accounted for centrally and a push is refused unless their preservation is
+;; provable.
 ;;
 ;; Auth is decoupled. Configure `gdocs-auth-function' to return an
 ;; alist of HTTP headers. Cookie sessions today, OAuth tomorrow.
@@ -225,16 +226,22 @@ request.el's chatty backend logs so *Messages* stays clean."
     (goto-char (point-min))
     (org-entry-put (point-min) key value)))
 
-(defun gdocs--update-top-metadata (title revision)
-  "Write the Drive TITLE and revision/timestamp properties.
+(defun gdocs--update-top-metadata (title revision &optional unsupported-summary)
+  "Write Drive TITLE, revision/timestamp, and capability metadata.
 
 The Drive document name is synchronization metadata, not an Org keyword.
-Title-styled paragraphs are rendered separately by `gdocs-dm-to-org'."
+Title-styled paragraphs are rendered separately by `gdocs-dm-to-org'.
+UNSUPPORTED-SUMMARY is a sanitized count string, never raw remote data."
   (save-excursion
     (when title
       (gdocs--put-top-property "GDOC_TITLE" title))
     (when revision
       (gdocs--put-top-property "GDOC_REVISION" revision))
+    (when (stringp unsupported-summary)
+      (if (string-empty-p unsupported-summary)
+          (when (org-entry-get (point-min) "GDOC_UNSUPPORTED" t)
+            (org-entry-delete (point-min) "GDOC_UNSUPPORTED"))
+        (gdocs--put-top-property "GDOC_UNSUPPORTED" unsupported-summary)))
     (gdocs--put-top-property "GDOC_SYNCED_AT" (gdocs--now-iso))))
 
 ;;; Out-of-date check
@@ -616,7 +623,7 @@ the doc or any buffer. The caller's `gdocs-auth-function' is used."
 ;; runs. Each run is a (:text :styles :link) plist.
 ;;
 ;; DOC   = (:revision N :doc-id S :title S :paragraphs (PARA ...)
-;;          :lists ALIST :inline-objects (OBJECT ...) :unsupported (REASON ...))
+;;          :lists ALIST :inline-objects (OBJECT ...) :unsupported (CAP ...))
 ;; PARA  = (:kind :para|:heading|:title|:subtitle|:blank|:list|:code|:table
 ;;          :level N         ; heading level 1..5 (only for :heading)
 ;;          :list-id S       ; list entity id (only for :list)
@@ -648,6 +655,196 @@ the doc or any buffer. The caller's `gdocs-auth-function' is used."
 (defsubst gdocs-dm-title (doc) (plist-get doc :title))
 (defsubst gdocs-dm-inline-objects (doc) (plist-get doc :inline-objects))
 (defsubst gdocs-dm-unsupported (doc) (plist-get doc :unsupported))
+
+;; Capability classification is deliberately separate from the doc-model.
+;; New Google entities or attributes can be added here without changing push
+;; policy: the decoder records a capability report and the preflight decides
+;; whether the planned OT edit can leave it untouched.
+(defconst gdocs--capability-registry
+  '((:operation
+     ("is" . :supported)
+     ("ds" . :supported)
+     ("as" . :attribute)
+     ("ae" . :entity)
+     ("te" . :entity-attachment))
+    (:entity
+     ("list" . :supported)
+     ("inline" . :recognized-not-editable))
+    (:attribute
+     ("text" . :supported)
+     ("link" . :supported)
+     ("paragraph" . :supported)
+     ("list" . :supported)
+     ("tbl" . :supported)
+     ("doco_anchor" . :recognized-not-editable)))
+  "Central registry for raw Google Docs OT constructs.
+
+The values describe decoder coverage, not push safety. A recognized
+not-editable construct still becomes a structured `:unsupported' report;
+the push preflight may allow it only when an edit is proven not to touch it.")
+
+(defun gdocs--capability-classify (category value)
+  "Return the registry classification for CATEGORY and VALUE.
+Unknown values are classified as `:unknown'."
+  (or (cdr (assoc value (cdr (assq category gdocs--capability-registry))))
+      :unknown))
+
+(defconst gdocs--capability-known-text-style-keys
+  '(ts_bd ts_bd_i ts_it ts_it_i ts_un ts_un_i ts_st ts_st_i
+          ts_ff ts_ff_i ts_fs ts_fs_i ts_fgc2 ts_fgc2_i ts_bgc2 ts_bgc2_i
+          ts_va ts_va_i ts_sc ts_sc_i ts_tw ts_tw_i)
+  "Text-style keys whose current decoder understands or intentionally
+normalizes their value.
+
+The key list is conservative about *new* Google style dimensions while
+allowing the common explicitness/default fields already emitted by Docs.")
+
+(defun gdocs--capability-kind-label (kind)
+  "Return a concise, user-facing label for capability KIND."
+  (or (cdr (assq kind
+                 '((:inline-image . "inline image")
+                   (:unknown-entity . "unknown entity")
+                   (:unknown-feature . "unknown feature")
+                   (:unsupported-style . "unsupported style")
+                   (:unsupported-paragraph . "unsupported paragraph construct")
+                   (:structural-codepoint . "unhandled structural codepoint")
+                   (:comment-anchor . "comment anchor")
+                   (:local-unsupported . "local unsupported-content marker")
+                   (:unsupported-entity . "unsupported entity"))))
+      (replace-regexp-in-string "-" " " (symbol-name kind))))
+
+(defun gdocs--capability-plural-label (kind)
+  "Return the plural label for capability KIND."
+  (pcase kind
+    (:inline-image "inline images")
+    (:unknown-entity "unknown entities")
+    (:unknown-feature "unknown features")
+    (:unsupported-style "unsupported styles")
+    (:unsupported-paragraph "unsupported paragraph constructs")
+    (:structural-codepoint "unhandled structural codepoints")
+    (:comment-anchor "comment anchors")
+    (:local-unsupported "local unsupported-content markers")
+    (:unsupported-entity "unsupported entities")
+    (_ (concat (gdocs--capability-kind-label kind) "s"))))
+
+(defun gdocs--capability-report (kind explanation &rest props)
+  "Build a sanitized unsupported-capability report.
+
+PROPS may contain `:ot-start', `:ot-end', `:entity-id', `:entity-type',
+`:codepoint', `:severity', `:preserve-untouched', `:refuse-push',
+`:push-policy', `:source', and `:render-directive'. Raw OT operations and
+payloads must never be placed in PROPS. `:preserve-untouched' is the proof
+required for an
+incremental push; `:refuse-push' marks capabilities for which no such proof
+can be made."
+  (let* ((preserve (if (plist-member props :preserve-untouched)
+                       (plist-get props :preserve-untouched)
+                     nil))
+         (refuse (if (plist-member props :refuse-push)
+                     (plist-get props :refuse-push)
+                   t))
+         (report (list :kind kind
+                       :severity (or (plist-get props :severity)
+                                     :destructive)
+                       :preserve-untouched preserve
+                       :safe-untouched preserve
+                       :refuse-push refuse
+                       :push-policy (or (plist-get props :push-policy)
+                                        (if refuse :refuse :allow-if-untouched))
+                       :explanation explanation)))
+    (cl-loop for (key value) on props by #'cddr
+             unless (memq key '(:severity :preserve-untouched :refuse-push
+                                          :push-policy))
+             do (setq report (plist-put report key value)))
+    report))
+
+(defun gdocs--capability-normalize (value)
+  "Convert legacy string VALUE into a structured local report."
+  (if (and (listp value) (plist-member value :kind))
+      (let* ((report (copy-sequence value))
+             (kind (plist-get report :kind))
+             (preserve (cond
+                        ((plist-member report :preserve-untouched)
+                         (plist-get report :preserve-untouched))
+                        ((plist-member report :safe-untouched)
+                         (plist-get report :safe-untouched))
+                        (t nil)))
+             (refuse (if (plist-member report :refuse-push)
+                         (plist-get report :refuse-push)
+                       t)))
+        (setq report (plist-put report :severity
+                                (or (plist-get report :severity)
+                                    :destructive)))
+        (setq report (plist-put report :preserve-untouched preserve))
+        (setq report (plist-put report :safe-untouched preserve))
+        (setq report (plist-put report :refuse-push refuse))
+        (setq report (plist-put report :push-policy
+                                (or (plist-get report :push-policy)
+                                    (if refuse :refuse :allow-if-untouched))))
+        (unless (plist-get report :explanation)
+          (setq report
+                (plist-put report :explanation
+                           (format "Unsupported %s."
+                                   (gdocs--capability-kind-label kind)))))
+        report)
+    (gdocs--capability-report
+     :local-unsupported
+     "The local document contains an unsupported-content marker."
+     :source :local)))
+
+(defun gdocs--capability-merge (&rest report-lists)
+  "Return REPORT-LISTS concatenated without duplicate reports."
+  (let (out keys)
+    (dolist (reports report-lists)
+      (dolist (report reports)
+        (setq report (gdocs--capability-normalize report))
+        (let ((key (mapcar (lambda (field) (plist-get report field))
+                           '(:kind :entity-id :entity-type :feature-type
+                                   :ot-start :ot-end :source))))
+          (unless (member key keys)
+            (setq keys (append keys (list key)))
+            (setq out (append out (list report)))))))
+    out))
+
+(defun gdocs--capability-summary (reports)
+  "Return a sanitized count summary for REPORTS.
+The summary contains kinds and counts only; it never serializes raw OT or
+entity payloads."
+  (let ((counts (make-hash-table :test #'eq)))
+    (dolist (value reports)
+      (let ((report (gdocs--capability-normalize value)))
+        (let ((kind (plist-get report :kind)))
+          (puthash kind (1+ (gethash kind counts 0)) counts))))
+    (let (kinds)
+      (maphash (lambda (kind _count) (push kind kinds)) counts)
+      (setq kinds (sort kinds
+                        (lambda (a b)
+                          (string< (symbol-name a) (symbol-name b)))))
+      (mapconcat
+       (lambda (kind)
+         (let ((count (gethash kind counts)))
+           (format "%d %s" count
+                   (if (= count 1)
+                       (gdocs--capability-kind-label kind)
+                     (gdocs--capability-plural-label kind)))))
+       kinds ", "))))
+
+(defun gdocs--capability-sanitized-details (reports)
+  "Return debug-safe summaries for REPORTS.
+Identifiers, payloads, and raw operation shapes are intentionally omitted."
+  (mapcar
+   (lambda (value)
+     (let ((report (gdocs--capability-normalize value)))
+       (let ((out (list :kind (plist-get report :kind)
+                        :severity (plist-get report :severity)
+                        :preserve-untouched
+                        (plist-get report :preserve-untouched)
+                        :refuse-push (plist-get report :refuse-push))))
+         (dolist (key '(:entity-type :ot-start :ot-end :codepoint))
+           (when (plist-member report key)
+             (setq out (plist-put out key (plist-get report key)))))
+         out)))
+   reports))
 
 (defun gdocs--doc-has-inline-object-p (doc)
   "Return non-nil if DOC contains an inline object in any model shape."
@@ -954,11 +1151,11 @@ An `ae et=\"inline\"' operation defines an entity.  Its `te' operation
 contains the authoritative one-based `spi' position and matching entity
 ID; `body[spi - 1]' must be the literal `*' placeholder.  Entity or
 operation order is deliberately ignored.  The result is a plist with
-`:objects', a position-indexed `:object-vector', and `:unsupported'
-reasons."
+`:objects', a position-indexed `:object-vector', and structured
+`:unsupported' capability reports."
   (let ((definitions (make-hash-table :test #'equal))
         (attachments nil)
-        (reasons nil)
+        (reports nil)
         (body-len (length (or body ""))))
     (dolist (op ops)
       (when (listp op)
@@ -969,16 +1166,27 @@ reasons."
                  (object (gdocs--inline-image-object-from-ae op)))
             (cond
              ((not (stringp id))
-              (push "inline entity has no string ID" reasons))
+              (push (gdocs--capability-report
+                     :inline-image
+                     "An inline image entity has no usable identifier."
+                     :refuse-push t :render-directive t)
+                    reports))
              ((gethash id definitions)
-              (push (format "inline entity %s is defined more than once" id)
-                    reasons))
+              (push (gdocs--capability-report
+                     :inline-image
+                     "An inline image entity is defined more than once."
+                     :entity-id id
+                     :refuse-push t :render-directive t)
+                    reports))
              (object (puthash id object definitions))
              (t
               (puthash id :unsupported definitions)
-              (push (format "inline entity %s has no recognized image metadata"
-                            id)
-                    reasons)))))
+              (push (gdocs--capability-report
+                     :inline-image
+                     "An inline image has metadata the decoder cannot preserve."
+                     :entity-id id
+                     :refuse-push t :render-directive t)
+                    reports)))))
          ((equal (alist-get 'ty op) "te")
           (push (list (alist-get 'id op) (alist-get 'spi op)) attachments)))))
     (setq attachments (nreverse attachments))
@@ -993,37 +1201,79 @@ reasons."
                (object (and (listp definition) definition)))
           (cond
            ((not (stringp id))
-            (push "inline attachment has no string entity ID" reasons))
+            (push (gdocs--capability-report
+                   :inline-image
+                   "An inline image attachment has no usable identifier."
+                   :refuse-push t :render-directive t)
+                  reports))
            ((null definition)
-            (push (format "inline attachment %s has no entity definition" id)
-                  reasons))
+            (push (gdocs--capability-report
+                   :unknown-entity
+                   "An inline entity attachment has no matching definition."
+                   :entity-type "inline"
+                   :entity-id id
+                   :refuse-push t :render-directive t)
+                  reports))
            ((eq definition :unsupported)
             ;; The malformed definition already contributed the detailed
             ;; reason above; retain this attachment as unsupported too.
-            (push (format "inline attachment %s cannot be decoded" id) reasons))
+            (push (gdocs--capability-report
+                   :inline-image
+                   "An inline image attachment cannot be decoded."
+                   :entity-id id
+                   :refuse-push t :render-directive t)
+                  reports))
            ((not (integerp spi))
-            (push (format "inline attachment %s has no integer spi" id)
-                  reasons))
+            (push (gdocs--capability-report
+                   :inline-image
+                   "An inline image attachment has no usable OT position."
+                   :entity-id id
+                   :refuse-push t :render-directive t)
+                  reports))
            ((or (< spi 1) (> spi body-len))
-            (push (format "inline attachment %s has out-of-range spi %S"
-                          id spi)
-                  reasons))
+            (push (gdocs--capability-report
+                   :inline-image
+                   "An inline image attachment has an out-of-range OT position."
+                   :entity-id id
+                   :refuse-push t :render-directive t)
+                  reports))
            ((/= (aref body (1- spi)) ?*)
-            (push (format "inline attachment %s spi %S is not an image placeholder"
-                          id spi)
-                  reasons))
+            (push (gdocs--capability-report
+                   :inline-image
+                   "An inline image attachment is not attached to its placeholder."
+                   :entity-id id
+                   :ot-start spi :ot-end spi
+                   :preserve-untouched t :refuse-push nil
+                   :push-policy :allow-if-untouched :render-directive t)
+                  reports))
            ((gethash id seen-ids)
-            (push (format "inline entity %s is attached more than once" id)
-                  reasons))
+            (push (gdocs--capability-report
+                   :inline-image
+                   "An inline image entity is attached more than once."
+                   :entity-id id
+                   :refuse-push t :render-directive t)
+                  reports))
            ((gethash spi seen-positions)
-            (push (format "inline placeholder position %S has multiple entities"
-                          spi)
-                  reasons))
+            (push (gdocs--capability-report
+                   :inline-image
+                   "An inline image placeholder has multiple attached entities."
+                   :ot-start spi :ot-end spi
+                   :preserve-untouched t :refuse-push nil
+                   :push-policy :allow-if-untouched :render-directive t)
+                  reports))
            (t
             (setq object (plist-put (copy-sequence object) :ot-position spi))
             (puthash id t seen-ids)
             (puthash spi t seen-positions)
             (aset object-vector (1- spi) object)
+            (push (gdocs--capability-report
+                   :inline-image
+                   "Inline images are pull-only; the current OT encoder can preserve one only when it is left untouched."
+                   :entity-id id
+                   :ot-start spi :ot-end spi
+                   :preserve-untouched t :refuse-push nil
+                   :push-policy :allow-if-untouched)
+                  reports)
             (push object objects)))))
       ;; Every inline definition must have exactly one attachment.  This is
       ;; what prevents a missing or reordered `te' from being guessed from
@@ -1032,16 +1282,305 @@ reasons."
        (lambda (id definition)
          (unless (gethash id seen-ids)
            (unless (eq definition :unsupported)
-             (push (format "inline entity %s has no unambiguous te attachment"
-                           id)
-                   reasons))))
+             (push (gdocs--capability-report
+                    :inline-image
+                    "An inline image has no unambiguous OT attachment."
+                    :entity-id id
+                    :refuse-push t :render-directive t)
+                   reports))))
        definitions)
       (list :objects (sort objects
                            (lambda (a b)
                              (< (plist-get a :ot-position)
                                 (plist-get b :ot-position))))
             :object-vector object-vector
-            :unsupported (nreverse reasons)))))
+            :unsupported (nreverse reports)))))
+
+(defun gdocs--capability-op-range (op)
+  "Return OP's sanitized inclusive OT range, or nil when unavailable."
+  (let ((start (alist-get 'si op))
+        (end (alist-get 'ei op)))
+    (when (and (integerp start) (>= start 1)
+               (or (null end)
+                   (and (integerp end) (>= end start))))
+      (list :ot-start start
+            :ot-end (if (and (integerp end) (>= end start)) end start)))))
+
+(defun gdocs--capability-report-for-op
+    (kind explanation op &rest props)
+  "Build a capability report for OP, adding its OT range when known."
+  (apply #'gdocs--capability-report kind explanation
+         (append (gdocs--capability-op-range op) props)))
+
+(defun gdocs--capability-unknown-style-keys (sm known)
+  "Return unknown top-level keys in style modifier SM."
+  (if (not (listp sm))
+      '(:malformed-style)
+    (cl-loop for entry in sm
+             for key = (and (consp entry) (car entry))
+             unless (and key (memq key known))
+             collect (or key :malformed-style))))
+
+(defun gdocs--scan-unsupported-capabilities (ops body)
+  "Classify raw OPS and structural codepoints in BODY.
+
+This scanner records only capability metadata and short explanations. It
+never copies an operation, style payload, URL, or entity contents into a
+report. Inline image reports are produced by
+`gdocs--decode-inline-objects'."
+  (let ((reports nil)
+        (attachments (make-hash-table :test #'equal)))
+    ;; Collect attachment positions first so an unknown entity can carry a
+    ;; useful range when Google supplied a `te' operation for it.
+    (dolist (op ops)
+      (when (and (listp op) (equal (alist-get 'ty op) "te"))
+        (let ((id (alist-get 'id op))
+              (spi (alist-get 'spi op)))
+          (when (and (stringp id) (integerp spi) (>= spi 1))
+            (puthash id spi attachments)))))
+    (dolist (op ops)
+      (when (listp op)
+        (let* ((type (alist-get 'ty op))
+               (classification (gdocs--capability-classify :operation type)))
+          (cond
+           ((eq classification :unknown)
+            (push (gdocs--capability-report-for-op
+                   :unknown-feature
+                   "The remote operation type is not understood and would be removed by a full replacement."
+                   op
+                   :feature-type (if (stringp type) type "unknown")
+                   :refuse-push t)
+                  reports))
+           ((equal type "is")
+            (unless (stringp (alist-get 's op))
+              (push (gdocs--capability-report-for-op
+                     :unknown-feature
+                     "A remote text insertion has no usable text payload."
+                     op :feature-type "is" :refuse-push t)
+                    reports)))
+           ((equal type "ae")
+            (let* ((entity-type (alist-get 'et op))
+                   (entity-id (alist-get 'id op))
+                   (entity-class
+                    (gdocs--capability-classify :entity entity-type)))
+              (cond
+               ((eq entity-class :unknown)
+                (let ((report
+                       (gdocs--capability-report
+                        :unknown-entity
+                        "The remote entity type is not understood and would be removed by a full replacement."
+                        :entity-type (if (stringp entity-type)
+                                         entity-type "unknown")
+                        :refuse-push t)))
+                  (when (stringp entity-id)
+                    (setq report (plist-put report :entity-id entity-id)))
+                  (when (and (stringp entity-id)
+                             (gethash entity-id attachments))
+                    (setq report
+                          (plist-put report :ot-start
+                                     (gethash entity-id attachments)))
+                    (setq report
+                          (plist-put report :ot-end
+                                     (gethash entity-id attachments)))
+                    (setq report
+                          (plist-put report :preserve-untouched t))
+                    (setq report
+                          (plist-put report :safe-untouched t))
+                    (setq report
+                          (plist-put report :refuse-push nil))
+                    (setq report
+                          (plist-put report :push-policy
+                                     :allow-if-untouched)))
+                  (push report reports)))
+               ((equal entity-type "list")
+                (if (stringp entity-id)
+                    (let* ((epm (alist-get 'epm op))
+                           (levels (and (listp epm)
+                                        (alist-get 'le_nb epm))))
+                      (dolist (level levels)
+                        (let ((glyph-type
+                               (and (listp (cdr level))
+                                    (alist-get 'b_gt (cdr level)))))
+                          (unless (memq glyph-type '(9 10 13 15))
+                            (push (gdocs--capability-report
+                                   :unsupported-entity
+                                   "A list glyph type is not supported by the Org/OT model."
+                                   :entity-type "list"
+                                   :entity-id entity-id
+                                   :feature-type "b_gt"
+                                   :refuse-push t)
+                                  reports)))))
+                  (push (gdocs--capability-report
+                         :unsupported-entity
+                         "A list entity has no usable identifier."
+                         :entity-type "list" :refuse-push t)
+                        reports)))
+               ;; Inline definitions are validated by the image decoder.
+               ((equal entity-type "inline") nil)
+               ((eq entity-class :recognized-not-editable)
+                (push (gdocs--capability-report
+                       :unsupported-entity
+                       "A recognized remote entity is not represented by the Org/OT model."
+                       :entity-type (if (stringp entity-type)
+                                        entity-type "recognized")
+                       :entity-id entity-id
+                       :refuse-push t)
+                      reports)))))
+           ((equal type "as")
+            (let* ((style (alist-get 'st op))
+                   (style-class (gdocs--capability-classify
+                                 :attribute style))
+                   (sm (alist-get 'sm op)))
+              (cond
+               ((eq style-class :unknown)
+                (push (gdocs--capability-report-for-op
+                       :unknown-feature
+                       "The remote attribute type is not understood and would be removed by a full replacement."
+                       op :feature-type (if (stringp style) style "unknown")
+                       :refuse-push t)
+                      reports))
+               ((equal style "text")
+                (dolist (key (gdocs--capability-unknown-style-keys
+                              sm gdocs--capability-known-text-style-keys))
+                  (push (gdocs--capability-report-for-op
+                         :unsupported-style
+                         "A remote text-style dimension is not represented by the Org/OT model."
+                         op :feature-type (format "%s" key)
+                         :preserve-untouched t :refuse-push nil
+                         :push-policy :allow-if-untouched)
+                        reports)))
+               ((equal style "paragraph")
+                (dolist (key (gdocs--capability-unknown-style-keys
+                              sm '(ps_hd ps_hd_i ps_hdid ps_hdid_i
+                                         ps_il ps_ifl ps_al)))
+                  (push (gdocs--capability-report-for-op
+                         :unsupported-paragraph
+                         "A remote paragraph attribute is not represented by the Org/OT model."
+                         op :feature-type (format "%s" key)
+                         :preserve-untouched t :refuse-push nil
+                         :push-policy :allow-if-untouched)
+                        reports))
+                (let ((heading (alist-get 'ps_hd sm)))
+                  (when (and (integerp heading)
+                             (not (or (and (<= 1 heading) (<= heading 5))
+                                      (memq heading '(100 101)))))
+                    (push (gdocs--capability-report-for-op
+                           :unsupported-paragraph
+                           "A remote paragraph heading level is not supported by the Org/OT model."
+                           op :feature-type "ps_hd"
+                           :preserve-untouched t :refuse-push nil
+                           :push-policy :allow-if-untouched)
+                          reports))))
+               ((equal style "list")
+                (dolist (key (gdocs--capability-unknown-style-keys
+                              sm '(ls_id ls_nest ls_ts)))
+                  (push (gdocs--capability-report-for-op
+                         :unsupported-paragraph
+                         "A remote list attribute is not represented by the Org/OT model."
+                         op :feature-type (format "%s" key)
+                         :preserve-untouched t :refuse-push nil
+                         :push-policy :allow-if-untouched)
+                        reports))
+                (let ((nest (alist-get 'ls_nest sm)))
+                  (when (and nest
+                             (not (and (integerp nest)
+                                       (<= 0 nest) (<= nest 8))))
+                    (push (gdocs--capability-report-for-op
+                           :unsupported-paragraph
+                           "A remote list nesting level is outside the supported range."
+                           op :feature-type "ls_nest"
+                           :preserve-untouched t :refuse-push nil
+                           :push-policy :allow-if-untouched)
+                          reports))))
+               ((equal style "link")
+                (let ((action (gdocs--link-sm-action sm)))
+                  (when (eq (plist-get action :action) :invalid)
+                    (push (gdocs--capability-report-for-op
+                           :unsupported-style
+                           "A remote link modifier is malformed and cannot be safely round-tripped."
+                           op :feature-type "link"
+                           :preserve-untouched t :refuse-push nil
+                           :push-policy :allow-if-untouched)
+                          reports))))
+               ((equal style "doco_anchor")
+                (push (gdocs--capability-report-for-op
+                       :comment-anchor
+                       "A remote comment anchor is not emitted by the OT encoder; it can be preserved only when left untouched."
+                       op :preserve-untouched t :refuse-push nil
+                       :push-policy :allow-if-untouched)
+                      reports))
+               ((eq style-class :recognized-not-editable)
+                (push (gdocs--capability-report-for-op
+                       :unknown-feature
+                       "A recognized remote attribute is not represented by the Org/OT model."
+                       op :feature-type (if (stringp style) style "recognized")
+                       :preserve-untouched t :refuse-push nil
+                       :push-policy :allow-if-untouched)
+                      reports)))))))))
+    ;; Structural controls outside the four table markers understood by the
+    ;; decoder are features, not ordinary text. Report each occurrence with
+    ;; its precise OT position so incremental edits can avoid it.
+    (let ((structural (and (boundp 'gdocs--ot-structural-codepoints)
+                           gdocs--ot-structural-codepoints)))
+      (dotimes (i (length (or body "")))
+        (let ((codepoint (aref body i)))
+          (when (and (>= codepoint #x10)
+                     (<= codepoint #x1f)
+                     (not (memq codepoint structural)))
+            (push (gdocs--capability-report
+                   :structural-codepoint
+                   "A remote structural codepoint is not handled by the OT decoder."
+                   :codepoint codepoint
+                   :ot-start (1+ i) :ot-end (1+ i)
+                   :preserve-untouched t :refuse-push nil
+                   :push-policy :allow-if-untouched)
+                  reports)))))
+    ;; Known table markers still need a valid nesting shape. An unmatched
+    ;; marker is not safe to normalize into an ordinary paragraph.
+    (let ((depth 0)
+          (open-position nil))
+      (dotimes (i (length (or body "")))
+        (let ((codepoint (aref body i)))
+          (cond
+           ((= codepoint gdocs--ot-table-open)
+            (when (zerop depth)
+              (setq open-position (1+ i)))
+            (cl-incf depth))
+           ((= codepoint gdocs--ot-table-close)
+            (if (> depth 0)
+                (progn
+                  (cl-decf depth)
+                  (when (zerop depth)
+                    (setq open-position nil)))
+              (push (gdocs--capability-report
+                     :unsupported-paragraph
+                     "A remote table structure has an unmatched close marker."
+                     :feature-type "table-structure"
+                     :ot-start (1+ i) :ot-end (1+ i)
+                     :preserve-untouched t :refuse-push nil
+                     :push-policy :allow-if-untouched)
+                    reports))))))
+      (when (and (> depth 0) open-position)
+        (push (gdocs--capability-report
+               :unsupported-paragraph
+               "A remote table structure has an unmatched open marker."
+               :feature-type "table-structure"
+               :ot-start open-position
+               :ot-end (length (or body ""))
+               :preserve-untouched t :refuse-push nil
+               :push-policy :allow-if-untouched)
+              reports)))
+    (nreverse reports)))
+
+(defun gdocs--decode-capability-analysis (ops body)
+  "Decode inline objects and return the complete capability analysis."
+  (let* ((inline (gdocs--decode-inline-objects ops body))
+         (reports (gdocs--capability-merge
+                   (gdocs--scan-unsupported-capabilities ops body)
+                   (plist-get inline :unsupported))))
+    (list :objects (plist-get inline :objects)
+          :object-vector (plist-get inline :object-vector)
+          :unsupported reports)))
 
 (defun gdocs--decode-doco-anchors (ops)
   "Extract comment anchors from OPS. Returns an alist (KIX-ID . (SI . EI)).
@@ -1324,7 +1863,7 @@ REVISION, DOC-ID and TITLE are stored as metadata."
          (list-bindings (gdocs--decode-list-bindings ops))
          (table-attrs (gdocs--decode-table-attrs ops))
          (list-defs (gdocs--decode-list-defs ops))
-         (inline-analysis (gdocs--decode-inline-objects ops body))
+         (inline-analysis (gdocs--decode-capability-analysis ops body))
          (inline-object-vec (plist-get inline-analysis :object-vector))
          (paragraphs nil)
          (i 0))
@@ -1678,11 +2217,22 @@ keyword lines emitted from Title/Subtitle paragraphs."
            (string-match-p "\\`#\\+subtitle:" line))))
 
 (defun gdocs--render-unsupported-directive (reasons)
-  "Render REASONS as one visible, non-prose Org directive."
+  "Render structured or legacy REASONS as one visible Org directive.
+
+Only the report explanations are rendered; raw operation payloads are never
+copied into the local document."
   (format "#+gdocs_unsupported: %s"
           (replace-regexp-in-string
            "[ \t\n\r]+" " "
-           (string-trim (string-join reasons "; ")))))
+           (string-trim
+            (string-join
+             (mapcar (lambda (reason)
+                       (if (stringp reason)
+                           reason
+                         (or (plist-get reason :explanation)
+                             "unsupported content")))
+                     reasons)
+             "; ")))))
 
 (defun gdocs-dm-to-org (doc)
   "Render a doc-model DOC to a canonical org-mode string.
@@ -1774,12 +2324,18 @@ than to the final text, so it never appears inside a source block."
               (seq-some (lambda (para)
                           (eq (plist-get para :kind) :unsupported))
                         paras))
+             (render-reports
+              (seq-filter
+               (lambda (report)
+                 (plist-get (gdocs--capability-normalize report)
+                            :render-directive))
+               (gdocs-dm-unsupported doc)))
              (rendered (concat (string-join final "\n")
                                (if final "\n" ""))))
-        (if (and (gdocs-dm-unsupported doc)
+        (if (and render-reports
                  (not explicit-unsupported))
             (concat (gdocs--render-unsupported-directive
-                     (gdocs-dm-unsupported doc))
+                     render-reports)
                     "\n" rendered)
           rendered)))))
 
@@ -2270,7 +2826,8 @@ caller can distinguish meaningful blank lines from heading padding."
         ((equal key "gdocs_unsupported")
          (list (list :kind :unsupported
                      :runs nil
-                     :unsupported-reason (or val "unsupported content"))))
+                     :unsupported-reason
+                     "The local document contains an unsupported-content marker.")))
         (t nil))))
     (_ nil)))
 
@@ -2313,8 +2870,11 @@ syntax)."
        :unsupported
        (cl-loop for paragraph in paras
                 when (eq (plist-get paragraph :kind) :unsupported)
-                collect (or (plist-get paragraph :unsupported-reason)
-                            "unsupported Org content"))))))
+                collect (gdocs--capability-report
+                         :local-unsupported
+                         (or (plist-get paragraph :unsupported-reason)
+                             "The local document contains unsupported Org content.")
+                         :source :local :render-directive t))))))
 
 ;;; Phase B.2 — Doc-model → OT op-stream emitter
 ;;
@@ -2586,7 +3146,10 @@ BODY at position 1)."
      "gdocs: inline image placeholders are remote-only; image OT operations are not supported"))
   (when (gdocs-dm-unsupported doc)
     (user-error "gdocs: document contains unsupported content: %s"
-                (car (gdocs-dm-unsupported doc))))
+                (or (plist-get (gdocs--capability-normalize
+                                (car (gdocs-dm-unsupported doc)))
+                               :explanation)
+                    "unsupported content")))
   (let* ((paragraphs (gdocs--normalize-paragraphs-for-ot
                       (gdocs-dm-paragraphs doc)))
          (list-defs (gdocs--collect-list-ids paragraphs))
@@ -2702,8 +3265,8 @@ list ids differ between live-decoded and freshly-rendered docs."
 minimal save commands.
 
 Falls back to a full-replace bundle if the diff region includes any
-list or table paragraphs — those carry entity ids whose live values we
-don't track yet, so re-emitting them in-place can desync references.
+list, table, or inline-object paragraphs — those carry structure or
+entity data whose live values we cannot safely rewrite in place.
 
 Returns a list of OT save commands (possibly empty if docs are equal)."
   (let* ((old-paras (gdocs--normalize-paragraphs-for-ot
@@ -2720,7 +3283,12 @@ Returns a list of OT save commands (possibly empty if docs are equal)."
     (cond
      ((and (null old-mid) (null new-mid))
       nil)
-     ((cl-some (lambda (p) (memq (plist-get p :kind) '(:list :table)))
+     ((cl-some (lambda (p)
+                 (or (memq (plist-get p :kind)
+                           '(:list :table :inline-object))
+                     (cl-some (lambda (run)
+                                (plist-get run :inline-object))
+                              (plist-get p :runs))))
                (append old-mid new-mid))
       (gdocs-dm-to-save-commands
        (gdocs--paragraphs-ot-length old-paras) new-doc))
@@ -2794,13 +3362,20 @@ CREATION-TIME-MS is non-nil) a `#+date:' line, ready for
          ;; Hash only the text that can be sent back to Google. The date,
          ;; property drawer, and GDOC_TITLE are synchronization metadata.
          (hash (secure-hash 'sha256 org-content))
-         (props (format
-                 ":PROPERTIES:\n:GDOC_ID: %s\n:GDOC_TITLE: %s\n:GDOC_REVISION: %s\n:GDOC_CONTENT_HASH: %s\n:GDOC_SYNCED_AT: %s\n:END:\n"
-                 doc-id
-                 effective-title
-                 (if revision (number-to-string revision) "")
-                 hash
-                 (gdocs--now-iso))))
+         (capability-summary (gdocs--capability-summary
+                              (gdocs-dm-unsupported doc)))
+         (props (concat
+                 (format
+                  ":PROPERTIES:\n:GDOC_ID: %s\n:GDOC_TITLE: %s\n:GDOC_REVISION: %s\n:GDOC_CONTENT_HASH: %s\n:GDOC_SYNCED_AT: %s\n"
+                  doc-id
+                  effective-title
+                  (if revision (number-to-string revision) "")
+                  hash
+                  (gdocs--now-iso))
+                 (when (length> capability-summary 0)
+                   (format ":GDOC_UNSUPPORTED: %s\n"
+                           capability-summary))
+                 ":END:\n")))
     (cons effective-title (concat props titled))))
 
 (defun gdocs--ot-body-length (ot-body)
@@ -3057,7 +3632,9 @@ fed straight into OT-position arithmetic."
 
 (defun gdocs--parse-edit-state-html (html)
   "Extract the edit-state plist from an /edit page HTML string.
-Returns a plist (:title :token :ouid :revision :smv :smb-seg :ot-body).
+Returns a plist (:title :token :ouid :revision :smv :smb-seg :ot-body
+:ot-ops :unsupported). The capability fields are derived from this HTML,
+not from buffer-local metadata.
 Any field may be nil if not present. Returns nil if HTML is nil."
   (when html
     (let ((title nil) (token nil) (ouid nil) (revision nil)
@@ -3091,14 +3668,20 @@ Any field may be nil if not present. Returns nil if HTML is nil."
         (setq ot-body (plist-get mc :ot-body))
         (when (plist-get mc :revision)
           (setq revision (plist-get mc :revision)))
-        (list :title title :token token :ouid ouid :revision revision
-              :smv smv :smb-seg smb-seg :ot-body ot-body
-              :ot-ops (plist-get full :ops))))))
+        (let* ((ops (plist-get full :ops))
+               (analysis (gdocs--decode-capability-analysis
+                          ops (or ot-body ""))))
+          (list :title title :token token :ouid ouid :revision revision
+                :smv smv :smb-seg smb-seg :ot-body ot-body
+                :ot-ops ops
+                :inline-objects (plist-get analysis :objects)
+                :unsupported (plist-get analysis :unsupported)))))))
 
 (defun gdocs--fetch-edit-state (doc-id)
   "Fetch the doc's /edit page once and extract everything we need.
 Returns a plist (:title T :token TK :ouid U :revision N :smv V
-:smb-seg S :ot-body STR). Any field may be nil if not found.
+:smb-seg S :ot-body STR :ot-ops OPS :unsupported REPORTS). Any field may be
+nil if not found.
 Single GET — reused by pull, push, and staleness.
 
 :smv is the model-version-max from `docs-smv'.
@@ -3485,7 +4068,9 @@ anyway."
             (gdocs--put-top-property (car pair) (cdr pair))))
         ;; A successful pull always refreshes the Drive name and sync time.
         ;; This deliberately does not create a visible #+title keyword.
-        (gdocs--update-top-metadata effective-title nil)
+        (gdocs--update-top-metadata
+         effective-title nil
+         (or (cdr (assoc "GDOC_UNSUPPORTED" drawer)) ""))
         (let* ((body-start (gdocs--body-start-pos))
                (current-content (buffer-substring-no-properties
                                  body-start (point-max))))
@@ -3562,43 +4147,331 @@ read-only projection of Google's comments and must not be pushed)."
            (text (replace-regexp-in-string "\\[fn:[0-9]+\\]" "" text)))
       text)))
 
-(defun gdocs--remote-inline-object-analysis (state)
-  "Return inline-object analysis for push STATE.
+(defun gdocs--inline-object-capability-report (object &optional source)
+  "Build a capability report for decoded inline OBJECT."
+  (gdocs--capability-report
+   :inline-image
+   "Inline images are pull-only; the current OT encoder can preserve one only when it is left untouched."
+   :entity-id (plist-get object :entity-id)
+   :ot-start (plist-get object :ot-position)
+   :ot-end (plist-get object :ot-position)
+   :source source
+   :preserve-untouched t :refuse-push nil
+   :push-policy :allow-if-untouched))
 
-The live edit-state parser retains the complete raw operation stream in
-`:ot-ops'.  A caller that already decoded the state may instead provide
-`:inline-objects' and `:unsupported' directly."
+(defun gdocs--remote-capability-analysis (state)
+  "Return a fresh capability analysis for push STATE.
+
+When raw `:ot-ops' are present they are authoritative and are decoded on
+every call. The cached `:unsupported' value is only a fallback for synthetic
+or legacy states without raw operations; push safety never trusts a stale
+buffer-local report over raw remote state."
   (if (plist-get state :ot-ops)
-      (gdocs--decode-inline-objects (plist-get state :ot-ops)
-                                    (or (plist-get state :ot-body) ""))
-    (list :objects (plist-get state :inline-objects)
-          :unsupported (plist-get state :unsupported))))
+      (gdocs--decode-capability-analysis
+       (plist-get state :ot-ops)
+       (or (plist-get state :ot-body) ""))
+    (let ((objects (plist-get state :inline-objects)))
+      (list :objects objects
+            :unsupported
+            (gdocs--capability-merge
+             (mapcar (lambda (report)
+                       (if (stringp report)
+                           (gdocs--capability-report
+                            :unknown-feature
+                            "The remote document contains capability data from an older decoder."
+                            :source :remote :refuse-push t)
+                         report))
+                     (plist-get state :unsupported))
+             (mapcar (lambda (object)
+                       (gdocs--inline-object-capability-report
+                        object :remote))
+                     objects))))))
+
+(defalias 'gdocs--remote-inline-object-analysis
+  #'gdocs--remote-capability-analysis)
+
+(defun gdocs--local-capability-analysis (local-body)
+  "Decode local unsupported markers and inline objects for preflight.
+Local object payloads are used only for equality checking against the fresh
+remote analysis; they are never put into a capability report."
+  (let ((doc (gdocs-dm-from-org (or local-body "")))
+        (objects nil)
+        (reports nil))
+    (dolist (object (gdocs-dm-inline-objects doc))
+      (push object objects)
+      (push (gdocs--capability-report
+             :inline-image
+             "The local document contains an inline image marker that the OT encoder cannot create or change."
+             :entity-id (plist-get object :entity-id)
+             :source :local-object
+             :preserve-untouched t :refuse-push nil
+             :push-policy :allow-if-untouched)
+            reports))
+    (list :objects (nreverse objects)
+          :unsupported (gdocs--capability-merge
+                        (gdocs-dm-unsupported doc)
+                        (nreverse reports)))))
+
+(defun gdocs--capability-object-equal-p (a b)
+  "Return non-nil when local and remote inline objects are unchanged."
+  (let ((same (lambda (key)
+                (let ((left (plist-get a key))
+                      (right (plist-get b key)))
+                  (if (and (numberp left) (numberp right))
+                      (= left right)
+                    (equal left right))))))
+    (and (funcall same :entity-id)
+         (funcall same :object-kind)
+         (funcall same :content-id)
+         (funcall same :width)
+         (funcall same :height))))
+
+(defun gdocs--capability-object-matches-p (object remote-objects)
+  "Return non-nil when OBJECT exactly matches a fresh remote object."
+  (cl-some (lambda (remote)
+             (gdocs--capability-object-equal-p object remote))
+           remote-objects))
+
+(defun gdocs--capability-report-range (report)
+  "Return REPORT's inclusive OT range, or nil when no range is known."
+  (let ((start (plist-get report :ot-start))
+        (end (plist-get report :ot-end)))
+    (and (integerp start) (integerp end) (>= start 1) (>= end start)
+         (cons start end))))
+
+(defun gdocs--capability-range-touched-p (report ranges)
+  "Return non-nil when an edit in RANGES touches REPORT.
+
+Each range is a plist with `:ot-start' and `:ot-end' inclusive for deleted
+content, `:delete-count', and optional `:insert-at'. Insertions at a
+boundary do not touch an existing capability; deletions do."
+  (let ((cap-range (gdocs--capability-report-range report)))
+    (and cap-range
+         (cl-some
+          (lambda (range)
+            (let ((start (plist-get range :ot-start))
+                  (end (plist-get range :ot-end)))
+              (and (> (or (plist-get range :delete-count) 0) 0)
+                   (integerp start) (integerp end)
+                   (<= (car cap-range) end)
+                   (<= start (cdr cap-range)))))
+          ranges))))
+
+(defun gdocs--inline-markers-as-ot-placeholders (text)
+  "Replace local/Org inline-object markers with their OT `*' placeholder.
+
+The rendered Org view carries a descriptive line or embedded export token,
+while Google indexes one literal asterisk. This normalization is used only
+for diff anchoring; the original local body is never rewritten."
+  (let ((text (replace-regexp-in-string
+               "\\(^\\|\\n\\)#\\+gdocs_inline_object:[^\n]*"
+               "\\1*" (or text ""))))
+    (replace-regexp-in-string
+     "@@gdocs-inline-object:[^@\n]*@@" "*" text)))
+
+(defun gdocs--push-capability-summary-error (reports reason)
+  "Signal a sanitized user-error for REPORTS and REASON."
+  (let* ((summary (gdocs--capability-summary reports))
+         (format-string
+          (pcase reason
+            (:local
+             "gdocs: Push refused: refusing push because the local body contains %s; image creation/replacement is not supported")
+            (:full-replace
+             "gdocs: Push refused: refusing push because full-document replacement would discard %s; pull remains available and unsupported content cannot be edited safely")
+            (:intersects
+             "gdocs: Push refused: refusing push because the edit intersects %s; the current OT encoder cannot preserve it")
+            (_
+             "gdocs: Push refused: refusing push because preservation cannot be proven for %s; pull remains available"))))
+    (user-error (format format-string summary))))
+
+(defun gdocs--push-preflight (state local-body plan)
+  "Validate PLAN against a fresh remote capability report.
+
+PLAN is a plist with `:kind' of `:full-replace', `:incremental', or `:noop'
+and, for incremental edits, a `:ranges' list. A full replacement is never
+allowed in the presence of destructive unsupported content. An incremental
+edit is allowed only when every report has a known range, explicitly allows
+untouched preservation, and no deletion range intersects it. The caller must
+pass STATE obtained from the current /edit fetch; raw `:ot-ops' are decoded
+again here so stale buffer-local capability metadata cannot bypass policy."
+  (let* ((remote (gdocs--remote-capability-analysis state))
+         (local (gdocs--local-capability-analysis local-body))
+         (remote-objects (plist-get remote :objects))
+         (local-objects (plist-get local :objects))
+         (local-reports (plist-get local :unsupported))
+         (unmatched-local
+          (cl-remove-if
+           (lambda (report)
+             (and (eq (plist-get report :source) :local-object)
+                  (let ((object
+                         (seq-find
+                          (lambda (candidate)
+                            (equal (plist-get candidate :entity-id)
+                                   (plist-get report :entity-id)))
+                          local-objects)))
+                    (and object
+                         (gdocs--capability-object-matches-p
+                          object remote-objects)))))
+           local-reports))
+         (reports (gdocs--capability-merge
+                   (plist-get remote :unsupported)
+                   unmatched-local))
+         (kind (plist-get plan :kind)))
+    (when unmatched-local
+      (when (seq-some (lambda (report)
+                        (eq (plist-get report :source) :local-object))
+                      unmatched-local)
+        (gdocs--push-capability-summary-error unmatched-local :local)))
+    (unless (eq kind :noop)
+      (cond
+       ((eq kind :full-replace)
+        (let ((destructive
+               (cl-remove-if-not
+                (lambda (report)
+                  (eq (plist-get report :severity) :destructive))
+                reports)))
+          (when destructive
+            (gdocs--push-capability-summary-error
+             destructive :full-replace))))
+       ((eq kind :incremental)
+        (let* ((ranges (plist-get plan :ranges))
+               (hard (cl-remove-if-not
+                      (lambda (report)
+                        (or (plist-get report :refuse-push)
+                            (not (plist-get report :preserve-untouched))))
+                      reports))
+               (unranged (cl-remove-if
+                          #'gdocs--capability-report-range reports))
+               (intersecting
+                (cl-remove-if-not
+                 (lambda (report)
+                   (gdocs--capability-range-touched-p report ranges))
+                 reports)))
+          (cond
+           (hard (gdocs--push-capability-summary-error hard :proof))
+           ((or (null ranges) unranged)
+            (gdocs--push-capability-summary-error
+             (or unranged reports) :proof))
+           (intersecting
+            (gdocs--push-capability-summary-error intersecting :intersects)))))
+       (t
+        (when reports
+          (gdocs--push-capability-summary-error reports :proof)))))
+    t))
+
+(defun gdocs--push-preflight-insertion (state ot-position text)
+  "Preflight an insertion against a freshly refetched STATE."
+  (when (length> text 0)
+    (let ((plan (list :kind :incremental)))
+      (setq plan
+            (plist-put
+             plan :ranges
+             (list (list :ot-start ot-position
+                         :ot-end ot-position
+                         :insert-at ot-position
+                         :delete-count 0))))
+      (gdocs--push-preflight state text plan))))
+
+(defun gdocs--push-plan-ranges (state remote-body local-body)
+  "Return OT touch ranges for a conservative incremental push plan."
+  (let* ((ot-body (plist-get state :ot-body))
+         (local-stripped
+          (gdocs--inline-markers-as-ot-placeholders
+           (car (gdocs--strip-heading-drawers local-body))))
+         (remote-mappable
+          (gdocs--inline-markers-as-ot-placeholders remote-body))
+         (prepended (gdocs--diff-prepend remote-mappable local-stripped))
+         (appended (gdocs--diff-append remote-mappable local-stripped)))
+    (cond
+     (prepended
+      (list (list :ot-start 1 :ot-end 1 :insert-at 1 :delete-count 0)))
+     ((and appended ot-body)
+      (let ((at (1+ (gdocs--ot-body-length ot-body))))
+        (list (list :ot-start at :ot-end at :insert-at at :delete-count 0))))
+     (ot-body
+      (let* ((paragraph-regions (gdocs--diff-paragraphs
+                                 remote-mappable local-stripped))
+             (regions (cond
+                       ((zerop (length paragraph-regions))
+                        (let ((single (gdocs--diff-single-region
+                                       remote-mappable local-stripped)))
+                          (and single (list single))))
+                       ((= (length paragraph-regions) 1)
+                        (let ((single (gdocs--diff-single-region
+                                       remote-mappable local-stripped)))
+                          (and single (list single))))
+                       (t paragraph-regions))))
+        (and regions
+             (mapcar
+              (lambda (region)
+                (let ((ot-range
+                       (gdocs--locate-edit-in-ot
+                        ot-body remote-mappable
+                        (plist-get region :start)
+                        (plist-get region :rem-end))))
+                  (when ot-range
+                    (list :ot-start (car ot-range)
+                          :ot-end (if (> (length (plist-get region :deleted)) 0)
+                                      (1- (cdr ot-range))
+                                    (car ot-range))
+                          :insert-at (car ot-range)
+                          :delete-count (length (plist-get region :deleted))))))
+              regions))))
+     (t nil))))
+
+(defun gdocs--incremental-needs-full-replace-p (state local-body)
+  "Return non-nil when the incremental backend must replace the document."
+  (let* ((ot-ops (plist-get state :ot-ops))
+         (old-doc (and ot-ops
+                       (gdocs-dm-from-ops
+                        (plist-get state :revision)
+                        nil (plist-get state :title)
+                        (or (plist-get state :ot-body) "") ot-ops)))
+         (new-doc (gdocs-dm-from-org local-body)))
+    (if (null old-doc)
+        t
+      (let* ((old-paras (gdocs--normalize-paragraphs-for-ot
+                         (gdocs-dm-paragraphs old-doc)))
+             (new-paras (gdocs--normalize-paragraphs-for-ot
+                         (gdocs-dm-paragraphs new-doc)))
+             (pre (gdocs--paragraphs-common-prefix old-paras new-paras))
+             (suf (gdocs--paragraphs-common-suffix
+                   (nthcdr pre old-paras) (nthcdr pre new-paras)))
+             (old-mid (cl-subseq old-paras pre
+                                 (- (length old-paras) suf)))
+             (new-mid (cl-subseq new-paras pre
+                                 (- (length new-paras) suf))))
+        (cl-some (lambda (para)
+                   (or (memq (plist-get para :kind) '(:list :table :inline-object))
+                       (cl-some (lambda (run)
+                                  (plist-get run :inline-object))
+                                (plist-get para :runs))))
+                 (append old-mid new-mid))))))
+
+(defun gdocs--push-plan-for-diff (state local-body remote-body)
+  "Return the preflight plan for the configured push backend."
+  (let* ((local-stripped
+          (gdocs--inline-markers-as-ot-placeholders
+           (car (gdocs--strip-heading-drawers local-body))))
+         (remote-mappable
+          (gdocs--inline-markers-as-ot-placeholders remote-body))
+         (kind
+          (cond
+           ((string= remote-mappable local-stripped) :noop)
+           ((eq gdocs-push-backend 'ot-encode) :full-replace)
+           ((and (eq gdocs-push-backend 'ot-incremental)
+                 (gdocs--incremental-needs-full-replace-p state local-body))
+            :full-replace)
+           (t :incremental))))
+    (list :kind kind
+          :ranges (and (eq kind :incremental)
+                       (gdocs--push-plan-ranges state remote-body local-body)))))
 
 (defun gdocs--assert-push-safe (state &optional local-body)
-  "Refuse a push that could lose a remote or local inline object.
-
-There is intentionally no exception for unrelated text edits: the current
-push backends can only emit text/style/list/table operations and cannot
-preserve an image through a full replacement or every incremental edit."
-  (let* ((analysis (gdocs--remote-inline-object-analysis state))
-         (objects (plist-get analysis :objects))
-         (unsupported (plist-get analysis :unsupported))
-         (local (or local-body "")))
-    (when unsupported
-      (user-error
-       "gdocs: refusing push: inline-object mapping is unsupported (%s); pull remains available but image edits are not supported"
-       (car unsupported)))
-    (when objects
-      (user-error
-       "gdocs: refusing push: remote document contains %d inline image%s; pull remains available but image deletion, movement, replacement, and upload are not supported"
-       (length objects)
-       (if (= (length objects) 1) "" "s")))
-    (when (or (string-match-p (regexp-quote "#+gdocs_inline_object:") local)
-              (string-match-p (regexp-quote "#+gdocs_unsupported:") local)
-              (string-match-p (regexp-quote "@@gdocs-inline-object:") local))
-      (user-error
-       "gdocs: refusing push: local body contains a remote inline-object placeholder; image creation/replacement is not supported"))
-    t))
+  "Compatibility guard for callers that require full-replacement safety.
+All policy is delegated to `gdocs--push-preflight'."
+  (gdocs--push-preflight
+   state (or local-body "") '(:kind :full-replace)))
 
 (defun gdocs--find-local-subtree-start (start)
   "Return the buffer position where a `:GDOC_LOCAL: t'-marked top-level
@@ -4319,17 +5192,28 @@ Runs ds (if any) → refetch state for verify → is (if any). CALLBACK is
              (do-is (lambda (state-for-is callback2)
                       (if (zerop (length inserted))
                           (funcall callback2 nil nil)
-                        (gdocs--run-op-async
-                         doc-id state-for-is
-                         `((ty . "is") (ibi . ,ot-start) (s . ,inserted))
-                         (lambda (rev err)
-                           (when (and rev (buffer-live-p buffer))
-                             (with-current-buffer buffer
-                               (gdocs--shift-buffer-anchors
-                                'is ot-start (length inserted))
-                               (gdocs--put-top-property
-                                "GDOC_REVISION" (number-to-string rev))))
-                           (funcall callback2 rev err)))))))
+                        (condition-case sig
+                            (progn
+                              ;; The delete path refetches STATE before this
+                              ;; insertion. Reapply capability policy to
+                              ;; that current state rather than trusting the
+                              ;; initial push snapshot.
+                              (gdocs--push-preflight-insertion
+                               state-for-is ot-start inserted)
+                              (gdocs--run-op-async
+                               doc-id state-for-is
+                               `((ty . "is") (ibi . ,ot-start) (s . ,inserted))
+                               (lambda (rev err)
+                                 (when (and rev (buffer-live-p buffer))
+                                   (with-current-buffer buffer
+                                     (gdocs--shift-buffer-anchors
+                                      'is ot-start (length inserted))
+                                     (gdocs--put-top-property
+                                      "GDOC_REVISION" (number-to-string rev))))
+                                 (funcall callback2 rev err))))
+                          (error
+                           (funcall callback2 nil
+                                    (error-message-string sig))))))))
         (cond
          ((length> deleted 0)
           (gdocs--run-op-async
@@ -4395,108 +5279,120 @@ CALLBACK = `(funcall CB FINAL-REV ERR)'."
     (doc-id state local-body remote-body buffer callback)
   "Async sibling of `gdocs--apply-push'.
 CALLBACK = `(funcall CB NEW-REV ERR)'. BUFFER is where property writes go."
-  (gdocs--assert-push-safe state local-body)
-  (let* ((ot-body (plist-get state :ot-body))
-         (ot-len (gdocs--ot-body-length ot-body))
-         (local-stripped (car (gdocs--strip-heading-drawers local-body)))
-         (prepended (gdocs--diff-prepend remote-body local-stripped))
-         (appended (gdocs--diff-append remote-body local-stripped))
-         (finalize
-          (lambda (rev err extra)
-            (when (and rev (buffer-live-p buffer))
-              (with-current-buffer buffer
-                (gdocs--finalize-push-props rev local-body)))
-            (when (and rev (not err))
-              (gdocs-log 'info "Pushed %s (rev %s)%s" doc-id rev (or extra "")))
-            (funcall callback rev err))))
-    (cond
-     ;; OT-encode backend: rebuild the doc-model from the buffer and ship
-     ;; a single multi-op /save bundle (ds + is + styles + entities). The
-     ;; plain-text diff branches below are bypassed since this is a full
-     ;; replacement, not a diff.
-     ((memq gdocs-push-backend '(ot-encode ot-incremental))
-      (let* ((new-doc (gdocs-dm-from-org local-body))
-             (backend gdocs-push-backend)
-             (cmds
-              (cond
-               ((eq backend 'ot-incremental)
-                (let* ((ot-ops (plist-get state :ot-ops))
-                       (rev (plist-get state :revision))
-                       (title (plist-get state :title))
-                       (old-doc (and ot-ops
-                                     (gdocs-dm-from-ops
-                                      rev doc-id title (or ot-body "") ot-ops))))
-                  (if old-doc
-                      (gdocs-dm-to-incremental-save-commands old-doc new-doc)
-                    ;; No live ops parsed — fall back to full-replace.
-                    (gdocs-dm-to-save-commands ot-len new-doc))))
-               (t (gdocs-dm-to-save-commands ot-len new-doc))))
-             (label (cond ((null cmds) nil)
-                          ((eq backend 'ot-incremental) "ot-incremental")
-                          (t "ot-encode"))))
-        (cond
-         ((null cmds)
-          (gdocs-log 'info "Pushed %s: no-op (docs equal)" doc-id)
-          (funcall callback nil nil))
-         (t
-          (gdocs--save-request-async
-           doc-id state cmds
-           (lambda (parsed err)
-             (cond
-              (err (funcall callback nil (format "%s push failed: %S" label err)))
-              (t
-               (let* ((meta (cdr (assq 'metadata parsed)))
-                      (server-rev (cdr (assq 'serverRevision meta)))
-                      (ranges (cdr (assq 'revisionRanges parsed)))
-                      (range-rev (and ranges
-                                      (let ((last (car (last ranges))))
-                                        (and last (car (last last))))))
-                      (new-rev (cond
-                                ((and server-rev range-rev)
-                                 (max server-rev range-rev))
-                                (t (or range-rev server-rev)))))
-                 (if new-rev
-                     (funcall finalize new-rev nil
-                              (format ", %s (%d ops)" label (length cmds)))
-                   (funcall callback nil
-                            (format "%s push: no rev in response" label))))))))))))
-     (prepended
-      (gdocs--run-op-async
-       doc-id state
-       `((ty . "is") (ibi . 1) (s . ,prepended))
-       (lambda (rev err)
-         (when (and rev (buffer-live-p buffer))
-           (with-current-buffer buffer
-             (gdocs--shift-buffer-anchors 'is 1 (length prepended))))
-         (funcall finalize rev err
-                  (format ", +%d prepended chars" (length prepended))))))
-     ((and appended ot-body)
-      (gdocs--run-op-async
-       doc-id state
-       `((ty . "is") (ibi . ,(1+ ot-len)) (s . ,appended))
-       (lambda (rev err)
-         (funcall finalize rev err
-                  (format ", +%d appended chars" (length appended))))))
-     (ot-body
-      (let* ((para-regions (gdocs--diff-paragraphs remote-body local-stripped))
-             (n-regions (length para-regions)))
-        (cond
-         ((or (zerop n-regions) (= n-regions 1))
-          (let ((single (gdocs--diff-single-region
-                         remote-body local-stripped)))
-            (if single
-                (gdocs--apply-in-place-region-async
-                 doc-id state remote-body single buffer
-                 (lambda (rev err) (funcall finalize rev err nil)))
-              (funcall callback nil nil))))
-         (t
-          (gdocs--apply-multi-regions-async
-           doc-id state remote-body
-           (nreverse (copy-sequence para-regions)) buffer
-           (lambda (rev err) (funcall finalize rev err nil)))))))
-     (t
-      (funcall callback nil
-               "edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)")))))
+  (let* ((raw-plan (gdocs--push-plan-for-diff state local-body remote-body))
+         ;; Direct callers of this low-level apply helper historically
+         ;; required an image guard even for a synthetic no-op. Keep that
+         ;; conservative contract; the public driver does not call this for
+         ;; a no-op.
+         (plan (if (eq (plist-get raw-plan :kind) :noop)
+                   (list :kind :full-replace)
+                 raw-plan)))
+    (gdocs--push-preflight state local-body plan)
+    (let* ((ot-body (plist-get state :ot-body))
+           (ot-len (gdocs--ot-body-length ot-body))
+           (local-stripped
+            (gdocs--inline-markers-as-ot-placeholders
+             (car (gdocs--strip-heading-drawers local-body))))
+           (remote-mappable
+            (gdocs--inline-markers-as-ot-placeholders remote-body))
+           (prepended (gdocs--diff-prepend remote-mappable local-stripped))
+           (appended (gdocs--diff-append remote-mappable local-stripped))
+           (finalize
+            (lambda (rev err extra)
+              (when (and rev (buffer-live-p buffer))
+                (with-current-buffer buffer
+                  (gdocs--finalize-push-props rev local-body)))
+              (when (and rev (not err))
+                (gdocs-log 'info "Pushed %s (rev %s)%s" doc-id rev (or extra "")))
+              (funcall callback rev err))))
+      (cond
+       ;; OT-encode backend: rebuild the doc-model from the buffer and ship
+       ;; a single multi-op /save bundle (ds + is + styles + entities). The
+       ;; plain-text diff branches below are bypassed since this is a full
+       ;; replacement, not a diff.
+       ((memq gdocs-push-backend '(ot-encode ot-incremental))
+        (let* ((new-doc (gdocs-dm-from-org local-body))
+               (backend gdocs-push-backend)
+               (cmds
+                (cond
+                 ((eq backend 'ot-incremental)
+                  (let* ((ot-ops (plist-get state :ot-ops))
+                         (rev (plist-get state :revision))
+                         (title (plist-get state :title))
+                         (old-doc (and ot-ops
+                                       (gdocs-dm-from-ops
+                                        rev doc-id title (or ot-body "") ot-ops))))
+                    (if old-doc
+                        (gdocs-dm-to-incremental-save-commands old-doc new-doc)
+                      ;; No live ops parsed — fall back to full-replace.
+                      (gdocs-dm-to-save-commands ot-len new-doc))))
+                 (t (gdocs-dm-to-save-commands ot-len new-doc))))
+               (label (cond ((null cmds) nil)
+                            ((eq backend 'ot-incremental) "ot-incremental")
+                            (t "ot-encode"))))
+          (cond
+           ((null cmds)
+            (gdocs-log 'info "Pushed %s: no-op (docs equal)" doc-id)
+            (funcall callback nil nil))
+           (t
+            (gdocs--save-request-async
+             doc-id state cmds
+             (lambda (parsed err)
+               (cond
+                (err (funcall callback nil (format "%s push failed: %S" label err)))
+                (t
+                 (let* ((meta (cdr (assq 'metadata parsed)))
+                        (server-rev (cdr (assq 'serverRevision meta)))
+                        (ranges (cdr (assq 'revisionRanges parsed)))
+                        (range-rev (and ranges
+                                        (let ((last (car (last ranges))))
+                                          (and last (car (last last))))))
+                        (new-rev (cond
+                                  ((and server-rev range-rev)
+                                   (max server-rev range-rev))
+                                  (t (or range-rev server-rev)))))
+                   (if new-rev
+                       (funcall finalize new-rev nil
+                                (format ", %s (%d ops)" label (length cmds)))
+                     (funcall callback nil
+                              (format "%s push: no rev in response" label))))))))))))
+       (prepended
+        (gdocs--run-op-async
+         doc-id state
+         `((ty . "is") (ibi . 1) (s . ,prepended))
+         (lambda (rev err)
+           (when (and rev (buffer-live-p buffer))
+             (with-current-buffer buffer
+               (gdocs--shift-buffer-anchors 'is 1 (length prepended))))
+           (funcall finalize rev err
+                    (format ", +%d prepended chars" (length prepended))))))
+       ((and appended ot-body)
+        (gdocs--run-op-async
+         doc-id state
+         `((ty . "is") (ibi . ,(1+ ot-len)) (s . ,appended))
+         (lambda (rev err)
+           (funcall finalize rev err
+                    (format ", +%d appended chars" (length appended))))))
+       (ot-body
+        (let* ((para-regions (gdocs--diff-paragraphs remote-mappable local-stripped))
+               (n-regions (length para-regions)))
+          (cond
+           ((or (zerop n-regions) (= n-regions 1))
+            (let ((single (gdocs--diff-single-region
+                           remote-mappable local-stripped)))
+              (if single
+                  (gdocs--apply-in-place-region-async
+                   doc-id state remote-mappable single buffer
+                   (lambda (rev err) (funcall finalize rev err nil)))
+                (funcall callback nil nil))))
+           (t
+            (gdocs--apply-multi-regions-async
+             doc-id state remote-mappable
+             (nreverse (copy-sequence para-regions)) buffer
+             (lambda (rev err) (funcall finalize rev err nil)))))))
+       (t
+        (funcall callback nil
+                 "edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)"))))))
 
 (defun gdocs--diff-prepend (remote local)
   "If LOCAL = NEW + REMOTE for some NEW, return NEW; else nil.
@@ -5067,6 +5963,7 @@ and OT body — the caller is responsible for refetching between regions."
         (user-error "gdocs: state refetch after delete saw rev %S, expected %S"
                     (and state (plist-get state :revision)) rev)))
     (when (length> inserted 0)
+      (gdocs--push-preflight-insertion state ot-start inserted)
       (setq rev (gdocs--run-op
                  doc-id state
                  `((ty . "is") (ibi . ,ot-start) (s . ,inserted))))
@@ -5092,71 +5989,79 @@ Strategies, in order:
 Each in-place op is a single-op POST (multi-op bundles trigger Google's
 abuse heuristic — see Push protocol). The final new revision and content
 hash are written back to buffer metadata."
-  (gdocs--assert-push-safe state local-body)
-  (let* ((ot-body (plist-get state :ot-body))
-         (ot-len (gdocs--ot-body-length ot-body))
-         (local-stripped (car (gdocs--strip-heading-drawers local-body)))
-         (prepended (gdocs--diff-prepend remote-body local-stripped))
-         (appended (gdocs--diff-append remote-body local-stripped))
-         (new-rev nil))
-    (cond
-     (prepended
-      (setq new-rev (gdocs--run-op
-                     doc-id state
-                     `((ty . "is") (ibi . 1) (s . ,prepended))))
-      (gdocs--shift-buffer-anchors 'is 1 (length prepended))
-      (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
-      (gdocs-log 'info "Pushed %s (rev %s, +%d prepended chars)"
-                 doc-id new-rev (length prepended)))
-     ((and appended ot-body)
-      (setq new-rev (gdocs--run-op
-                     doc-id state
-                     `((ty . "is") (ibi . ,(1+ ot-len)) (s . ,appended))))
-      (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
-      (gdocs-log 'info "Pushed %s (rev %s, +%d appended chars)"
-                 doc-id new-rev (length appended)))
-     (ot-body
-      (let* ((para-regions (gdocs--diff-paragraphs remote-body local-stripped))
-             (n-regions (length para-regions)))
-        (cond
-         ((zerop n-regions)
-          ;; Paragraph-level diff finds nothing but prepend/append didn't
-          ;; match — extremely rare; fall through to single-region.
-          (let ((single (gdocs--diff-single-region remote-body local-stripped)))
-            (when single
+  (let* ((raw-plan (gdocs--push-plan-for-diff state local-body remote-body))
+         (plan (if (eq (plist-get raw-plan :kind) :noop)
+                   (list :kind :full-replace)
+                 raw-plan)))
+    (gdocs--push-preflight state local-body plan)
+    (let* ((ot-body (plist-get state :ot-body))
+           (ot-len (gdocs--ot-body-length ot-body))
+           (local-stripped
+            (gdocs--inline-markers-as-ot-placeholders
+             (car (gdocs--strip-heading-drawers local-body))))
+           (remote-mappable
+            (gdocs--inline-markers-as-ot-placeholders remote-body))
+           (prepended (gdocs--diff-prepend remote-mappable local-stripped))
+           (appended (gdocs--diff-append remote-mappable local-stripped))
+           (new-rev nil))
+      (cond
+       (prepended
+        (setq new-rev (gdocs--run-op
+                       doc-id state
+                       `((ty . "is") (ibi . 1) (s . ,prepended))))
+        (gdocs--shift-buffer-anchors 'is 1 (length prepended))
+        (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
+        (gdocs-log 'info "Pushed %s (rev %s, +%d prepended chars)"
+                   doc-id new-rev (length prepended)))
+       ((and appended ot-body)
+        (setq new-rev (gdocs--run-op
+                       doc-id state
+                       `((ty . "is") (ibi . ,(1+ ot-len)) (s . ,appended))))
+        (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
+        (gdocs-log 'info "Pushed %s (rev %s, +%d appended chars)"
+                   doc-id new-rev (length appended)))
+       (ot-body
+        (let* ((para-regions (gdocs--diff-paragraphs remote-mappable local-stripped))
+               (n-regions (length para-regions)))
+          (cond
+           ((zerop n-regions)
+            ;; Paragraph-level diff finds nothing but prepend/append didn't
+            ;; match — extremely rare; fall through to single-region.
+            (let ((single (gdocs--diff-single-region remote-mappable local-stripped)))
+              (when single
+                (setq new-rev (car (gdocs--apply-in-place-region
+                                    doc-id state remote-mappable single))))))
+           ((= n-regions 1)
+            ;; Single paragraph touched — prefer the contracted single-region
+            ;; diff so we ship only the changed substring, not the whole para.
+            (let ((single (gdocs--diff-single-region remote-mappable local-stripped)))
               (setq new-rev (car (gdocs--apply-in-place-region
-                                  doc-id state remote-body single))))))
-         ((= n-regions 1)
-          ;; Single paragraph touched — prefer the contracted single-region
-          ;; diff so we ship only the changed substring, not the whole para.
-          (let ((single (gdocs--diff-single-region remote-body local-stripped)))
-            (setq new-rev (car (gdocs--apply-in-place-region
-                                doc-id state remote-body single)))))
-         (t
-          ;; Disjoint regions — apply latest-first, refetching state.
-          ;; Sleep between regions so we don't burst the /save rate budget.
-          (let ((regions (nreverse (copy-sequence para-regions)))
-                (first t))
-            (dolist (region regions)
-              (unless first (sleep-for gdocs--inter-region-delay))
-              (setq first nil)
-              (setq state (gdocs--fetch-edit-state doc-id))
-              (let ((res (gdocs--apply-in-place-region
-                          doc-id state remote-body region)))
-                (setq new-rev (car res)))))))))
-     (t
-      (user-error
-       "gdocs: edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)")))
-    ;; new-rev may be nil if no branch produced an op (e.g. the diff
-    ;; collapses to a no-op after stripping). Don't write garbage to the
-    ;; rev property in that case.
-    (when new-rev
-      (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
-      (gdocs--put-top-property "GDOC_CONTENT_HASH"
-                               (secure-hash 'sha256 local-body))
-      (gdocs--put-top-property "GDOC_SYNCED_AT" (gdocs--now-iso))
-      (gdocs--mark-synced))
-    new-rev))
+                                  doc-id state remote-mappable single)))))
+           (t
+            ;; Disjoint regions — apply latest-first, refetching state.
+            ;; Sleep between regions so we don't burst the /save rate budget.
+            (let ((regions (nreverse (copy-sequence para-regions)))
+                  (first t))
+              (dolist (region regions)
+                (unless first (sleep-for gdocs--inter-region-delay))
+                (setq first nil)
+                (setq state (gdocs--fetch-edit-state doc-id))
+                (let ((res (gdocs--apply-in-place-region
+                            doc-id state remote-mappable region)))
+                  (setq new-rev (car res)))))))))
+       (t
+        (user-error
+         "gdocs: edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)")))
+      ;; new-rev may be nil if no branch produced an op (e.g. the diff
+      ;; collapses to a no-op after stripping). Don't write garbage to the
+      ;; rev property in that case.
+      (when new-rev
+        (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
+        (gdocs--put-top-property "GDOC_CONTENT_HASH"
+                                 (secure-hash 'sha256 local-body))
+        (gdocs--put-top-property "GDOC_SYNCED_AT" (gdocs--now-iso))
+        (gdocs--mark-synced))
+      new-rev)))
 
 (defun gdocs-push-remotely (&optional doc-id)
   "Push buffer to remote via the cookie-authenticated /save endpoint.
@@ -5214,10 +6119,14 @@ completion or error."
                             remote-rev local-rev)))
           (t
            (condition-case sig
-               (let ((remote-body
-                      (progn
-                        (gdocs--assert-push-safe state local-body)
-                        (gdocs--ot-remote-org-body doc-id html state))))
+               (let* ((remote-body
+                       (gdocs--ot-remote-org-body doc-id html state))
+                      (plan (gdocs--push-plan-for-diff
+                             state local-body remote-body)))
+                 ;; STATE and HTML came from the current /edit fetch above;
+                 ;; preflight decodes their raw ops again rather than trusting
+                 ;; any capability summary serialized in the buffer.
+                 (gdocs--push-preflight state local-body plan)
                  (cond
                   ((string= (car (gdocs--strip-heading-drawers local-body))
                             remote-body)
@@ -5249,6 +6158,11 @@ single-region diff, and the locate result (if any). Default OUT-FILE is
          (local-stripped (car (gdocs--strip-heading-drawers local-body)))
          (plain (and ot-body (gdocs--ot-plain-text ot-body)))
          (stripped-remote (car (gdocs--strip-org-markup remote-body)))
+         (capability-analysis (gdocs--remote-capability-analysis state))
+         (capability-reports (plist-get capability-analysis :unsupported))
+         (capability-summary (gdocs--capability-summary capability-reports))
+         (capability-details
+          (gdocs--capability-sanitized-details capability-reports))
          (single (gdocs--diff-single-region remote-body local-stripped))
          (paras (gdocs--diff-paragraphs remote-body local-stripped))
          (locate (and single
@@ -5270,6 +6184,12 @@ single-region diff, and the locate result (if any). Default OUT-FILE is
       (insert (format "diff-single-region: %S\n" single))
       (insert (format "diff-paragraphs count: %d\n" (length paras)))
       (insert (format "locate result: %S\n" locate))
+      (insert (format "unsupported capability summary: %s\n"
+                      (if (length> capability-summary 0)
+                          capability-summary
+                        "none")))
+      (insert (format "unsupported capability details (sanitized): %S\n"
+                      capability-details))
       (insert "\n=== local-body ===\n")
       (insert local-body)
       (insert "\n=== remote-body ===\n")
