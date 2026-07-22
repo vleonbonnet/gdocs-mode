@@ -2532,21 +2532,63 @@ trailing newline that org-element keeps at the end of each paragraph."
                        (string-empty-p (or (plist-get r :text) ""))))
                 runs)))
 
+(defun gdocs--org-inline-content-runs (text)
+  "Parse TEXT as inline Org content and return its doc-model runs.
+
+TEXT is placed in a temporary paragraph before being parsed, so keyword
+prefixes are never included in the returned runs.  A zero-width prefix keeps
+TEXT that happens to start with Org block syntax (for example `* heading') in
+that paragraph.  If Org cannot produce a paragraph, or parsing fails, return
+TEXT as one unstyled run instead of silently dropping visible content."
+  (when (and (stringp text) (not (string-empty-p text)))
+    (let ((fallback
+           (list (gdocs-dm-make-run (substring-no-properties text))))
+          ;; An ordinary character before an emphasis marker would prevent
+          ;; Org from recognizing it.  U+200B is accepted as a boundary by
+          ;; the emphasis parser and is removed from the first parsed run.
+          (sentinel (string #x200b)))
+      (condition-case nil
+          (with-temp-buffer
+            (let ((org-inhibit-startup t))
+              (insert sentinel text "\n"))
+            (org-mode)
+            (let* ((tree (org-element-parse-buffer))
+                   (section
+                    (seq-find
+                     (lambda (element)
+                       (and (consp element) (eq (car element) 'section)))
+                     (cddr tree)))
+                   (paragraph
+                    (and section
+                         (seq-find
+                          (lambda (element)
+                            (and (consp element)
+                                 (eq (car element) 'paragraph)))
+                          (cddr section))))
+                   (runs (and paragraph
+                              (gdocs--paragraph-content-runs paragraph)))
+                   (first (car runs))
+                   (first-text (and first (plist-get first :text))))
+              (if (and (stringp first-text)
+                       (string-prefix-p sentinel first-text))
+                  (let ((trimmed (copy-sequence first)))
+                    (plist-put trimmed :text
+                               (substring-no-properties
+                                first-text (length sentinel)))
+                    (setq runs (cons trimmed (cdr runs)))
+                    (or (seq-remove
+                         (lambda (run)
+                           (and (not (plist-get run :inline-object))
+                                (string-empty-p
+                                 (or (plist-get run :text) ""))))
+                         runs)
+                        fallback))
+                fallback)))
+        (error fallback)))))
+
 (defun gdocs--org-headline-runs (hl)
-  "Return runs for a headline element HL by parsing its :raw-value
-\(simpler than walking the title's parsed structure since org-element
-sometimes lifts inline children up into the headline)."
-  (let ((raw (plist-get (cadr hl) :raw-value)))
-    (when (and raw (not (string-empty-p raw)))
-      (with-temp-buffer
-        (let ((org-inhibit-startup t)) (insert raw "\n"))
-        (org-mode)
-        (let* ((tree (org-element-parse-buffer))
-               (par (seq-find (lambda (e)
-                                (and (consp e) (eq (car e) 'paragraph)))
-                              (cddr tree))))
-          (if par (gdocs--paragraph-content-runs par)
-            (list (gdocs-dm-make-run raw nil nil))))))))
+  "Return runs for a headline element HL by parsing its :raw-value."
+  (gdocs--org-inline-content-runs (plist-get (cadr hl) :raw-value)))
 
 (defun gdocs--org-item-runs (item)
   "Return runs for a plain-list item ITEM."
@@ -2804,8 +2846,7 @@ caller can distinguish meaningful blank lines from heading padding."
        (cond
         ((member key '("title" "subtitle"))
          (let ((para (list :kind (if (equal key "title") :title :subtitle)
-                           :runs (when (and val (not (string-empty-p val)))
-                                   (list (gdocs-dm-make-run val))))))
+                           :runs (gdocs--org-inline-content-runs val))))
            (list (if source-spans
                      (gdocs--org-annotate-paragraph
                       para (gdocs--org-element-line-number el)

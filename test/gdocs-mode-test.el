@@ -827,6 +827,63 @@ END is the inclusive final OT position."
     (should (member :code kinds))
     (should (member :table kinds))))
 
+(ert-deftest gdocs-test-org-title-and-subtitle-parse-rich-inline-runs ()
+  "Title keywords parse the same inline styles as ordinary paragraphs."
+  (let* ((org-text
+          (concat "#+title: Plain *bold* [[https://title.example][*linked*]]\n"
+                  "#+subtitle: Mixed /italic/ _under_ +strike+ =verbatim= ~code~\n"))
+         (doc (gdocs-dm-from-org org-text))
+         (paragraphs (gdocs-dm-paragraphs doc))
+         (title (car paragraphs))
+         (subtitle (cadr paragraphs)))
+    (should (eq (plist-get title :kind) :title))
+    (should (equal (mapcar #'gdocs-test--run-view (plist-get title :runs))
+                   '(("Plain " nil nil)
+                     ("bold" (:bold) nil)
+                     (" " nil nil)
+                     ("linked" (:bold) "https://title.example"))))
+    (should (eq (plist-get subtitle :kind) :subtitle))
+    (dolist (entry '(("italic" :italic)
+                     ("under" :underline)
+                     ("strike" :strike)
+                     ("verbatim" :verbatim)
+                     ("code" :code)))
+      (let ((run (seq-find (lambda (candidate)
+                             (string= (plist-get candidate :text)
+                                      (car entry)))
+                           (plist-get subtitle :runs))))
+        (should run)
+        (should (memq (cadr entry) (plist-get run :styles)))))))
+
+(ert-deftest gdocs-test-rich-title-model-org-model-round-trip ()
+  "Rendering rich Title and Subtitle values is stable and reversible."
+  (let* ((source
+          (concat "#+title: [[https://title.example][*Linked title*]]\n"
+                  "\n#+subtitle: /An italic subtitle/ with ~code~\n"))
+         (original (gdocs-dm-from-org source))
+         (rendered (gdocs-dm-to-org original))
+         (round-tripped (gdocs-dm-from-org rendered))
+         (rendered-again (gdocs-dm-to-org round-tripped))
+         (ot-body (car (gdocs-dm-to-ot original))))
+    (should (equal (gdocs-test--model-view original)
+                   (gdocs-test--model-view round-tripped)))
+    (should (equal (gdocs-test--normalize-org rendered)
+                   (gdocs-test--normalize-org rendered-again)))
+    (should (equal ot-body "Linked title\nAn italic subtitle with code\n"))
+    (should (string-prefix-p
+             "#+title: [[https://title.example][*Linked title*]]"
+             rendered))))
+
+(ert-deftest gdocs-test-malformed-org-title-preserves-visible-text ()
+  "Malformed inline markup does not turn a Title paragraph into nothing."
+  (let* ((doc (gdocs-dm-from-org "#+title: *Unclosed title\n\nBody\n"))
+         (title (car (gdocs-dm-paragraphs doc))))
+    (should (equal (plist-get title :kind) :title))
+    (should (equal (gdocs-dm-runs-text (plist-get title :runs))
+                   "*Unclosed title"))
+    (should (string-match-p "^#\\+title: \\*Unclosed title$"
+                            (gdocs-dm-to-org doc)))))
+
 (ert-deftest gdocs-test-org-link-runs-and-rendered-labels ()
   "Labeled HTTP and mail links retain their URLs and visible labels."
   (let* ((fixture (gdocs-test--fixture "links"))
@@ -1283,6 +1340,24 @@ END is the inclusive final OT position."
       (should (= (gdocs-test--count-substring
                   pull-body (format "#+title: %s" body-title))
                  1)))))
+
+(ert-deftest gdocs-test-pipeline-drive-title-equals-styled-body-title-remains-distinct ()
+  "A styled body Title remains content even when it matches GDOC_TITLE."
+  (let* ((body "Same\n")
+         (ops (list (gdocs-test--insert-op body)
+                    (gdocs-test--text-range-op
+                     body '(:text "Same" :styles (:bold)))
+                    (gdocs-test--paragraph-op
+                     body '(:line 1 :kind :title))))
+         (state (list :revision 12 :title "Same" :ot-body body))
+         (result (gdocs--ot-decode-pipeline
+                  "synthetic-title-document"
+                  (gdocs-test--html-for-ops 12 ops)
+                  state))
+         (pull-body (cdr result)))
+    (should (string-match-p ":GDOC_TITLE: Same" pull-body))
+    (should (string-match-p "^#\\+title: \\*Same\\*$" pull-body))
+    (should-not (string-match-p "^#\\+title: Same$" pull-body))))
 
 (ert-deftest gdocs-test-pipeline-preserves-title-and-subtitle-body-styles ()
   "Title and Subtitle body paragraphs are both emitted without metadata duplicates."
