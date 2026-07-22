@@ -789,6 +789,102 @@ END is the inclusive final OT position."
       (should (seq-some (lambda (op) (equal (alist-get 'st op) "tbl"))
                         ops)))))
 
+(ert-deftest gdocs-test-org-table-cells-preserve-inline-runs ()
+  "Table cells retain link and style boundaries when parsed from Org."
+  (let* ((org-text
+          (concat
+           "|   Plain | [[https://linked.example][linked]] | "
+           "[[https://bold.example][*bold linked*]]   |\n"
+           "| [[https://a.example][one]] plain | "
+           "[[https://a.example][one]] and [[https://b.example][two]] | "
+           "~code~ =verbatim= |\n"
+           "| | [[https://empty.example][x]] | |\n"))
+         (doc (gdocs-dm-from-org org-text))
+         (rows (plist-get (car (gdocs-dm-paragraphs doc)) :rows)))
+    (should (equal
+             (mapcar (lambda (row) (mapcar #'gdocs-test--cell-view row)) rows)
+             '(((("Plain" nil nil))
+                (("linked" nil "https://linked.example"))
+                (("bold linked" (:bold) "https://bold.example")))
+               ((
+                 ("one" nil "https://a.example")
+                 (" plain" nil nil))
+                (
+                 ("one" nil "https://a.example")
+                 (" and " nil nil)
+                 ("two" nil "https://b.example"))
+                (
+                 ("code" (:code) nil)
+                 (" " nil nil)
+                 ("verbatim" (:verbatim) nil)))
+               (nil
+                (("x" nil "https://empty.example"))
+                nil))))))
+
+(ert-deftest gdocs-test-table-inline-runs-round-trip-through-org-and-ot ()
+  "Rich table cells survive both Org rendering and OT reconstruction."
+  (let* ((source
+          (concat
+           "| Plain | [[https://a.example][*linked*]] | =verbatim= |\n"
+           "| [[https://b.example][one]] plain | "
+           "[[https://c.example][two]] and [[https://d.example][three]] | "
+           "~code~ |\n"))
+         (original (gdocs-dm-from-org source))
+         (org (gdocs-dm-to-org original))
+         (org-round-trip (gdocs-dm-from-org org))
+         (built (gdocs-dm-to-ot original))
+         (ot-round-trip (gdocs-dm-from-ops nil nil nil
+                                           (car built) (cdr built))))
+    (should (equal (gdocs-test--model-view original)
+                   (gdocs-test--model-view org-round-trip)))
+    (should (equal
+             (gdocs-test--paragraph-view
+              (car (gdocs-dm-paragraphs original)))
+             (gdocs-test--paragraph-view
+              (car (gdocs-dm-paragraphs ot-round-trip)))))
+    (should (seq-some (lambda (op) (equal (alist-get 'st op) "text"))
+                      (cdr built)))
+    (should (seq-some (lambda (op) (equal (alist-get 'st op) "link"))
+                      (cdr built)))
+    (should (equal org (gdocs-dm-to-org org-round-trip)))))
+
+(ert-deftest gdocs-test-table-safe-literal-pipes-and-newlines ()
+  "Literal cell pipes and newlines use valid, reversible Org escapes."
+  (let* ((table
+          (list :kind :table
+                :rows (list
+                       (list
+                        (list (list (gdocs-dm-make-run "A | B")))
+                        (list (list (gdocs-dm-make-run "line one\nline two")))))))
+         (doc (gdocs-dm-make-doc :paragraphs (list table)))
+         (org (gdocs-dm-to-org doc))
+         (round-trip (gdocs-dm-from-org org)))
+    (should (string-match-p "\\\\vert{}" org))
+    (should (string-match-p "\\\\linebreak{}" org))
+    (should (equal (gdocs-test--model-view doc)
+                   (gdocs-test--model-view round-trip)))
+    (should (equal org (gdocs-dm-to-org round-trip)))))
+
+(ert-deftest gdocs-test-table-inline-object-is-safe-and-not-emitted ()
+  "An inline object in a cell remains marked and cannot be pushed as text."
+  (let* ((object '(:kind :inline-object
+                         :entity-id "kix.table-image"
+                         :object-kind :image
+                         :content-id "s-blob-v1-IMAGE-table"
+                         :width 10.0 :height 20.0))
+         (doc
+          (gdocs-dm-make-doc
+           :paragraphs
+           (list
+            (list :kind :table
+                  :rows (list
+                         (list (list (list :inline-object object))))))))
+         (org (gdocs-dm-to-org doc))
+         (round-trip (gdocs-dm-from-org org)))
+    (should (string-match-p "@@gdocs-inline-object:image kix.table-image" org))
+    (should (= (length (gdocs-dm-inline-objects round-trip)) 1))
+    (should-error (gdocs-dm-to-ot round-trip) :type 'user-error)))
+
 (ert-deftest gdocs-test-source-block-rendering ()
   "Contiguous code paragraphs render as one source block."
   (let* ((doc (gdocs-dm-make-doc

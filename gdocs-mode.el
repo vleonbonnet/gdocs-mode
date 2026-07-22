@@ -852,6 +852,8 @@ Identifiers, payloads, and raw operation shapes are intentionally omitted."
       (cl-some
        (lambda (paragraph)
          (or (eq (plist-get paragraph :kind) :inline-object)
+             (and (eq (plist-get paragraph :kind) :table)
+                  (gdocs--doc-table-inline-objects paragraph))
              (cl-some (lambda (run) (plist-get run :inline-object))
                       (plist-get paragraph :runs))))
        (gdocs-dm-paragraphs doc))))
@@ -866,6 +868,31 @@ Identifiers, payloads, and raw operation shapes are intentionally omitted."
 (defun gdocs-dm-runs-text (runs)
   "Return the concatenated text of RUNS (ignoring styles)."
   (mapconcat (lambda (r) (or (plist-get r :text) "")) runs ""))
+
+(defun gdocs--table-cell-runs (cell)
+  "Return the flat run list represented by table CELL.
+
+The canonical model stores a cell as a one-element list containing its runs,
+but accepting a direct run list here keeps all table boundaries tolerant of
+the older intermediate shape as well."
+  (cond
+   ((null cell) nil)
+   ((and (consp cell)
+         (consp (car cell))
+         (or (plist-member (car cell) :text)
+             (plist-member (car cell) :inline-object)))
+    cell)
+   ((listp cell) (apply #'append cell))
+   (t nil)))
+
+(defun gdocs--doc-table-inline-objects (paragraph)
+  "Return inline objects nested in table CELLS of PARAGRAPH."
+  (cl-loop for row in (plist-get paragraph :rows)
+           append (cl-loop for cell in row
+                           append (cl-loop for run in
+                                           (gdocs--table-cell-runs cell)
+                                           when (plist-get run :inline-object)
+                                           collect (plist-get run :inline-object)))))
 
 (defun gdocs-dm-pp (doc &optional buffer-name)
   "Pretty-print DOC into BUFFER-NAME (default *gdocs-doc-model*) and return it."
@@ -2095,6 +2122,29 @@ adjacent runs that share a style are wrapped by a single emphasis pair rather
 than per-run pairs."
   (gdocs--render-runs-by-link runs))
 
+(defun gdocs--escape-org-table-cell-markup (text)
+  "Escape table delimiters in rendered cell TEXT.
+
+Org table rows are line-oriented, so a literal pipe or newline cannot be
+emitted verbatim inside a cell.  `\\vert{}' and `\\linebreak{}' are valid
+Org inline constructs; the table parser turns them back into their literal
+characters.  This is deliberately applied after inline rendering so pipes in
+link descriptions and style runs are protected without changing run
+boundaries."
+  (mapconcat
+   (lambda (char)
+     (cond
+      ((= char 124) (concat "\\vert{}" gdocs--org-link-description-sentinel))
+      ((or (= char 10) (= char 13))
+       (concat "\\linebreak{}" gdocs--org-link-description-sentinel))
+      (t (string char))))
+   (string-to-list (or text "")) ""))
+
+(defun gdocs--render-table-cell (cell)
+  "Render one table CELL while keeping its content in one Org row."
+  (gdocs--escape-org-table-cell-markup
+   (gdocs--render-runs (gdocs--table-cell-runs cell))))
+
 (defun gdocs--render-runs-styled (runs already-wrapped)
   "Inner driver for `gdocs--render-runs'.
 ALREADY-WRAPPED is the set of style keys an outer wrapper has already
@@ -2161,14 +2211,7 @@ sequence number within the current numbered list at this nest level
            (lambda (row)
              (concat "| "
                      (mapconcat
-                      (lambda (cell)
-                        (let* ((para-runs
-                                (if (and cell (consp (car cell))
-                                         (plist-member (car cell) :text))
-                                    cell      ; runs directly
-                                  (apply #'append cell))) ; list of run-lists
-                               (text (gdocs--render-runs para-runs)))
-                          (replace-regexp-in-string "[|\n]" " " text)))
+                      #'gdocs--render-table-cell
                       row " | ")
                      " |"))
            rows)))
@@ -2391,12 +2434,14 @@ The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT'."
               :width (gdocs--inline-object-dimension width-token)
               :height (gdocs--inline-object-dimension height-token))))))
 
-(defun gdocs--unescape-org-inline (text &optional link-description)
+(defun gdocs--unescape-org-inline
+    (text &optional link-description table-cell)
   "Remove the literal-text escapes emitted by `gdocs--escape-org-inline'.
 
 Only the characters that the renderer escapes are unescaped.  For link
-descriptions, the invisible separator used around subscript/LaTeX-sensitive
-characters is removed too.  Other backslashes remain ordinary user content,
+descriptions and table cells, the invisible separator used around
+subscript/LaTeX-sensitive characters is removed too.  Other backslashes
+remain ordinary user content,
 which avoids turning unrelated Org syntax (for example a LaTeX command) into
 a different document-model value."
   (let ((i 0)
@@ -2405,7 +2450,7 @@ a different document-model value."
     (while (< i n)
       (let ((char (aref text i)))
         (cond
-         ((and link-description
+         ((and (or link-description table-cell)
                (= char #x200b))
           (cl-incf i))
          ((and (= char ?\\)
@@ -2418,16 +2463,30 @@ a different document-model value."
           (cl-incf i)))))
     (apply #'string (nreverse out))))
 
-(defun gdocs--element-runs (el &optional inherited-styles inherited-link)
+(defun gdocs--unescape-org-table-markup (text)
+  "Decode table-safe inline escapes in a link destination TEXT."
+  (let* ((text (or text ""))
+         (text (replace-regexp-in-string
+                (regexp-quote gdocs--org-link-description-sentinel)
+                "" text t t))
+         (text (replace-regexp-in-string
+                (regexp-quote "\\vert{}") "|" text t t)))
+    (replace-regexp-in-string
+     (regexp-quote "\\linebreak{}") "\n" text t t)))
+
+(defun gdocs--element-runs
+    (el &optional inherited-styles inherited-link table-cell)
   "Walk inline ORG-ELEMENT EL and return a flat list of runs.
-INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers."
+INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers.
+TABLE-CELL enables the table-only escapes for embedded newlines."
   (cond
    ((stringp el)
     (if (string-empty-p el)
         nil
-      (list (gdocs-dm-make-run (gdocs--unescape-org-inline
-                                el (and inherited-link t))
-                               inherited-styles inherited-link))))
+      (list (gdocs-dm-make-run
+             (gdocs--unescape-org-inline
+              el (and inherited-link t) table-cell)
+             inherited-styles inherited-link))))
    ((null el) nil)
    ((consp el)
     (let* ((type (and (symbolp (car el)) (car el)))
@@ -2446,13 +2505,17 @@ INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers."
        ((eq type 'link)
         (let* ((path (plist-get props :path))
                (kind (plist-get props :type))
+               (path (if table-cell
+                         (gdocs--unescape-org-table-markup path)
+                       path))
                (url (if (member kind '("https" "http" "mailto" "ftp"))
                         (format "%s:%s" kind path)
                       path))
                (runs (if contents
                          (cl-mapcan
                           (lambda (c)
-                            (gdocs--element-runs c inherited-styles url))
+                            (gdocs--element-runs c inherited-styles url
+                                                 table-cell))
                           contents)
                        ;; Bare link with no description.
                        (list (gdocs-dm-make-run (or url path)
@@ -2469,9 +2532,37 @@ INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers."
             runs)))
        ((eq type 'plain-text)
         (when (stringp props)
-          (list (gdocs-dm-make-run (gdocs--unescape-org-inline
-                                    props (and inherited-link t))
-                                   inherited-styles inherited-link))))
+          (list (gdocs-dm-make-run
+                 (gdocs--unescape-org-inline
+                  props (and inherited-link t) table-cell)
+                 inherited-styles inherited-link))))
+       ((eq type 'entity)
+        (let* ((value (or (plist-get props :utf-8)
+                          (plist-get props :ascii)))
+               (runs (when (and table-cell (stringp value))
+                       (list (gdocs-dm-make-run
+                              value inherited-styles inherited-link))))
+               (post-blank (org-element-property :post-blank el)))
+          (if (and runs (integerp post-blank) (> post-blank 0))
+              (append runs
+                      (list (gdocs-dm-make-run
+                             (make-string post-blank ?\s)
+                             inherited-styles inherited-link)))
+            runs)))
+       ((eq type 'latex-fragment)
+        (let* ((value (plist-get props :value))
+               (runs (when (and table-cell (stringp value))
+                       (list (gdocs-dm-make-run
+                              (if (string= value "\\linebreak{}")
+                                  "\n" value)
+                              inherited-styles inherited-link))))
+               (post-blank (org-element-property :post-blank el)))
+          (if (and runs (integerp post-blank) (> post-blank 0))
+              (append runs
+                      (list (gdocs-dm-make-run
+                             (make-string post-blank ?\s)
+                             inherited-styles inherited-link)))
+            runs)))
        (style
         (let* ((styles (cons style inherited-styles))
                (runs
@@ -2479,10 +2570,15 @@ INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers."
                          (stringp (plist-get props :value)))
                     ;; Inline code/verbatim contents come as a single
                     ;; string in :value.
-                    (list (gdocs-dm-make-run (plist-get props :value)
-                                             styles inherited-link))
+                    (list (gdocs-dm-make-run
+                           (if table-cell
+                               (gdocs--unescape-org-table-markup
+                                (plist-get props :value))
+                             (plist-get props :value))
+                           styles inherited-link))
                   (cl-mapcan
-                   (lambda (c) (gdocs--element-runs c styles inherited-link))
+                   (lambda (c)
+                     (gdocs--element-runs c styles inherited-link table-cell))
                    contents)))
                ;; Org-element consumes the post-character whitespace
                ;; after the closing marker into the emphasis element
@@ -2498,7 +2594,8 @@ INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers."
             runs)))
        (t
         (cl-mapcan
-         (lambda (c) (gdocs--element-runs c inherited-styles inherited-link))
+         (lambda (c)
+           (gdocs--element-runs c inherited-styles inherited-link table-cell))
          contents)))))))
 
 (defun gdocs--paragraph-content-runs (par)
@@ -2617,6 +2714,74 @@ TEXT as one unstyled run instead of silently dropping visible content."
               0)))
     (/ indent 2)))
 
+(defun gdocs--coalesce-table-cell-runs (runs)
+  "Coalesce adjacent table RUNS with identical style and link metadata.
+
+Runs with different destinations or styles, and inline-object runs, are never
+coalesced.  This only removes AST boundaries introduced by table-safe Org
+entities and post-blank whitespace."
+  (let (out)
+    (dolist (run runs (nreverse out))
+      (let ((previous (car out)))
+        (if (and previous
+                 (not (plist-get previous :inline-object))
+                 (not (plist-get run :inline-object))
+                 (equal (plist-get previous :styles)
+                        (plist-get run :styles))
+                 (equal (plist-get previous :link)
+                        (plist-get run :link)))
+            (setcar out
+                    (plist-put (copy-sequence previous) :text
+                               (concat (or (plist-get previous :text) "")
+                                       (or (plist-get run :text) ""))))
+          (push run out))))))
+
+(defun gdocs--trim-table-cell-runs (runs)
+  "Trim table padding from the edge text runs in RUNS.
+
+Only the first and last textual runs are changed.  Inline objects and all
+style/link boundaries remain separate, and an all-whitespace cell becomes an
+empty run list rather than disappearing from its row."
+  (let* ((runs (mapcar (lambda (run)
+                         (let ((copy (copy-sequence run))
+                               (text (plist-get run :text)))
+                           (when (stringp text)
+                             (setq copy (plist-put
+                                         copy :text
+                                         (substring-no-properties text))))
+                           copy))
+                       runs))
+         (first-index nil)
+         (last-index nil)
+         (index 0))
+    (dolist (run runs)
+      (when (stringp (plist-get run :text))
+        (unless first-index (setq first-index index))
+        (setq last-index index))
+      (cl-incf index))
+    (when first-index
+      (let* ((first-run (nth first-index runs))
+             (last-run (nth last-index runs))
+             (first-text (string-trim-left (or (plist-get first-run :text)
+                                               "")))
+             (last-text (string-trim-right (or (plist-get last-run :text)
+                                               ""))))
+        (setcar (nthcdr first-index runs)
+                (plist-put (copy-sequence first-run) :text first-text))
+        (if (= first-index last-index)
+            (setcar (nthcdr first-index runs)
+                    (plist-put (copy-sequence first-run)
+                               :text (string-trim (or (plist-get first-run
+                                                                 :text)
+                                                      ""))))
+          (setcar (nthcdr last-index runs)
+                  (plist-put (copy-sequence last-run) :text last-text)))))
+    (gdocs--coalesce-table-cell-runs
+     (seq-remove (lambda (run)
+                   (and (not (plist-get run :inline-object))
+                        (string-empty-p (or (plist-get run :text) ""))))
+                 runs))))
+
 (defun gdocs--src-block-paragraphs (sb)
   "Split a src-block's :value into a list of :code paragraphs."
   (let* ((val (or (plist-get (cadr sb) :value) ""))
@@ -2725,11 +2890,12 @@ Each cell becomes (RUNS) — one element holding a list of runs."
           (unless (eq rtype 'rule)
             (dolist (sub (cddr child))
               (when (and (consp sub) (eq (car sub) 'table-cell))
-                (let* ((text (string-trim
-                              (substring-no-properties
-                               (org-element-interpret-data (cddr sub)))))
-                       (runs (when (length> text 0)
-                               (list (gdocs-dm-make-run text)))))
+                (let ((runs
+                       (gdocs--trim-table-cell-runs
+                        (cl-mapcan
+                         (lambda (content)
+                           (gdocs--element-runs content nil nil t))
+                         (cddr sub)))))
                   (push (list runs) cells))))
             (let ((row (nreverse cells)))
               (setq max-cols (max max-cols (length row)))
@@ -2904,6 +3070,8 @@ syntax)."
                 append (cond
                         ((eq (plist-get paragraph :kind) :inline-object)
                          (list paragraph))
+                        ((eq (plist-get paragraph :kind) :table)
+                         (gdocs--doc-table-inline-objects paragraph))
                         (t
                          (cl-loop for run in (plist-get paragraph :runs)
                                   when (plist-get run :inline-object)
@@ -3095,7 +3263,7 @@ ops for cell content."
         (dolist (cell padded)
           (push (string gdocs--ot-cell-end) parts)
           (setq pos (1+ pos))
-          (let* ((runs (and (consp cell) (car cell)))
+          (let* ((runs (gdocs--table-cell-runs cell))
                  (cell-text (gdocs-dm-runs-text (or runs nil)))
                  (cell-start pos))
             (when (length> cell-text 0)
