@@ -1267,6 +1267,100 @@ END is the inclusive final OT position."
        (list (list 1 :text "synthetic" :anchor anchor)))
       "*coverage*[fn:1]\n"))))
 
+(ert-deftest gdocs-test-comment-inline-anchor-after-labeled-link ()
+  "A linked anchor gets its ref after the complete labeled link."
+  (let ((anchor "kix.linked-word"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "[[https://example.com][coverage]]\n"
+       "coverage\n"
+       (list (cons anchor (cons 1 8)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "[[https://example.com][coverage]][fn:1]\n"))))
+
+(ert-deftest gdocs-test-comment-inline-anchor-after-styled-link ()
+  "A styled linked anchor gets its ref after the complete link."
+  (let ((anchor "kix.styled-linked-word"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "[[https://example.com][*coverage*]]\n"
+       "coverage\n"
+       (list (cons anchor (cons 1 8)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "[[https://example.com][*coverage*]][fn:1]\n"))))
+
+(ert-deftest gdocs-test-comment-inline-anchor-after-bare-link ()
+  "A bare URL anchor gets its ref after the complete bare link."
+  (let* ((anchor "kix.bare-link")
+         (url "https://example.com"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       (concat "[[" url "]]\n")
+       (concat url "\n")
+       (list (cons anchor (cons 1 (length url))))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      (concat "[[" url "]][fn:1]\n")))))
+
+(ert-deftest gdocs-test-comment-inline-anchor-before-link-punctuation ()
+  "A ref ending at a link stays before punctuation after that link."
+  (let ((anchor "kix.linked-punctuation"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "[[https://example.com][coverage]],\n"
+       "coverage,\n"
+       (list (cons anchor (cons 1 8)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "[[https://example.com][coverage]][fn:1],\n"))))
+
+(ert-deftest gdocs-test-comment-inline-anchor-before-end-of-link-description ()
+  "A partial anchor in a larger link description closes the whole link."
+  (let ((anchor "kix.partial-link-description"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "[[https://example.com][coverage details]]\n"
+       "coverage details\n"
+       (list (cons anchor (cons 1 8)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "[[https://example.com][coverage details]][fn:1]\n"))))
+
+(ert-deftest gdocs-test-comment-inline-anchor-does-not-scan-literal-link-close ()
+  "Literal closing brackets outside an Org link do not move a ref."
+  (let ((anchor "kix.literal-closing-brackets"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "literal ]] trailing\n"
+       "literal ]] trailing\n"
+       (list (cons anchor (cons 1 7)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "literal[fn:1] ]] trailing\n"))))
+
+(ert-deftest gdocs-test-comment-inline-ref-supports-footnote-navigation ()
+  "A ref after a link remains a navigable Org footnote reference."
+  (with-temp-buffer
+    (insert
+     (gdocs--inline-comment-refs
+      "[[https://example.com][coverage]]\n"
+      "coverage\n"
+      (list (cons "kix.footnote-navigation" (cons 1 8)))
+      '((1 :text "synthetic" :anchor "kix.footnote-navigation"))))
+    (insert "\n[fn:1] synthetic\n")
+    (org-mode)
+    (goto-char (point-min))
+    (search-forward "[fn:1]" nil t)
+    (backward-char 1)
+    (let ((reference (org-footnote-at-reference-p)))
+      (should (equal (car reference) "1"))
+      (org-footnote-goto-definition (car reference))
+      (should (equal (buffer-substring-no-properties
+                      (line-beginning-position) (line-end-position))
+                     "[fn:1] synthetic")))))
+
 (ert-deftest gdocs-test-comment-trailing-selected-space-is-not-anchor-end ()
   "Trailing selected horizontal whitespace is ignored for placement."
   (let ((anchor "kix.trailing-space"))

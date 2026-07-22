@@ -286,6 +286,40 @@ be placed."
         text
       (concat "..." (substring text start)))))
 
+(defun gdocs--inline-ref-containing-link-end ()
+  "Return the end of the Org link containing point, or nil.
+
+The point must be inside a link description.  Bare links are handled as a
+special case because their target is also their visible text.  Walk the
+element parents so styled runs inside a link are recognized without scanning
+for literal closing brackets."
+  (condition-case nil
+      (let ((position (point))
+            (element (org-element-context))
+            link-end)
+        (while (and element (not link-end))
+          (when (eq (org-element-type element) 'link)
+            (let ((begin (org-element-property :begin element))
+                  (end (org-element-property :end element))
+                  (contents-begin (org-element-property
+                                   :contents-begin element))
+                  (contents-end (org-element-property :contents-end element)))
+              (when (and (integerp begin)
+                         (integerp end)
+                         (<= begin position)
+                         (< position end)
+                         (if (and (integerp contents-begin)
+                                  (integerp contents-end))
+                             (and (<= contents-begin position)
+                                  (<= position contents-end))
+                           ;; A bare link has no description; its target is
+                           ;; the visible text and must be kept whole.
+                           t))
+                (setq link-end end))))
+          (setq element (org-element-property :parent element)))
+        link-end)
+    (error nil)))
+
 (defun gdocs--inline-comment-refs (org-body ot-body anchor-map comments)
   "Insert `[fn:N]' refs into ORG-BODY at each comment's anchor position.
 ANCHOR-MAP is the alist (KIX-ID . (SI . EI)) returned by
@@ -374,6 +408,7 @@ harmless but wrong)."
                              (> (plist-get a :plain-end)
                                 (plist-get b :plain-end)))))
     (with-temp-buffer
+      (org-mode)
       (insert org-body)
       (dolist (pl placements)
         (let* ((pe (plist-get pl :plain-end))
@@ -408,6 +443,12 @@ harmless but wrong)."
                   (when (= count 1)
                     (setq found t)
                     (goto-char last)
+                    ;; A plain-text endpoint can fall inside a labeled link
+                    ;; (including a styled description). Keep the reference
+                    ;; outside the complete link, before any following blank.
+                    (let ((link-end (gdocs--inline-ref-containing-link-end)))
+                      (when link-end
+                        (goto-char link-end)))
                     ;; Walk past any trailing emphasis markers so the
                     ;; `[fn:N]' lands outside `~text~' or `*text*' rather
                     ;; than inside (which would alter the styled span).
