@@ -83,7 +83,9 @@ via `gdocs-dm-to-save-commands', and ships them in one /save call.
 paragraph-level diff against the new doc-model, and emits only the
 changed range's ds+is+style ops via
 `gdocs-dm-to-incremental-save-commands'. Falls back to ot-encode if
-the diff includes list or table paragraphs (entity-id rewrite limit)."
+the diff includes list, table, or changed inline-object paragraphs. An
+unchanged inline object can remain outside the diff when preflight proves it
+is preserved."
   :type '(choice (const :tag "Plain text diff" plain)
                  (const :tag "OT encode (full replace + styles)" ot-encode)
                  (const :tag "OT incremental (paragraph diff)" ot-incremental))
@@ -677,6 +679,7 @@ the doc or any buffer. The caller's `gdocs-auth-function' is used."
 ;;          :link S :inline-object OBJECT)
 ;; OBJECT = (:kind :inline-object :entity-id S :object-kind :image
 ;;           :content-id S :width NUMBER :height NUMBER :ot-position N)
+;;          ; `:ot-position' is decoder metadata, not object identity.
 ;;
 ;; Tables are represented as a single :kind=:table paragraph whose :rows is a
 ;; list of rows; each row is a list of cells; each cell is a list of runs.
@@ -1211,6 +1214,38 @@ that association is made by its separate `te' operation."
             :content-id content-id
             :width (and (numberp width) width)
             :height (and (numberp height) height)))))
+
+(defconst gdocs--inline-object-identity-keys
+  '(:entity-id :object-kind :content-id :width :height)
+  "Stable fields that identify an inline object for comparison.
+
+OT positions, decoder-only vectors, and source metadata are deliberately not
+part of this identity.  Width and height remain part of the identity because
+changing either changes the rendered object and cannot be preserved by a text
+only incremental edit.")
+
+(defun gdocs--inline-object-canonical-value (key value)
+  "Normalize VALUE for stable inline-object identity KEY.
+
+JSON decoding and Org parsing may represent the same dimension as an integer
+or a float.  Normalize numeric dimensions so that representation details do
+not make an unchanged object look changed."
+  (if (and (memq key '(:width :height)) (numberp value))
+      (float value)
+    value))
+
+(defun gdocs--inline-object-identity (object)
+  "Return the stable comparison identity of inline OBJECT.
+
+Only `gdocs--inline-object-identity-keys' are copied.  In particular,
+`:ot-position' remains available to the capability preflight but is not part
+of equality, because it changes when unrelated text is inserted before an
+otherwise untouched object."
+  (when (and object (listp object))
+    (cl-loop for key in gdocs--inline-object-identity-keys
+             append (list key
+                          (gdocs--inline-object-canonical-value
+                           key (plist-get object key))))))
 
 (defun gdocs--decode-inline-objects (ops body)
   "Decode inline image entities in OPS against OT BODY.
@@ -3462,18 +3497,57 @@ BODY at position 1)."
   (let ((o1 (plist-get r1 :inline-object))
         (o2 (plist-get r2 :inline-object)))
     (if (or o1 o2)
-        (equal o1 o2)
+        (let ((identity1 (and o1 (gdocs--inline-object-identity o1)))
+              (identity2 (and o2 (gdocs--inline-object-identity o2))))
+          (and identity1 identity2 (equal identity1 identity2)))
       (and (equal (plist-get r1 :text) (plist-get r2 :text))
            (equal (sort (plist-get r1 :styles) :lessp #'string<)
                   (sort (plist-get r2 :styles) :lessp #'string<))
            (equal (plist-get r1 :link) (plist-get r2 :link))))))
 
+(defun gdocs--paragraph-inline-object-for-equality (paragraph)
+  "Return the standalone inline object represented by PARAGRAPH.
+
+Remote decoding stores a standalone object both in paragraph fields and as a
+single `:inline-object' run.  Org parsing stores it only in paragraph fields.
+Normalize those shapes to the run object, rejecting an inconsistent duplicate
+instead of allowing one representation to hide changed metadata."
+  (when (eq (plist-get paragraph :kind) :inline-object)
+    (let* ((runs (plist-get paragraph :runs))
+           (run-object (and (= (length runs) 1)
+                            (plist-get (car runs) :inline-object)))
+           (paragraph-object (and (plist-member paragraph :entity-id)
+                                  paragraph)))
+      (cond
+       ((and run-object paragraph-object)
+        (if (equal (gdocs--inline-object-identity run-object)
+                   (gdocs--inline-object-identity paragraph-object))
+            run-object
+          :invalid-inline-object))
+       (run-object run-object)
+       (paragraph-object paragraph-object)
+       (t :invalid-inline-object)))))
+
+(defun gdocs--paragraph-runs-for-equality (paragraph)
+  "Return PARAGRAPH runs in the canonical shape used for equality."
+  (if (eq (plist-get paragraph :kind) :inline-object)
+      (list (list :inline-object
+                  (gdocs--paragraph-inline-object-for-equality paragraph)))
+    (plist-get paragraph :runs)))
+
 (defun gdocs--paragraph-equal-p (p1 p2)
   "Return non-nil if P1 and P2 are equivalent at the user-visible level.
-Compares kind, runs, heading level, list nest/glyph, but NOT list-id —
-list ids differ between live-decoded and freshly-rendered docs."
-  (let ((kind (plist-get p1 :kind)))
-    (and (eq kind (plist-get p2 :kind))
+Compares kind, runs, heading level, list nest/glyph, and canonical inline
+object identity, but NOT list-id — list ids differ between live-decoded and
+freshly-rendered docs."
+  (let* ((kind (plist-get p1 :kind))
+         (object1 (and (eq kind :inline-object)
+                       (gdocs--paragraph-inline-object-for-equality p1)))
+         (object2 (and (eq kind :inline-object)
+                       (gdocs--paragraph-inline-object-for-equality p2))))
+    (and (not (eq object1 :invalid-inline-object))
+         (not (eq object2 :invalid-inline-object))
+         (eq kind (plist-get p2 :kind))
          ;; A missing heading level renders exactly like level 1, so it should
          ;; not turn a spacing-only/render-normalization pass into an OT edit.
          (equal (if (eq kind :heading)
@@ -3484,8 +3558,8 @@ list ids differ between live-decoded and freshly-rendered docs."
                   (plist-get p2 :level)))
          (equal (plist-get p1 :nest) (plist-get p2 :nest))
          (equal (plist-get p1 :glyph) (plist-get p2 :glyph))
-         (let ((r1 (plist-get p1 :runs))
-               (r2 (plist-get p2 :runs)))
+         (let ((r1 (gdocs--paragraph-runs-for-equality p1))
+               (r2 (gdocs--paragraph-runs-for-equality p2)))
            (and (= (length r1) (length r2))
                 (cl-every #'gdocs--run-text-equal-p r1 r2))))))
 
@@ -4440,6 +4514,16 @@ buffer-local report over raw remote state."
 (defalias 'gdocs--remote-inline-object-analysis
   #'gdocs--remote-capability-analysis)
 
+(defun gdocs--local-inline-object-capability-report (object)
+  "Build the local capability report for inline OBJECT."
+  (gdocs--capability-report
+   :inline-image
+   "The local document contains an inline image marker that the OT encoder cannot create or change."
+   :entity-id (plist-get object :entity-id)
+   :source :local-object
+   :preserve-untouched t :refuse-push nil
+   :push-policy :allow-if-untouched))
+
 (defun gdocs--local-capability-analysis (local-body)
   "Decode local unsupported markers and inline objects for preflight.
 Local object payloads are used only for equality checking against the fresh
@@ -4449,14 +4533,7 @@ remote analysis; they are never put into a capability report."
         (reports nil))
     (dolist (object (gdocs-dm-inline-objects doc))
       (push object objects)
-      (push (gdocs--capability-report
-             :inline-image
-             "The local document contains an inline image marker that the OT encoder cannot create or change."
-             :entity-id (plist-get object :entity-id)
-             :source :local-object
-             :preserve-untouched t :refuse-push nil
-             :push-policy :allow-if-untouched)
-            reports))
+      (push (gdocs--local-inline-object-capability-report object) reports))
     (list :objects (nreverse objects)
           :unsupported (gdocs--capability-merge
                         (gdocs-dm-unsupported doc)
@@ -4464,17 +4541,9 @@ remote analysis; they are never put into a capability report."
 
 (defun gdocs--capability-object-equal-p (a b)
   "Return non-nil when local and remote inline objects are unchanged."
-  (let ((same (lambda (key)
-                (let ((left (plist-get a key))
-                      (right (plist-get b key)))
-                  (if (and (numberp left) (numberp right))
-                      (= left right)
-                    (equal left right))))))
-    (and (funcall same :entity-id)
-         (funcall same :object-kind)
-         (funcall same :content-id)
-         (funcall same :width)
-         (funcall same :height))))
+  (let ((identity-a (gdocs--inline-object-identity a))
+        (identity-b (gdocs--inline-object-identity b)))
+    (and identity-a identity-b (equal identity-a identity-b))))
 
 (defun gdocs--capability-object-matches-p (object remote-objects)
   "Return non-nil when OBJECT exactly matches a fresh remote object."
@@ -4550,19 +4619,36 @@ again here so stale buffer-local capability metadata cannot bypass policy."
          (local-objects (plist-get local :objects))
          (local-reports (plist-get local :unsupported))
          (unmatched-local
-          (cl-remove-if
-           (lambda (report)
-             (and (eq (plist-get report :source) :local-object)
-                  (let ((object
-                         (seq-find
-                          (lambda (candidate)
-                            (equal (plist-get candidate :entity-id)
-                                   (plist-get report :entity-id)))
-                          local-objects)))
-                    (and object
-                         (gdocs--capability-object-matches-p
-                          object remote-objects)))))
-           local-reports))
+          (let ((remaining-remote (copy-sequence remote-objects))
+                (unmatched-objects nil))
+            ;; Consume each remote identity at most once.  Matching a local
+            ;; marker against the same remote object twice would let a
+            ;; duplicated image pass preflight even though equality later
+            ;; treats the extra paragraph as a document change.
+            (dolist (object local-objects)
+              (let ((match (seq-find
+                            (lambda (candidate)
+                              (gdocs--capability-object-equal-p
+                               object candidate))
+                            remaining-remote)))
+                (if match
+                    (setq remaining-remote (delq match remaining-remote))
+                  (push (or (seq-find
+                             (lambda (report)
+                               (and (eq (plist-get report :source)
+                                        :local-object)
+                                    (equal (plist-get report :entity-id)
+                                           (plist-get object :entity-id))))
+                             local-reports)
+                            (gdocs--local-inline-object-capability-report
+                             object))
+                        unmatched-objects))))
+            (append
+             (cl-remove-if
+              (lambda (report)
+                (eq (plist-get report :source) :local-object))
+              local-reports)
+             (nreverse unmatched-objects))))
          (reports (gdocs--capability-merge
                    (plist-get remote :unsupported)
                    unmatched-local))
@@ -4705,12 +4791,19 @@ again here so stale buffer-local capability metadata cannot bypass policy."
            (car (gdocs--strip-heading-drawers local-body))))
          (remote-mappable
           (gdocs--inline-markers-as-ot-placeholders remote-body))
+         ;; Placeholder normalization intentionally hides image metadata and
+         ;; therefore cannot establish a no-op on its own.  Decode the models
+         ;; before treating equal placeholder text as unchanged.
+         (model-requires-full
+          (gdocs--incremental-needs-full-replace-p state local-body))
          (kind
           (cond
-           ((string= remote-mappable local-stripped) :noop)
+           ((and (string= remote-mappable local-stripped)
+                 (not model-requires-full))
+            :noop)
            ((eq gdocs-push-backend 'ot-encode) :full-replace)
            ((and (eq gdocs-push-backend 'ot-incremental)
-                 (gdocs--incremental-needs-full-replace-p state local-body))
+                 model-requires-full)
             :full-replace)
            (t :incremental))))
     (list :kind kind

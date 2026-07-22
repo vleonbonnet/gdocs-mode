@@ -538,6 +538,71 @@ END is the inclusive final OT position."
                    "BeforeAfter"))
     (should-error (gdocs-dm-to-ot doc) :type 'user-error)))
 
+(ert-deftest gdocs-test-inline-object-equality-uses-stable-identity ()
+  "Inline-object equality ignores OT metadata but preserves object shape."
+  (let* ((object '(:kind :inline-object
+                         :entity-id "kix.synthetic-image"
+                         :object-kind :image
+                         :content-id "s-blob-v1-IMAGE-synthetic"
+                         :width 468.0 :height 102.0
+                         :ot-position 8
+                         :decoder-vector [ignored]
+                         :source :remote))
+         (same-object (plist-put (copy-sequence object) :ot-position 99))
+         (standalone-remote
+          (list :kind :inline-object
+                :runs (list (list :inline-object object))
+                :entity-id "kix.synthetic-image"
+                :object-kind :image
+                :content-id "s-blob-v1-IMAGE-synthetic"
+                :width 468.0 :height 102.0 :ot-position 8))
+         (standalone-local
+          (list :kind :inline-object
+                :entity-id "kix.synthetic-image"
+                :object-kind :image
+                :content-id "s-blob-v1-IMAGE-synthetic"
+                :width 468 :height 102 :ot-position nil))
+         (embedded-remote
+          (list :kind :para
+                :runs (list (gdocs-dm-make-run "Before")
+                            (list :inline-object object)
+                            (gdocs-dm-make-run "After"))))
+         (embedded-local
+          (list :kind :para
+                :runs (list (gdocs-dm-make-run "Before")
+                            (list :inline-object same-object)
+                            (gdocs-dm-make-run "After")))))
+    (should (equal (gdocs--inline-object-identity object)
+                   (gdocs--inline-object-identity same-object)))
+    (should (gdocs--paragraph-equal-p standalone-remote standalone-local))
+    (should (gdocs--paragraph-equal-p embedded-remote embedded-local))
+    (dolist (field-values '((:entity-id "other-entity")
+                            (:object-kind :video)
+                            (:content-id "other-content")
+                            (:width 469.0)
+                            (:height 103.0)))
+      (let ((changed (plist-put (copy-sequence same-object)
+                                (car field-values) (cadr field-values))))
+        (should-not
+         (gdocs--run-text-equal-p
+          (list :inline-object object)
+          (list :inline-object changed)))))
+    ;; Object order and surrounding text remain part of paragraph equality.
+    (should-not
+     (gdocs--paragraph-equal-p
+      embedded-remote
+      (list :kind :para
+            :runs (list (gdocs-dm-make-run "After")
+                        (list :inline-object same-object)
+                        (gdocs-dm-make-run "Before")))))
+    (should-not
+     (gdocs--paragraph-equal-p
+      embedded-remote
+      (list :kind :para
+            :runs (list (gdocs-dm-make-run "Changed")
+                        (list :inline-object same-object)
+                        (gdocs-dm-make-run "After")))))))
+
 (ert-deftest gdocs-test-inline-images-use-te-positions-not-entity-order ()
   "Multiple images are sorted by OT position, not ae or te order."
   (let* ((fixture (gdocs-test--inline-case "multiple-images-not-entity-order"))
@@ -1799,6 +1864,60 @@ END is the inclusive final OT position."
                              2)
                    '("ds" "is")))
     (should (= (alist-get 'si (car commands)) 1))))
+
+(ert-deftest gdocs-test-unchanged-inline-object-allows-safe-incremental-text-edits ()
+  "Text edits around an unchanged image stay incremental and preflighted."
+  (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
+         (body (plist-get fixture :body))
+         (ops (plist-get fixture :ops))
+         (state (list :revision 17 :ot-body body :ot-ops ops))
+         (remote (gdocs-dm-to-org (gdocs-dm-from-ops nil nil nil body ops)))
+         (marker (progn
+                   (string-match "^#\\+gdocs_inline_object:[^\\n]*" remote)
+                   (match-string 0 remote)))
+         (before (replace-regexp-in-string "Before" "Changed" remote))
+         (after (replace-regexp-in-string "After" "Changed" remote))
+         (spanning (replace-regexp-in-string
+                    "Before" "Changed"
+                    (replace-regexp-in-string "After" "Changed" remote)))
+         (moved (concat marker "\nBefore\nAfter\n"))
+         (duplicated (concat "Before\n" marker "\n" marker
+                             "\nAfter\n"))
+         (changed-object (replace-regexp-in-string
+                          "468x102" "469x102" remote))
+         (substituted-object (replace-regexp-in-string
+                              "kix.synthetic-image-one"
+                              "kix.synthetic-image-other" remote))
+         (gdocs-push-backend 'ot-incremental))
+    (dolist (local (list before after))
+      (let ((plan (gdocs--push-plan-for-diff state local remote)))
+        (should-not (gdocs--incremental-needs-full-replace-p state local))
+        (should (eq (plist-get plan :kind) :incremental))
+        (should (gdocs--push-preflight state local plan))))
+    (let* ((old-doc (gdocs-dm-from-ops 17 nil nil body ops))
+           (new-doc (gdocs-dm-from-org before))
+           (commands (gdocs-dm-to-incremental-save-commands old-doc new-doc)))
+      (should (equal (seq-take (mapcar (lambda (op) (alist-get 'ty op))
+                                       commands)
+                               2)
+                     '("ds" "is"))))
+    ;; Preflight still validates object identities one-to-one; equality alone
+    ;; must not make a duplicated local marker look preserved.
+    (should-error
+     (gdocs--push-preflight
+      state duplicated
+      '(:kind :incremental
+              :ranges ((:ot-start 1 :ot-end 1 :insert-at 1 :delete-count 1))))
+     :type 'user-error)
+    ;; An object in the changed middle still forces the destructive path, and
+    ;; preflight refuses it before any transport can run.
+    (dolist (local (list spanning moved duplicated changed-object
+                         substituted-object))
+      (let ((plan (gdocs--push-plan-for-diff state local remote)))
+        (should (gdocs--incremental-needs-full-replace-p state local))
+        (should (eq (plist-get plan :kind) :full-replace))
+        (should-error (gdocs--push-preflight state local plan)
+                      :type 'user-error)))))
 
 (ert-deftest gdocs-test-locate-edit-through-structural-ot-map ()
   "An edit in plain text maps back to its OT positions."

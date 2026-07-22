@@ -22,8 +22,9 @@ the image bytes are not downloaded.
 writes it remotely. Sections that existed before the last pull are updated in
 place; new sections are appended. A push is refused if the remote document
 changed since the last pull, so concurrent edits are never silently
-overwritten. Pushes are also refused for documents containing inline images,
-because this version cannot emit image-preserving OT operations.
+overwritten. Unchanged inline images can be preserved while an incremental
+text edit is proven not to touch them; edits that change, move, duplicate, or
+delete an image remain refused.
 - **Auto-sync** — an idle timer polls the remote revision. If the remote
 advanced and the local buffer is clean, it pulls automatically; if both sides
 changed, it surfaces a one-shot conflict warning and takes no action.
@@ -52,19 +53,22 @@ synthetic heading blank cannot become a new remote paragraph on every cycle.
 ### Supported content
 
 The supported round-trip surface is headings, paragraphs, inline emphasis,
-links, lists, tables, and source blocks. Google Docs inline images are pullable
-but intentionally not pushable. A pulled image is rendered as an explicit
-remote placeholder such as:
+links, lists, tables, and source blocks. Google Docs inline images are
+pullable but intentionally not editable. A pulled image is rendered as an
+explicit remote placeholder such as:
 
 ```org
 #+gdocs_inline_object: image kix.example 468x102 content-id=s-blob-v1-IMAGE-example
 ```
 
-The placeholder is metadata, not prose and not an Org image link. Do not edit,
-remove, move, or recreate it and then push: the push is refused rather than
-silently deleting the remote image. If the entity-to-placeholder association
-cannot be established from Google's OT `te.spi` attachment, the document is
-marked unsupported and push remains refused.
+The placeholder is metadata, not prose and not an Org image link. Its entity
+ID, object kind, content ID, and dimensions form its stable identity. Do not
+edit, remove, move, or recreate it and then push: the push is refused rather
+than silently deleting the remote image. Unrelated text edits may use the
+incremental backend when the image is proven untouched. If the
+entity-to-placeholder association cannot be established from Google's OT
+`te.spi` attachment, the document is marked unsupported and push remains
+refused.
 
 ## Requirements
 
