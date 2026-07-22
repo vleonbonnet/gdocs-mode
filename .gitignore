@@ -1,1 +1,3 @@
+# Keep accidental manual byte-compilation artifacts out of version control.
+# The Makefile itself compiles into a temporary directory and removes it.
 *.elc

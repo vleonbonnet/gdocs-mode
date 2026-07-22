@@ -217,6 +217,11 @@ Run byte-compilation validation with `make byte-compile`, or run both checks
 with `make check`. The optional `make integration` target only selects the
 `integration` ERT tag after explicitly setting `GDOCS_MODE_RUN_INTEGRATION=1`;
 no live credentials or live integration tests are required by this repository.
+Byte-compilation writes `gdocs-mode.elc` and `gdocs-mode-test.elc` to a fresh
+directory under `$TMPDIR` (or `/tmp`), puts that directory first on the load
+path, and removes it on success, failure, or interruption. It never writes
+compiled files beside the source files, and `make check` serializes its test
+and compilation prerequisites even when invoked with `make -j check`.
 
 ## Caveats
 
