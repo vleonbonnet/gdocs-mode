@@ -1550,25 +1550,154 @@ END is the inclusive final OT position."
     (should (equal range '(4 . 8)))))
 
 (ert-deftest gdocs-test-image-bearing-push-is-refused-before-ot-ops ()
-  "An image-bearing remote document cannot enter any push backend."
+  "The synchronous push backend refuses an image before emitting OT ops."
   (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
          (body (plist-get fixture :body))
          (state (list :revision 17 :ot-body body
                       :ot-ops (plist-get fixture :ops)))
-         (message nil))
-    (condition-case err
-        (gdocs--apply-push "synthetic-image-document" state
-                           "Before\nAfter\n" "Before\nAfter\n")
-      (user-error (setq message (error-message-string err))))
-    (should (string-match-p "refusing push" message))
-    (should (string-match-p "inline image" message))
-    (should (string-match-p "pull remains available" message))
-    (condition-case err
-        (gdocs--apply-push-async
-         "synthetic-image-document" state "Before\nAfter\n"
-         "Before\nAfter\n" nil (lambda (&rest _args) nil))
-      (user-error (setq message (error-message-string err))))
-    (should (string-match-p "refusing push" message))))
+         (error-message nil)
+         (save-called nil)
+         (transport-called nil))
+    (cl-letf (((symbol-function 'gdocs--save-request)
+               (lambda (&rest _args) (setq save-called t)))
+              ((symbol-function 'gdocs--curl-post)
+               (lambda (&rest _args) (setq transport-called t))))
+      (let ((signal
+             (should-error
+              (gdocs--apply-push "synthetic-image-document" state
+                                 "Before\nAfter\n" "Before\nAfter\n")
+              :type 'user-error)))
+        (setq error-message (error-message-string signal))))
+    (should (string-match-p "refusing push" error-message))
+    (should (string-match-p "inline image" error-message))
+    (should (string-match-p "pull remains available" error-message))
+    (should-not save-called)
+    (should-not transport-called)))
+
+(ert-deftest gdocs-test-image-bearing-async-push-is-refused-before-ot-ops ()
+  "The low-level async push refuses an image before save or callbacks.
+
+The guard currently signals synchronously, so the callback must not be
+called at all. Keeping the error and all invocation flags local to this test
+prevents a preceding synchronous refusal from making this assertion pass."
+  (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
+         (body (plist-get fixture :body))
+         (state (list :revision 17 :ot-body body
+                      :ot-ops (plist-get fixture :ops)))
+         (error-message nil)
+         (save-called nil)
+         (transport-called nil)
+         (callback-count 0)
+         (success-callback nil)
+         (gdocs-push-backend 'ot-encode))
+    ;; Keep these resets explicit: this is the state whose values the async
+    ;; invocation below is allowed to establish.
+    (setq error-message nil
+          save-called nil
+          transport-called nil
+          callback-count 0
+          success-callback nil)
+    (cl-letf (((symbol-function 'gdocs--save-request-async)
+               (lambda (&rest _args) (setq save-called t)))
+              ((symbol-function 'gdocs--curl-async)
+               (lambda (&rest _args) (setq transport-called t)))
+              ((symbol-function 'gdocs--run-op-async)
+               (lambda (&rest _args) (setq save-called t))))
+      (let ((signal
+             (should-error
+              (gdocs--apply-push-async
+               "synthetic-image-document" state "Before\nAfter\n"
+               "Before\nAfter\n" nil
+               (lambda (revision err)
+                 (cl-incf callback-count)
+                 (when (and revision (null err))
+                   (setq success-callback t))))
+              :type 'user-error)))
+        (setq error-message (error-message-string signal))))
+    (should (string-match-p "refusing push" error-message))
+    (should (string-match-p "inline image" error-message))
+    (should (string-match-p "pull remains available" error-message))
+    (should-not save-called)
+    (should-not transport-called)
+    (should (= callback-count 0))
+    (should-not success-callback)))
+
+(ert-deftest gdocs-test-public-async-image-bearing-push-is-refused ()
+  "The public async push entry point refuses images before /save.
+
+`gdocs-push-remotely' reports asynchronous failures through its warning log
+and has no public completion callback. Wrap the low-level callback anyway so
+that a removed preflight guard would be observed as an unexpected success."
+  (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
+         (body (plist-get fixture :body))
+         (ops (plist-get fixture :ops))
+         (state (list :revision 17 :token "token" :ouid "ouid"
+                      :ot-body body :ot-ops ops))
+         (html (gdocs-test--html-for-ops 17 ops))
+         (error-message nil)
+         (failure-report-count 0)
+         (fetch-callback-count 0)
+         (save-called nil)
+         (transport-called nil)
+         (completion-callback-count 0)
+         (success-callback nil)
+         (gdocs-push-backend 'ot-encode)
+         (gdocs--sync-mutex nil))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n"
+              ":GDOC_ID: synthetic-image-document\n"
+              ":GDOC_REVISION: 17\n"
+              ":END:\n\n"
+              "Before\nChanged\nAfter\n")
+      (org-mode)
+      ;; Do not inherit either an error or an invocation flag from another
+      ;; operation: these values belong exclusively to this public call.
+      (setq error-message nil
+            failure-report-count 0
+            fetch-callback-count 0
+            save-called nil
+            transport-called nil
+            completion-callback-count 0
+            success-callback nil)
+      (let ((original-apply (symbol-function 'gdocs--apply-push-async)))
+        (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                   (lambda (_doc callback)
+                     (cl-incf fetch-callback-count)
+                     (funcall callback state html nil)))
+                  ((symbol-function 'gdocs--save-request-async)
+                   (lambda (_doc _state _commands callback)
+                     (setq save-called t)
+                     ;; If the guard is removed, complete the synthetic save
+                     ;; so the wrapped callback exposes a false success.
+                     (funcall callback
+                              '((metadata . ((serverRevision . 18)))) nil)))
+                  ((symbol-function 'gdocs--curl-async)
+                   (lambda (&rest _args) (setq transport-called t)))
+                  ((symbol-function 'gdocs-log)
+                   (lambda (level format-string &rest args)
+                     (when (eq level 'warn)
+                       (cl-incf failure-report-count)
+                       (setq error-message (apply #'format format-string args)))))
+                  ((symbol-function 'gdocs--apply-push-async)
+                   (lambda (doc-id push-state local-body remote-body buffer callback)
+                     (funcall original-apply
+                              doc-id push-state local-body remote-body buffer
+                              (lambda (revision err)
+                                (cl-incf completion-callback-count)
+                                (when (and revision (null err))
+                                  (setq success-callback t))
+                                (funcall callback revision err))))))
+          (gdocs-push-remotely "synthetic-image-document"))))
+    (should (= fetch-callback-count 1))
+    (should (= failure-report-count 1))
+    (should (string-match-p "refusing push" error-message))
+    (should (string-match-p "inline image" error-message))
+    (should (string-match-p "pull remains available" error-message))
+    (should-not save-called)
+    (should-not transport-called)
+    (should (= completion-callback-count 0))
+    (should-not success-callback)
+    (should-not gdocs--sync-mutex)))
 
 (ert-deftest gdocs-test-capability-preflight-allows-supported-text-only ()
   "A supported text-only incremental edit passes capability preflight."
