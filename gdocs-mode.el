@@ -1216,7 +1216,7 @@ that association is made by its separate `te' operation."
             :height (and (numberp height) height)))))
 
 (defconst gdocs--inline-object-identity-keys
-  '(:entity-id :object-kind :content-id :width :height)
+  '(:entity-id :kind :object-kind :content-id :width :height)
   "Stable fields that identify an inline object for comparison.
 
 OT positions, decoder-only vectors, and source metadata are deliberately not
@@ -1233,6 +1233,15 @@ not make an unchanged object look changed."
   (if (and (memq key '(:width :height)) (numberp value))
       (float value)
     value))
+
+(defun gdocs--inline-object-dimension-equal-p (a b)
+  "Return non-nil when dimensions A and B are exactly numerically equal.
+
+The preservation policy accepts integer/float representation differences, but
+does not use a tolerance and does not treat missing/non-numeric dimensions as
+preserved metadata."
+  (and (numberp a) (numberp b)
+       (= (float a) (float b))))
 
 (defun gdocs--inline-object-identity (object)
   "Return the stable comparison identity of inline OBJECT.
@@ -4524,32 +4533,254 @@ buffer-local report over raw remote state."
    :preserve-untouched t :refuse-push nil
    :push-policy :allow-if-untouched))
 
+(defun gdocs--capability-object-entity-id (object)
+  "Return OBJECT's usable stable entity ID, or nil."
+  (let ((id (plist-get object :entity-id)))
+    (and (stringp id)
+         (not (string-empty-p id))
+         id)))
+
+(defun gdocs--inline-object-matching-report (object source explanation)
+  "Build a sanitized inline-object mismatch report for OBJECT.
+
+SOURCE identifies which representation supplied OBJECT.  The entity ID is
+retained internally for matching and range bookkeeping, but capability error
+summaries never serialize it."
+  (gdocs--capability-report
+   :inline-image explanation
+   :entity-id (gdocs--capability-object-entity-id object)
+   :ot-start (plist-get object :ot-position)
+   :ot-end (plist-get object :ot-position)
+   :source source
+   :preserve-untouched t :refuse-push nil
+   :push-policy :allow-if-untouched))
+
+(defun gdocs--capability-object-error-ranges (reports)
+  "Return conservative deletion ranges for inline-object REPORTS.
+
+These ranges are diagnostic/preflight metadata only.  They retain the remote
+OT position without normalizing the corresponding marker text first."
+  (cl-loop for report in reports
+           for start = (plist-get report :ot-start)
+           for end = (plist-get report :ot-end)
+           when (and (integerp start) (integerp end) (>= end start))
+           collect (list :ot-start start :ot-end end
+                         :insert-at start
+                         :delete-count (max 1 (1+ (- end start))))))
+
+(defun gdocs--capability-object-matching-errors
+    (local-objects remote-objects &optional partial)
+  "Return reports when LOCAL-OBJECTS cannot be preserved against REMOTE-OBJECTS.
+
+Matching is keyed by the stable entity ID first, then compares immutable
+metadata.  Each valid ID is consumed at most once.  FULL comparisons require
+the two representations to contain the same ordered set of objects; PARTIAL
+comparisons are used for an insertion payload and only reject markers in that
+payload, because the payload is not the complete local document."
+  (let ((local-seen (make-hash-table :test #'equal))
+        (remote-seen (make-hash-table :test #'equal))
+        (remote-by-id (make-hash-table :test #'equal))
+        (local-duplicates (make-hash-table :test #'equal))
+        (remote-duplicates (make-hash-table :test #'equal))
+        (local-paired (make-hash-table :test #'equal))
+        (consumed (make-hash-table :test #'equal))
+        (errors nil))
+    ;; Validate local IDs before attempting any match.  A duplicate ID must
+    ;; never be allowed to consume the same remote object twice.
+    (dolist (object local-objects)
+      (let ((id (gdocs--capability-object-entity-id object)))
+        (cond
+         ((null id)
+          (push (gdocs--inline-object-matching-report
+                 object :local-object
+                 "A local inline image marker has no usable entity ID.")
+                errors))
+         ((gethash id local-seen)
+          (puthash id t local-duplicates)
+          (push (gdocs--inline-object-matching-report
+                 object :local-object
+                 "A local inline image marker uses an entity ID more than once.")
+                errors))
+         (t (puthash id object local-seen)))))
+    ;; Validate remote IDs separately.  Legacy/synthetic states may carry an
+    ;; object list without having passed through the raw OT decoder.  This
+    ;; check also applies to partial insertion preflight.
+    (dolist (object remote-objects)
+      (let ((id (gdocs--capability-object-entity-id object)))
+        (cond
+         ((null id)
+          (push (gdocs--inline-object-matching-report
+                 object :remote-object
+                 "A remote inline image has no usable entity ID.")
+                errors))
+         ((gethash id remote-seen)
+          (puthash id t remote-duplicates)
+          (push (gdocs--inline-object-matching-report
+                 object :remote-object
+                 "A remote inline image uses an entity ID more than once.")
+                errors))
+         (t
+          (puthash id object remote-seen)
+          (puthash id object remote-by-id)))))
+    (if partial
+        ;; An insertion payload cannot safely create, duplicate, or substitute
+        ;; an image.  It is not the complete local representation, so do not
+        ;; interpret its absence of markers as deletion of remote objects.
+        (dolist (object local-objects)
+          (unless (gethash (gdocs--capability-object-entity-id object)
+                           local-duplicates)
+            (push (gdocs--inline-object-matching-report
+                   object :local-object
+                   "An inline image marker cannot be inserted or changed.")
+                  errors)))
+      (progn
+        ;; Pair by entity ID, consuming a remote object exactly once.  A
+        ;; metadata mismatch consumes the corresponding remote ID for error
+        ;; reporting, rather than being mistaken for a second missing object.
+        (dolist (object local-objects)
+          (let ((id (gdocs--capability-object-entity-id object)))
+            (when (and id
+                       ;; Pair the first occurrence even when the ID is
+                       ;; duplicated; the later occurrences are the local
+                       ;; one-to-many violation already reported above.
+                       (not (gethash id local-paired))
+                       (not (gethash id remote-duplicates)))
+              (puthash id t local-paired)
+              (let ((remote (gethash id remote-by-id)))
+                (cond
+                 ((null remote)
+                  (push (gdocs--inline-object-matching-report
+                         object :local-object
+                         "A local inline image marker has no matching remote object.")
+                        errors))
+                 (t
+                  (puthash id t consumed)
+                  (unless (gdocs--capability-object-equal-p object remote)
+                    (push (gdocs--inline-object-matching-report
+                           remote :remote-object
+                           "Inline image metadata differs between local and remote documents.")
+                          errors))))))))
+        ;; A remote ID without a local marker is a deletion, not an ordinary
+        ;; text edit.  Do not let placeholder normalization hide it.
+        (dolist (object remote-objects)
+          (let ((id (gdocs--capability-object-entity-id object)))
+            (when (and id
+                       (not (gethash id remote-duplicates))
+                       (not (gethash id consumed)))
+              (push (gdocs--inline-object-matching-report
+                     object :remote-object
+                     "A remote inline image has no local marker.")
+                    errors))))
+        ;; OT positions are transient, but moving an image is not supported.
+        ;; Compare document order separately from object identity.
+        (when (null errors)
+          (let ((local-order
+                 (mapcar #'gdocs--capability-object-entity-id local-objects))
+                (remote-order
+                 (mapcar #'gdocs--capability-object-entity-id remote-objects)))
+            (unless (equal local-order remote-order)
+              (push (gdocs--inline-object-matching-report
+                     (car remote-objects) :remote-object
+                     "Inline image markers were reordered, but moving images is unsupported.")
+                    errors))))))
+    (nreverse errors)))
+
+(defun gdocs--inline-marker-count (text)
+  "Return the number of standalone and embedded image markers in TEXT."
+  (let ((text (or text ""))
+        (count 0)
+        (start 0))
+    (while (string-match
+            "\\(^\\|\\n\\)#\\+gdocs_inline_object:[^\n]*"
+            text start)
+      (cl-incf count)
+      (setq start (match-end 0)))
+    (setq start 0)
+    (while (string-match "@@gdocs-inline-object:[^@\n]*@@" text start)
+      (cl-incf count)
+      (setq start (match-end 0)))
+    count))
+
+(defun gdocs--remote-inline-object-validation-errors (reports)
+  "Return hard inline-image reports from remote capability REPORTS.
+
+Valid remote image reports deliberately have `:refuse-push' nil and are
+preserved by range checks.  A hard inline-image report represents malformed or
+ambiguous remote object data that must also block a no-op."
+  (cl-remove-if-not
+   (lambda (report)
+     (and (eq (plist-get report :kind) :inline-image)
+          (plist-get report :refuse-push)))
+   reports))
+
 (defun gdocs--local-capability-analysis (local-body)
   "Decode local unsupported markers and inline objects for preflight.
 Local object payloads are used only for equality checking against the fresh
-remote analysis; they are never put into a capability report."
-  (let ((doc (gdocs-dm-from-org (or local-body "")))
-        (objects nil)
-        (reports nil))
-    (dolist (object (gdocs-dm-inline-objects doc))
-      (push object objects)
-      (push (gdocs--local-inline-object-capability-report object) reports))
-    (list :objects (nreverse objects)
+remote analysis; they are never put into a capability report. Marker-like text
+that does not decode to exactly one object per marker is reported as invalid."
+  (let* ((body (or local-body ""))
+         (doc (gdocs-dm-from-org body))
+         (objects (gdocs-dm-inline-objects doc))
+         (reports (mapcar #'gdocs--local-inline-object-capability-report
+                          objects))
+         (marker-count (gdocs--inline-marker-count body))
+         (marker-errors
+          (if (= marker-count (length objects))
+              nil
+            (list
+             (gdocs--capability-report
+              :inline-image
+              "The local document contains an invalid inline image marker."
+              :source :local-marker :refuse-push t :render-directive nil)))))
+    (list :objects objects
+          :inline-marker-errors marker-errors
           :unsupported (gdocs--capability-merge
                         (gdocs-dm-unsupported doc)
-                        (nreverse reports)))))
+                        marker-errors reports))))
 
 (defun gdocs--capability-object-equal-p (a b)
-  "Return non-nil when local and remote inline objects are unchanged."
-  (let ((identity-a (gdocs--inline-object-identity a))
-        (identity-b (gdocs--inline-object-identity b)))
-    (and identity-a identity-b (equal identity-a identity-b))))
+  "Return non-nil when local and remote inline objects are unchanged.
+
+The stable entity ID is the primary identity.  Once it matches, immutable
+object kind, content ID, and dimensions must also match.  Dimensions use the
+exact numeric policy of `gdocs--inline-object-canonical-value': numeric values
+are compared after conversion to double precision with no tolerance, and
+missing dimensions are not preserved.  OT position and decoder/source metadata
+are ignored."
+  (let ((id-a (gdocs--capability-object-entity-id a))
+        (id-b (gdocs--capability-object-entity-id b))
+        (object-kind-a (plist-get a :object-kind))
+        (object-kind-b (plist-get b :object-kind))
+        (content-a (plist-get a :content-id))
+        (content-b (plist-get b :content-id)))
+    (and id-a id-b
+         (equal id-a id-b)
+         (plist-get a :kind)
+         (equal (plist-get a :kind) (plist-get b :kind))
+         object-kind-a object-kind-b
+         (equal object-kind-a object-kind-b)
+         (stringp content-a) (stringp content-b)
+         (not (string-empty-p content-a))
+         (not (string-empty-p content-b))
+         (equal content-a content-b)
+         (gdocs--inline-object-dimension-equal-p
+          (plist-get a :width) (plist-get b :width))
+         (gdocs--inline-object-dimension-equal-p
+          (plist-get a :height) (plist-get b :height)))))
 
 (defun gdocs--capability-object-matches-p (object remote-objects)
-  "Return non-nil when OBJECT exactly matches a fresh remote object."
-  (cl-some (lambda (remote)
-             (gdocs--capability-object-equal-p object remote))
-           remote-objects))
+  "Return non-nil when OBJECT has exactly one matching remote object.
+
+This helper does not mutate REMOTE-OBJECTS, so callers needing a complete
+one-to-one proof must use `gdocs--capability-object-matching-errors'."
+  (let ((candidates
+         (cl-remove-if-not
+          (lambda (remote)
+            (equal (gdocs--capability-object-entity-id object)
+                   (gdocs--capability-object-entity-id remote)))
+          remote-objects)))
+    (and (= (length candidates) 1)
+         (gdocs--capability-object-equal-p object (car candidates)))))
 
 (defun gdocs--capability-report-range (report)
   "Return REPORT's inclusive OT range, or nil when no range is known."
@@ -4581,7 +4812,8 @@ boundary do not touch an existing capability; deletions do."
 
 The rendered Org view carries a descriptive line or embedded export token,
 while Google indexes one literal asterisk. This normalization is used only
-for diff anchoring; the original local body is never rewritten."
+for diff anchoring after capability validation; the original local body is
+never rewritten."
   (let ((text (replace-regexp-in-string
                "\\(^\\|\\n\\)#\\+gdocs_inline_object:[^\n]*"
                "\\1*" (or text ""))))
@@ -4594,7 +4826,7 @@ for diff anchoring; the original local body is never rewritten."
          (format-string
           (pcase reason
             (:local
-             "gdocs: Push refused: refusing push because the local body contains %s; image creation/replacement is not supported")
+             "gdocs: Push refused: refusing push because the local body contains %s; image creation/replacement is not supported; pull remains available")
             (:full-replace
              "gdocs: Push refused: refusing push because full-document replacement would discard %s; pull remains available and unsupported content cannot be edited safely")
             (:intersects
@@ -4607,57 +4839,45 @@ for diff anchoring; the original local body is never rewritten."
   "Validate PLAN against a fresh remote capability report.
 
 PLAN is a plist with `:kind' of `:full-replace', `:incremental', or `:noop'
-and, for incremental edits, a `:ranges' list. A full replacement is never
-allowed in the presence of destructive unsupported content. An incremental
-edit is allowed only when every report has a known range, explicitly allows
-untouched preservation, and no deletion range intersects it. The caller must
-pass STATE obtained from the current /edit fetch; raw `:ot-ops' are decoded
-again here so stale buffer-local capability metadata cannot bypass policy."
+and, for incremental edits, a `:ranges' list.  The optional
+`:inline-object-scope' value `:partial' marks an insertion payload rather than
+the complete local document.  A full replacement is never allowed in the
+presence of destructive unsupported content. An incremental edit is allowed
+only when every report has a known range, explicitly allows untouched
+preservation, and no deletion range intersects it. The caller must pass STATE
+obtained from the current /edit fetch; raw `:ot-ops' are decoded again here so
+stale buffer-local capability metadata cannot bypass policy."
   (let* ((remote (gdocs--remote-capability-analysis state))
          (local (gdocs--local-capability-analysis local-body))
          (remote-objects (plist-get remote :objects))
          (local-objects (plist-get local :objects))
+         (kind (plist-get plan :kind))
+         (object-errors
+          (append
+           (plist-get local :inline-marker-errors)
+           (gdocs--remote-inline-object-validation-errors
+            (plist-get remote :unsupported))
+           (gdocs--capability-object-matching-errors
+            local-objects remote-objects
+            (eq (plist-get plan :inline-object-scope) :partial))))
          (local-reports (plist-get local :unsupported))
-         (unmatched-local
-          (let ((remaining-remote (copy-sequence remote-objects))
-                (unmatched-objects nil))
-            ;; Consume each remote identity at most once.  Matching a local
-            ;; marker against the same remote object twice would let a
-            ;; duplicated image pass preflight even though equality later
-            ;; treats the extra paragraph as a document change.
-            (dolist (object local-objects)
-              (let ((match (seq-find
-                            (lambda (candidate)
-                              (gdocs--capability-object-equal-p
-                               object candidate))
-                            remaining-remote)))
-                (if match
-                    (setq remaining-remote (delq match remaining-remote))
-                  (push (or (seq-find
-                             (lambda (report)
-                               (and (eq (plist-get report :source)
-                                        :local-object)
-                                    (equal (plist-get report :entity-id)
-                                           (plist-get object :entity-id))))
-                             local-reports)
-                            (gdocs--local-inline-object-capability-report
-                             object))
-                        unmatched-objects))))
-            (append
-             (cl-remove-if
-              (lambda (report)
-                (eq (plist-get report :source) :local-object))
-              local-reports)
-             (nreverse unmatched-objects))))
          (reports (gdocs--capability-merge
                    (plist-get remote :unsupported)
-                   unmatched-local))
-         (kind (plist-get plan :kind)))
-    (when unmatched-local
-      (when (seq-some (lambda (report)
-                        (eq (plist-get report :source) :local-object))
-                      unmatched-local)
-        (gdocs--push-capability-summary-error unmatched-local :local)))
+                   (cl-remove-if
+                    (lambda (report)
+                      (eq (plist-get report :source) :local-object))
+                    local-reports))))
+    (when object-errors
+      (gdocs--push-capability-summary-error
+       object-errors
+       (if (and (eq kind :incremental)
+                (cl-some
+                 (lambda (report)
+                   (gdocs--capability-range-touched-p
+                    report (plist-get plan :ranges)))
+                 object-errors))
+           :intersects
+         :local)))
     (unless (eq kind :noop)
       (cond
        ((eq kind :full-replace)
@@ -4706,6 +4926,11 @@ again here so stale buffer-local capability metadata cannot bypass policy."
                          :ot-end ot-position
                          :insert-at ot-position
                          :delete-count 0))))
+      ;; TEXT is only the inserted payload, not the complete local document.
+      ;; Its absence of image markers therefore cannot prove that existing
+      ;; remote images were deleted, while any marker in the payload is an
+      ;; unsupported image creation/duplication attempt.
+      (setq plan (plist-put plan :inline-object-scope :partial))
       (gdocs--push-preflight state text plan))))
 
 (defun gdocs--push-plan-ranges (state remote-body local-body)
@@ -4786,29 +5011,55 @@ again here so stale buffer-local capability metadata cannot bypass policy."
 
 (defun gdocs--push-plan-for-diff (state local-body remote-body)
   "Return the preflight plan for the configured push backend."
-  (let* ((local-stripped
-          (gdocs--inline-markers-as-ot-placeholders
-           (car (gdocs--strip-heading-drawers local-body))))
-         (remote-mappable
-          (gdocs--inline-markers-as-ot-placeholders remote-body))
-         ;; Placeholder normalization intentionally hides image metadata and
-         ;; therefore cannot establish a no-op on its own.  Decode the models
-         ;; before treating equal placeholder text as unchanged.
-         (model-requires-full
-          (gdocs--incremental-needs-full-replace-p state local-body))
-         (kind
-          (cond
-           ((and (string= remote-mappable local-stripped)
-                 (not model-requires-full))
-            :noop)
-           ((eq gdocs-push-backend 'ot-encode) :full-replace)
-           ((and (eq gdocs-push-backend 'ot-incremental)
-                 model-requires-full)
-            :full-replace)
-           (t :incremental))))
-    (list :kind kind
-          :ranges (and (eq kind :incremental)
-                       (gdocs--push-plan-ranges state remote-body local-body)))))
+  ;; Validate the complete marker representation before replacing any marker
+  ;; with a literal OT placeholder.  Invalid representations still return a
+  ;; conservative plan so callers can run the normal preflight and receive a
+  ;; sanitized error, but no marker text is normalized on this path.
+  (let* ((remote-analysis (gdocs--remote-capability-analysis state))
+         (local-analysis (gdocs--local-capability-analysis local-body))
+         (object-errors
+          (append
+           (plist-get local-analysis :inline-marker-errors)
+           (gdocs--remote-inline-object-validation-errors
+            (plist-get remote-analysis :unsupported))
+           (gdocs--capability-object-matching-errors
+            (plist-get local-analysis :objects)
+            (plist-get remote-analysis :objects)))))
+    (if object-errors
+        ;; Preserve the backend's conservative plan shape for diagnostics and
+        ;; range-aware callers, while still skipping normalization and relying
+        ;; on preflight to reject the invalid representation.
+        (let ((kind (if (memq gdocs-push-backend '(ot-encode ot-incremental))
+                        :full-replace
+                      :incremental)))
+          (list :kind kind
+                :ranges (and (eq kind :incremental)
+                             (gdocs--capability-object-error-ranges
+                              object-errors))))
+      (let* ((local-stripped
+              (gdocs--inline-markers-as-ot-placeholders
+               (car (gdocs--strip-heading-drawers local-body))))
+             (remote-mappable
+              (gdocs--inline-markers-as-ot-placeholders remote-body))
+             ;; Placeholder normalization intentionally hides image metadata
+             ;; and therefore cannot establish a no-op on its own.  Decode the
+             ;; models before treating equal placeholder text as unchanged.
+             (model-requires-full
+              (gdocs--incremental-needs-full-replace-p state local-body))
+             (kind
+              (cond
+               ((and (string= remote-mappable local-stripped)
+                     (not model-requires-full))
+                :noop)
+               ((eq gdocs-push-backend 'ot-encode) :full-replace)
+               ((and (eq gdocs-push-backend 'ot-incremental)
+                     model-requires-full)
+                :full-replace)
+               (t :incremental))))
+        (list :kind kind
+              :ranges (and (eq kind :incremental)
+                           (gdocs--push-plan-ranges
+                            state remote-body local-body)))))))
 
 (defun gdocs--assert-push-safe (state &optional local-body)
   "Compatibility guard for callers that require full-replacement safety.

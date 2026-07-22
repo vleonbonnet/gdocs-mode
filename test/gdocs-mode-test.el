@@ -104,6 +104,23 @@
                             ("ambiguous-image-attachment" . "inline-image-ambiguous"))))))
     (and file (gdocs-test--fixture file))))
 
+(defun gdocs-test--inline-state (name)
+  "Return a push state for inline-image fixture NAME."
+  (let* ((fixture (gdocs-test--inline-case name))
+         (body (plist-get fixture :body)))
+    (list :revision 17
+          :ot-body body
+          :ot-ops (plist-get fixture :ops))))
+
+(defun gdocs-test--inline-markers (text)
+  "Return standalone inline-object marker lines in TEXT."
+  (let ((start 0)
+        markers)
+    (while (string-match "^#\\+gdocs_inline_object:[^\n]*" text start)
+      (push (match-string 0 text) markers)
+      (setq start (match-end 0)))
+    (nreverse markers)))
+
 (defun gdocs-test--fixture-html (fixture)
   "Turn the model chunks in FIXTURE into synthetic edit-page HTML."
   (mapconcat
@@ -574,6 +591,10 @@ END is the inclusive final OT position."
                             (gdocs-dm-make-run "After")))))
     (should (equal (gdocs--inline-object-identity object)
                    (gdocs--inline-object-identity same-object)))
+    (should (gdocs--capability-object-equal-p object same-object))
+    ;; Integer and float dimension encodings are equivalent under the exact
+    ;; numeric preservation policy.
+    (should (gdocs--capability-object-equal-p object standalone-local))
     (should (gdocs--paragraph-equal-p standalone-remote standalone-local))
     (should (gdocs--paragraph-equal-p embedded-remote embedded-local))
     (dolist (field-values '((:entity-id "other-entity")
@@ -586,7 +607,8 @@ END is the inclusive final OT position."
         (should-not
          (gdocs--run-text-equal-p
           (list :inline-object object)
-          (list :inline-object changed)))))
+          (list :inline-object changed)))
+        (should-not (gdocs--capability-object-equal-p object changed))))
     ;; Object order and surrounding text remain part of paragraph equality.
     (should-not
      (gdocs--paragraph-equal-p
@@ -1918,6 +1940,133 @@ END is the inclusive final OT position."
         (should (eq (plist-get plan :kind) :full-replace))
         (should-error (gdocs--push-preflight state local plan)
                       :type 'user-error)))))
+
+(ert-deftest gdocs-test-inline-object-preflight-is-one-to-one-and-sanitized ()
+  "Inline markers must preserve the remote object set exactly once and in order."
+  (let* ((gdocs-push-backend 'ot-incremental)
+         (state (gdocs-test--inline-state "one-image-between-paragraphs"))
+         (remote (gdocs-dm-to-org
+                  (gdocs-dm-from-ops nil nil nil
+                                     (plist-get state :ot-body)
+                                     (plist-get state :ot-ops))))
+         (marker (car (gdocs-test--inline-markers remote)))
+         (changed-text (replace-regexp-in-string
+                        "Before" "Changed" remote))
+         (safe-plan '(:kind :incremental
+                            :ranges ((:ot-start 1 :ot-end 1
+                                                :insert-at 1 :delete-count 0)))))
+    ;; One local marker consumes the one matching remote object.
+    (should (gdocs--push-preflight state changed-text safe-plan))
+    ;; A copied marker has an ID that is not present in this document.
+    (let* ((other-state (gdocs-test--inline-state "multiple-images-not-entity-order"))
+           (other-remote (gdocs-dm-to-org
+                          (gdocs-dm-from-ops nil nil nil
+                                             (plist-get other-state :ot-body)
+                                             (plist-get other-state :ot-ops))))
+           (copied (car (gdocs-test--inline-markers other-remote))))
+      (should-error
+       (gdocs--push-preflight
+        state (concat "Before\n" copied "\nAfter\n") safe-plan)
+       :type 'user-error))
+    ;; Duplicating a marker cannot consume the same remote object twice.
+    (should-error
+     (gdocs--push-preflight
+      state (concat "Before\n" marker "\n" marker "\nAfter\n") safe-plan)
+     :type 'user-error)
+    ;; A legacy state carrying duplicate remote IDs is rejected as well.
+    (let* ((remote-object
+            (car (plist-get (gdocs--remote-capability-analysis state)
+                            :objects)))
+           (duplicate-state
+            (list :ot-body (plist-get state :ot-body)
+                  :inline-objects
+                  (list remote-object (copy-sequence remote-object)))))
+      (should-error
+       (gdocs--push-preflight duplicate-state remote safe-plan)
+       :type 'user-error))
+    ;; Removing the marker leaves a remote object with no local representation.
+    (should-error
+     (gdocs--push-preflight
+      state (replace-regexp-in-string
+             (concat (regexp-quote marker) "\n") "" remote)
+      safe-plan)
+     :type 'user-error)
+    ;; Immutable content metadata is compared after ID pairing.
+    (let ((message nil))
+      (condition-case err
+          (gdocs--push-preflight
+           state
+           (replace-regexp-in-string
+            "s-blob-v1-IMAGE-synthetic-one"
+            "s-blob-v1-IMAGE-changed" remote)
+           safe-plan)
+        (user-error (setq message (error-message-string err))))
+      (should (string-match-p "1 inline image" message))
+      (should-not (string-match-p "kix\.synthetic\|s-blob-v1" message)))
+    ;; Two distinct IDs pair with two distinct remote objects.
+    (let* ((multiple-state
+            (gdocs-test--inline-state "multiple-images-not-entity-order"))
+           (multiple-remote (gdocs-dm-to-org
+                             (gdocs-dm-from-ops
+                              nil nil nil
+                              (plist-get multiple-state :ot-body)
+                              (plist-get multiple-state :ot-ops))))
+           (multiple-plan
+            (gdocs--push-plan-for-diff
+             multiple-state
+             (concat "Changed\n" (substring multiple-remote (length "One\n")))
+             multiple-remote)))
+      (should (eq (plist-get multiple-plan :kind) :incremental))
+      (should (gdocs--push-preflight
+               multiple-state
+               (concat "Changed\n" (substring multiple-remote (length "One\n")))
+               multiple-plan)))
+    ;; Identity matching alone must not permit moving objects.
+    (let* ((multiple-state
+            (gdocs-test--inline-state "multiple-images-not-entity-order"))
+           (multiple-remote (gdocs-dm-to-org
+                             (gdocs-dm-from-ops
+                              nil nil nil
+                              (plist-get multiple-state :ot-body)
+                              (plist-get multiple-state :ot-ops))))
+           (markers (gdocs-test--inline-markers multiple-remote))
+           (first (car markers))
+           (second (cadr markers))
+           (reordered (replace-regexp-in-string
+                       (regexp-quote first) "gdocs-test-temporary-marker"
+                       multiple-remote))
+           (reordered (replace-regexp-in-string
+                       (regexp-quote second) first reordered))
+           (reordered (replace-regexp-in-string
+                       "gdocs-test-temporary-marker" second reordered)))
+      (should-error
+       (gdocs--push-preflight multiple-state reordered safe-plan)
+       :type 'user-error))))
+
+(ert-deftest gdocs-test-inline-object-plan-does-not-normalize-before-validation ()
+  "Invalid marker sets are rejected before placeholder normalization."
+  (let* ((state (gdocs-test--inline-state "one-image-between-paragraphs"))
+         (remote (gdocs-dm-to-org
+                  (gdocs-dm-from-ops nil nil nil
+                                     (plist-get state :ot-body)
+                                     (plist-get state :ot-ops))))
+         (marker (car (gdocs-test--inline-markers remote)))
+         (duplicate (concat "Before\n" marker "\n" marker "\nAfter\n")))
+    (cl-letf (((symbol-function 'gdocs--inline-markers-as-ot-placeholders)
+               (lambda (&rest _args)
+                 (error "placeholder normalization ran too early"))))
+      (let ((plan (gdocs--push-plan-for-diff state duplicate remote)))
+        (should (memq (plist-get plan :kind) '(:incremental :full-replace)))))
+    (let* ((plain-state '(:ot-body "plain\n" :ot-ops nil))
+           (malformed "#+gdocs_inline_object: not-an-image-marker\n"))
+      (should-error
+       (gdocs--push-preflight plain-state malformed '(:kind :noop))
+       :type 'user-error))))
+
+(ert-deftest gdocs-test-inline-object-insertion-allows-literal-star ()
+  "An ordinary literal star insertion is not mistaken for an image marker."
+  (let ((state (gdocs-test--inline-state "one-image-between-paragraphs")))
+    (should (gdocs--push-preflight-insertion state 1 "*"))))
 
 (ert-deftest gdocs-test-locate-edit-through-structural-ot-map ()
   "An edit in plain text maps back to its OT positions."
