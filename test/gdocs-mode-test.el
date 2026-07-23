@@ -141,6 +141,26 @@
   "Construct an OT insert operation for BODY."
   `((ty . "is") (s . ,body)))
 
+(defun gdocs-test--push-state (revision remote-body &optional ot-body)
+  "Build a small push state with an independently configurable OT body."
+  (let ((ot-body (or ot-body remote-body)))
+    (list :revision revision
+          :remote-body remote-body
+          :ot-body ot-body
+          :ot-ops (list (gdocs-test--insert-op ot-body)))))
+
+(defun gdocs-test--apply-plain-op (body op)
+  "Apply a simple one-operation OT command to BODY for transport tests."
+  (pcase (alist-get 'ty op)
+    ("ds"
+     (concat (substring body 0 (1- (alist-get 'si op)))
+             (substring body (alist-get 'ei op))))
+    ("is"
+     (concat (substring body 0 (1- (alist-get 'ibi op)))
+             (alist-get 's op)
+             (substring body (1- (alist-get 'ibi op)))))
+    (_ (error "Unsupported synthetic test operation: %S" op))))
+
 (defun gdocs-test--style-modifier (styles)
   "Construct a compact text style modifier for STYLES.
 
@@ -2586,6 +2606,395 @@ that a removed preflight guard would be observed as an unexpected success."
       (gdocs--push-remotely-async-1 "synthetic-id" nil "7" "local")
       (should-not applied)
       (should-not gdocs--sync-mutex))))
+
+(ert-deftest gdocs-test-throttle-retry-replans-against-unchanged-body ()
+  "A throttled save retries only after rebuilding its OT position."
+  (let* ((gdocs--rate-limit-retry-delay 0)
+         (state (gdocs-test--push-state 1 "A" "A"))
+         ;; Same visible body, but a newer OT snapshot with one extra
+         ;; structural codepoint changes the append position.
+         (refetched (gdocs-test--push-state 1 "A" "A*"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan
+              fresh-state fresh-body "!" :append))))
+         (save-count 0)
+         (fetch-count 0)
+         (sent nil)
+         (planner-snapshots nil)
+         (insertion-preflight-count 0)
+         (original-insertion-preflight
+          (symbol-function 'gdocs--push-preflight-insertion)))
+    (cl-letf (((symbol-function 'gdocs--save-request)
+               (lambda (_doc _state commands)
+                 (cl-incf save-count)
+                 (push commands sent)
+                 (if (= save-count 1)
+                     (signal 'gdocs-save-rejected
+                             '(:http-code 550 :err-code 13 :di 1))
+                   '((metadata . ((serverRevision . 2)))))))
+              ((symbol-function 'gdocs--fetch-edit-state)
+               (lambda (_doc)
+                 (cl-incf fetch-count)
+                 refetched))
+              ((symbol-function 'gdocs--push-preflight-insertion)
+               (lambda (&rest args)
+                 (cl-incf insertion-preflight-count)
+                 (apply original-insertion-preflight args))))
+      ;; Record the actual planner input separately from the save command.
+      (let ((original-replan (plist-get intent :replan)))
+        (setq intent
+              (plist-put
+               intent :replan
+               (lambda (fresh-state fresh-body)
+                 (push (list (plist-get fresh-state :ot-body) fresh-body)
+                       planner-snapshots)
+                 (funcall original-replan fresh-state fresh-body))))
+        (should (= (gdocs--run-op "synthetic" state intent) 2)))
+      (should (= save-count 2))
+      (should (= fetch-count 1))
+      (should (= insertion-preflight-count 2))
+      (should (equal (mapcar (lambda (commands)
+                               (alist-get 'ibi (car commands)))
+                             (nreverse sent))
+                     '(2 3)))
+      (should (equal (mapcar #'car (nreverse planner-snapshots))
+                     '("A" "A*"))))))
+
+(ert-deftest gdocs-test-throttle-retry-with-concurrent-text-change-aborts ()
+  "A body change observed after a throttle is a conflict, not a retry."
+  (let* ((gdocs--rate-limit-retry-delay 0)
+         (state (gdocs-test--push-state 1 "A"))
+         (changed (gdocs-test--push-state 2 "AX"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan
+              fresh-state fresh-body "!" :append))))
+         (save-count 0)
+         (message nil))
+    (cl-letf (((symbol-function 'gdocs--save-request)
+               (lambda (&rest _args)
+                 (cl-incf save-count)
+                 (signal 'gdocs-save-rejected
+                         '(:http-code 550 :err-code 13 :di 1))))
+              ((symbol-function 'gdocs--fetch-edit-state)
+               (lambda (_doc) changed)))
+      (condition-case err
+          (gdocs--run-op "synthetic" state intent)
+        (user-error (setq message (error-message-string err))))
+      (should (string-match-p "conflict" message))
+      (should (= save-count 1)))))
+
+(ert-deftest gdocs-test-throttle-accepts-committed-post-body-without-replay ()
+  "A throttled request already visible remotely is not sent a second time."
+  (let* ((gdocs--rate-limit-retry-delay 0)
+         (state (gdocs-test--push-state 1 "A"))
+         (committed (gdocs-test--push-state 2 "A!" "A!"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan
+              fresh-state fresh-body "!" :append))))
+         (save-count 0))
+    (cl-letf (((symbol-function 'gdocs--save-request)
+               (lambda (&rest _args)
+                 (cl-incf save-count)
+                 (signal 'gdocs-save-rejected
+                         '(:http-code 550 :err-code 13 :di 1))))
+              ((symbol-function 'gdocs--fetch-edit-state)
+               (lambda (_doc) committed)))
+      (should (= (gdocs--run-op "synthetic" state intent) 2)))
+    (should (= save-count 1))))
+
+(ert-deftest gdocs-test-throttle-retry-with-new-image-aborts-before-delete ()
+  "A newly inserted remote image prevents replaying an ambiguous delete."
+  (let* ((gdocs--rate-limit-retry-delay 0)
+         (initial (gdocs-test--push-state 1 "Before\nAfter\n"))
+         (region (gdocs--diff-single-region "Before\nAfter\n" "After\n"))
+         (selector (gdocs--push-region-selector region))
+         (fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
+         (image-state
+          (list :revision 2
+                :remote-body
+                (gdocs-dm-to-org
+                 (gdocs-dm-from-ops
+                  2 "synthetic" nil
+                  (plist-get fixture :body)
+                  (plist-get fixture :ops)))
+                :ot-body (plist-get fixture :body)
+                :ot-ops (plist-get fixture :ops)))
+         (intent
+          (gdocs--make-push-intent
+           initial "After\n" "Before\nAfter\n"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-region-plan
+              fresh-state fresh-body "After\n" selector :delete))))
+         (save-count 0)
+         (message nil))
+    (cl-letf (((symbol-function 'gdocs--save-request)
+               (lambda (&rest _args)
+                 (cl-incf save-count)
+                 (signal 'gdocs-save-rejected
+                         '(:http-code 550 :err-code 13 :di 1))))
+              ((symbol-function 'gdocs--fetch-edit-state)
+               (lambda (_doc) image-state)))
+      (condition-case err
+          (gdocs--run-op "synthetic" initial intent)
+        (user-error (setq message (error-message-string err))))
+      (should (string-match-p "conflict" message))
+      ;; The failed delete was never replayed against the image-bearing state.
+      (should (= save-count 1)))))
+
+(ert-deftest gdocs-test-async-throttle-retry-callback-fires-once ()
+  "Async throttle verification and replanning complete exactly once."
+  (let* ((gdocs--rate-limit-retry-delay 0)
+         (state (gdocs-test--push-state 1 "A" "A"))
+         (refetched (gdocs-test--push-state 1 "A" "A*"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan
+              fresh-state fresh-body "!" :append))))
+         (save-count 0)
+         (fetch-count 0)
+         (callback-count 0)
+         (callback-revision nil)
+         (callback-error :unset))
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (_delay _repeat function &rest args)
+                 (apply function args)))
+              ((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (cl-incf save-count)
+                 (if (= save-count 1)
+                     (funcall callback nil
+                              '(:http-code 550 :err-code 13 :di 1))
+                   (funcall callback
+                            '((metadata . ((serverRevision . 2))))
+                            nil))))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback)
+                 (cl-incf fetch-count)
+                 (funcall callback refetched nil))))
+      (gdocs--run-op-async
+       "synthetic" state intent
+       (lambda (revision err)
+         (cl-incf callback-count)
+         (setq callback-revision revision
+               callback-error err))))
+    (should (= save-count 2))
+    (should (= fetch-count 1))
+    (should (= callback-count 1))
+    (should (= callback-revision 2))
+    (should-not callback-error)))
+
+(ert-deftest gdocs-test-async-partial-success-reports-committed-revision ()
+  "A failed insertion reports the preceding committed delete revision."
+  (let* ((gdocs--rate-limit-retry-delay 0)
+         (state (gdocs-test--push-state 1 "old\n"))
+         (after-delete (gdocs-test--push-state 2 "\n"))
+         (target "new\n")
+         (region (gdocs--diff-single-region "old\n" target))
+         (save-count 0)
+         (fetch-count 0)
+         (callback-count 0)
+         (committed-revision nil)
+         (callback-error nil))
+    (cl-letf (((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (cl-incf save-count)
+                 (if (= save-count 1)
+                     (funcall callback
+                              '((metadata . ((serverRevision . 2)))) nil)
+                   (funcall callback nil
+                            '(:http-code 500 :err-code 9)))))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback)
+                 (cl-incf fetch-count)
+                 (funcall callback after-delete nil))))
+      (gdocs--apply-in-place-region-async
+       "synthetic" state "old\n" region nil
+       (lambda (revision err)
+         (cl-incf callback-count)
+         (setq committed-revision revision
+               callback-error err))))
+    (should (= callback-count 1))
+    (should (= committed-revision 2))
+    (should (string-match-p "http 500" callback-error))
+    ;; The delete verification fetch happened; the insertion failed and was
+    ;; not treated as a successful final baseline.
+    (should (= fetch-count 1))))
+
+(ert-deftest gdocs-test-multi-regions-accepts-own-prior-change-and-replans ()
+  "Each multi-region boundary accepts the prior change and rebuilds ranges."
+  (let* ((gdocs-push-backend 'plain)
+         (gdocs--inter-region-delay 0)
+         (remote-body "one\n\ntwo\n\nthree\n")
+         (target-body "ONE\n\ntwo\n\nTHREE\n")
+         (state (gdocs-test--push-state 1 remote-body))
+         (current-body remote-body)
+         (current-revision 1)
+         (save-count 0)
+         (fetch-count 0))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_REVISION: 1\n:END:\n\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--save-request)
+                 (lambda (_doc _state commands)
+                   (cl-incf save-count)
+                   (setq current-body
+                         (gdocs-test--apply-plain-op
+                          current-body (car commands)))
+                   (cl-incf current-revision)
+                   `((metadata . ((serverRevision . ,current-revision))))))
+                ((symbol-function 'gdocs--fetch-edit-state)
+                 (lambda (_doc)
+                   (cl-incf fetch-count)
+                   (gdocs-test--push-state
+                    current-revision current-body))))
+        (should (= (gdocs--apply-push
+                    "synthetic" state target-body remote-body)
+                   5))))
+    (should (equal current-body target-body))
+    ;; Two regions, each ds+is, plus one boundary refetch before region two.
+    (should (= save-count 4))
+    (should (= fetch-count 5))))
+
+(ert-deftest gdocs-test-multi-regions-aborts-on-boundary-concurrent-change ()
+  "A change between verified multi-region operations fails closed."
+  (let* ((gdocs-push-backend 'plain)
+         (gdocs--inter-region-delay 0)
+         (remote-body "one\n\ntwo\n\nthree\n")
+         (target-body "ONE\n\ntwo\n\nTHREE\n")
+         (state (gdocs-test--push-state 1 remote-body))
+         (current-body remote-body)
+         (current-revision 1)
+         (save-count 0)
+         (fetch-count 0)
+         (message nil))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_REVISION: 1\n:END:\n\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--save-request)
+                 (lambda (_doc _state commands)
+                   (cl-incf save-count)
+                   (setq current-body
+                         (gdocs-test--apply-plain-op
+                          current-body (car commands)))
+                   (cl-incf current-revision)
+                   `((metadata . ((serverRevision . ,current-revision))))))
+                ((symbol-function 'gdocs--fetch-edit-state)
+                 (lambda (_doc)
+                   (cl-incf fetch-count)
+                   (if (= fetch-count 3)
+                       (gdocs-test--push-state
+                        (1+ current-revision)
+                        (concat "REMOTE\n" current-body))
+                     (gdocs-test--push-state
+                      current-revision current-body)))))
+        (condition-case err
+            (gdocs--apply-push "synthetic" state target-body remote-body)
+          (user-error (setq message (error-message-string err)))))
+      (should (string-match-p "unexpected remote content" message))
+      ;; The first region committed, but the second region was never sent.
+      (should (= save-count 2))
+      (should (= fetch-count 3)))))
+
+(ert-deftest gdocs-test-async-multi-regions-refetches-boundary ()
+  "The async multi-region path verifies each fresh boundary as well."
+  (let* ((gdocs-push-backend 'plain)
+         (gdocs--inter-region-delay 0)
+         (remote-body "one\n\ntwo\n\nthree\n")
+         (target-body "ONE\n\ntwo\n\nTHREE\n")
+         (state (gdocs-test--push-state 1 remote-body))
+         (current-body remote-body)
+         (current-revision 1)
+         (save-count 0)
+         (fetch-count 0)
+         (callback-count 0)
+         (callback-revision nil)
+         (callback-error nil))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_REVISION: 1\n:END:\n\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'run-with-timer)
+                 (lambda (_delay _repeat function &rest args)
+                   (apply function args)))
+                ((symbol-function 'gdocs--save-request-async)
+                 (lambda (_doc _state commands callback)
+                   (cl-incf save-count)
+                   (setq current-body
+                         (gdocs-test--apply-plain-op
+                          current-body (car commands)))
+                   (cl-incf current-revision)
+                   (funcall callback
+                            `((metadata . ((serverRevision . ,current-revision))))
+                            nil)))
+                ((symbol-function 'gdocs--fetch-edit-state-async)
+                 (lambda (_doc callback)
+                   (cl-incf fetch-count)
+                   (funcall callback
+                            (gdocs-test--push-state
+                             current-revision current-body)
+                            nil))))
+        (gdocs--apply-push-async
+         "synthetic" state target-body remote-body (current-buffer)
+         (lambda (revision err)
+           (cl-incf callback-count)
+           (setq callback-revision revision
+                 callback-error err))))
+      (should (= callback-count 1))
+      (should (= callback-revision 5))
+      (should-not callback-error))
+    (should (equal current-body target-body))
+    (should (= save-count 4))
+    (should (= fetch-count 5))))
+
+(ert-deftest gdocs-test-deletion-preflight-reruns-after-throttle-refetch ()
+  "Deletion capability analysis runs again before a rebuilt delete."
+  (let* ((gdocs--rate-limit-retry-delay 0)
+         (state (gdocs-test--push-state 1 "AB" "AB"))
+         (refetched (gdocs-test--push-state 1 "AB" "*AB"))
+         (region (gdocs--diff-single-region "AB" "B"))
+         (selector (gdocs--push-region-selector region))
+         (intent
+          (gdocs--make-push-intent
+           state "B" "AB"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-region-plan
+              fresh-state fresh-body "B" selector :delete))))
+         (save-count 0)
+         (preflight-count 0)
+         (commands-seen nil)
+         (original-preflight (symbol-function 'gdocs--push-preflight)))
+    (cl-letf (((symbol-function 'gdocs--save-request)
+               (lambda (_doc _state commands)
+                 (cl-incf save-count)
+                 (push commands commands-seen)
+                 (if (= save-count 1)
+                     (signal 'gdocs-save-rejected
+                             '(:http-code 550 :err-code 13 :di 1))
+                   '((metadata . ((serverRevision . 2)))))))
+              ((symbol-function 'gdocs--fetch-edit-state)
+               (lambda (_doc) refetched))
+              ((symbol-function 'gdocs--push-preflight)
+               (lambda (&rest args)
+                 (cl-incf preflight-count)
+                 (apply original-preflight args))))
+      (should (= (gdocs--run-op "synthetic" state intent) 2)))
+    (should (= save-count 2))
+    (should (= preflight-count 2))
+    ;; The fresh leading OT codepoint forces a newly mapped delete position.
+    (should (equal (mapcar (lambda (commands)
+                             (alist-get 'si (car commands)))
+                           (nreverse commands-seen))
+                   '(1 2)))))
 
 (ert-deftest gdocs-test-push-preflight-noop-and-dirty-dispatch ()
   "Matching revision performs a no-op or dispatches dirty content offline."

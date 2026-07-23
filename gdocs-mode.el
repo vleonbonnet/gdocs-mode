@@ -6114,52 +6114,534 @@ On curl error, ERR is a string."
                      :body (substring body 0
                                       (min 300 (length body)))))))))
 
+(defun gdocs--push-comparison-body (body)
+  "Return the canonical body representation used for push verification.
+
+Heading drawers and inline-object display markers are not part of Google's
+OT text.  They must be removed in the same way when comparing a freshly
+fetched state with the high-level push intent; otherwise a successful retry
+could be mistaken for an unrelated change merely because the renderer uses a
+different Org representation."
+  (gdocs--inline-markers-as-ot-placeholders
+   (car (gdocs--strip-heading-drawers (or body "")))))
+
+(defun gdocs--remote-org-body-from-state (doc-id state)
+  "Render STATE's current OT stream as an Org body.
+
+This is deliberately derived from the raw operations on every refetch.  A
+retry must not use the body or capability information captured before the
+refetch.  Synthetic tests may provide `:remote-body' directly, but real edit
+states always contain `:ot-body' and `:ot-ops'."
+  (when state
+    (or (plist-get state :remote-body)
+        (let ((doc (gdocs-dm-from-ops
+                    (plist-get state :revision)
+                    doc-id
+                    (plist-get state :title)
+                    (or (plist-get state :ot-body) "")
+                    (or (plist-get state :ot-ops) nil))))
+          (gdocs-dm-to-org doc)))))
+
+(defun gdocs--push-state-body (doc-id state)
+  "Return STATE's canonical remote body, or nil when it cannot be decoded."
+  (and state
+       (condition-case _
+           (gdocs--push-comparison-body
+            (gdocs--remote-org-body-from-state doc-id state))
+         (error nil))))
+
+(defun gdocs--push-revisions-equal-p (a b)
+  "Return non-nil when revision values A and B represent the same revision."
+  (and a b (string= (format "%s" a) (format "%s" b))))
+
+(defun gdocs--push-next-revision (revision)
+  "Return the expected next revision for numeric REVISION, or nil."
+  (cond
+   ((integerp revision) (1+ revision))
+   ((and (stringp revision)
+         (string-match-p "\\`[0-9]+\\'" revision))
+    (number-to-string (1+ (string-to-number revision))))
+   (t nil)))
+
+(defun gdocs--push-apply-region-body (body region)
+  "Apply REGION's high-level text replacement to canonical BODY."
+  (let ((start (plist-get region :start))
+        (rem-end (plist-get region :rem-end))
+        (inserted (or (plist-get region :inserted) "")))
+    (concat (substring body 0 start)
+            inserted
+            (substring body rem-end))))
+
+(defun gdocs--push-target-body-from-regions (remote-body regions)
+  "Reconstruct a target body from high-level REGIONS for legacy callers.
+
+REGIONS are applied latest-first, so an edit to a later position cannot shift
+the original coordinates of an earlier region.  Normal push callers pass the
+complete local body directly; this fallback keeps the low-level multi-region
+helper safe when only its historical REGION argument is available."
+  (let ((target (gdocs--push-comparison-body remote-body)))
+    (dolist (region regions target)
+      (setq target (gdocs--push-apply-region-body target region)))))
+
+(defun gdocs--push-region-list
+    (remote-body target-body &optional selector)
+  "Return high-level regions needed to turn REMOTE-BODY into TARGET-BODY.
+
+When SELECTOR is supplied, prefer the contracted single-region diff if it
+identifies that selector.  Paragraph-level diffs intentionally expand a
+single paragraph replacement, but a retry of that operation must preserve
+the original high-level edit rather than switch to the whole paragraph."
+  (let* ((remote (gdocs--push-comparison-body remote-body))
+         (target (gdocs--push-comparison-body target-body))
+         (paragraphs (gdocs--diff-paragraphs remote target))
+         (single (gdocs--diff-single-region remote target)))
+    (if (and selector single
+             (listp selector)
+             (= (plist-get single :start) (plist-get selector :start))
+             (equal (or (plist-get single :deleted) "")
+                    (or (plist-get selector :deleted) ""))
+             (equal (or (plist-get single :inserted) "")
+                    (or (plist-get selector :inserted) "")))
+        (list single)
+      (or paragraphs (and single (list single))))))
+
+(defun gdocs--push-region-selector (region)
+  "Return a content selector for REGION, not a reusable OT position."
+  (list :start (plist-get region :start)
+        :deleted (or (plist-get region :deleted) "")
+        :inserted (or (plist-get region :inserted) "")))
+
+(defun gdocs--push-select-region (regions selector)
+  "Select a freshly computed region from REGIONS using high-level SELECTOR.
+
+SELECTOR may be an integer index in latest-first order or a content selector.
+The returned region is always an object from the current diff; no positional
+fields from a previous plan are reused as an OT operation."
+  (cond
+   ((integerp selector)
+    (or (nth selector (nreverse (copy-sequence regions)))
+        (user-error "gdocs: could not replan the requested edit region")))
+   ((listp selector)
+    (let* ((matches
+            (cl-remove-if-not
+             (lambda (candidate)
+               (and (= (plist-get candidate :start)
+                       (plist-get selector :start))
+                    (equal (or (plist-get candidate :deleted) "")
+                           (or (plist-get selector :deleted) ""))
+                    (equal (or (plist-get candidate :inserted) "")
+                           (or (plist-get selector :inserted) ""))))
+             regions))
+           (same-start
+            (cl-find-if
+             (lambda (candidate)
+               (= (plist-get candidate :start)
+                  (plist-get selector :start)))
+             matches)))
+      (or same-start
+          (and (= (length matches) 1) (car matches))
+          (user-error "gdocs: could not uniquely replan the requested edit region"))))
+   (t
+    (user-error "gdocs: invalid edit-region selector %S" selector))))
+
+(defun gdocs--push-region-plan
+    (state remote-body target-body selector stage)
+  "Build a fresh positional plan for one high-level region.
+
+STATE and REMOTE-BODY are the same current snapshot.  TARGET-BODY is the
+complete desired canonical body.  STAGE is `:delete' or `:insert'."
+  (let* ((remote (gdocs--push-comparison-body remote-body))
+         (target (gdocs--push-comparison-body target-body))
+         (regions (gdocs--push-region-list remote target selector))
+         (region (and regions (gdocs--push-select-region regions selector)))
+         (start (and region (plist-get region :start)))
+         (rem-end (and region (plist-get region :rem-end)))
+         (deleted (and region (or (plist-get region :deleted) "")))
+         (inserted (and region (or (plist-get region :inserted) "")))
+         (ot-body (plist-get state :ot-body))
+         (ot-range
+          (and region
+               (or (gdocs--locate-edit-in-ot
+                    ot-body remote start rem-end)
+                   ;; A pure insertion at the end has no surviving plain
+                   ;; character to anchor through the segment map.  The end
+                   ;; of the OT body is nevertheless an unambiguous position.
+                   (and (= start rem-end)
+                        (= start (length remote))
+                        (cons (1+ (length (or ot-body "")))
+                              (1+ (length (or ot-body ""))))))))
+         (ot-start (and ot-range (car ot-range)))
+         (ot-end (and ot-range (cdr ot-range)))
+         (kind (if (eq stage :delete) :delete :insert)))
+    (unless (and region ot-range)
+      (user-error "gdocs: could not locate edit context uniquely in OT body"))
+    (when (and (eq kind :delete) (zerop (length deleted)))
+      (user-error "gdocs: deletion plan contains no deleted content"))
+    (when (and (eq kind :insert) (zerop (length inserted)))
+      (user-error "gdocs: insertion plan contains no inserted content"))
+    (list :kind kind
+          :op (if (eq kind :delete)
+                  `((ty . "ds") (si . ,ot-start) (ei . ,(1- ot-end)))
+                `((ty . "is") (ibi . ,ot-start) (s . ,inserted)))
+          :ot-start ot-start
+          :ot-end ot-end
+          :deleted deleted
+          :inserted inserted
+          :region region
+          :post-body (if (eq kind :delete)
+                         (gdocs--push-apply-region-body remote
+                                                        (list :start start
+                                                              :rem-end rem-end
+                                                              :inserted ""))
+                       (gdocs--push-apply-region-body remote
+                                                      (list :start start
+                                                            :rem-end start
+                                                            :inserted inserted)))
+          :preflight-plan
+          (list :kind :incremental
+                :ranges
+                (list (list :ot-start ot-start
+                            :ot-end (if (eq kind :delete)
+                                        (1- ot-end)
+                                      ot-start)
+                            :insert-at ot-start
+                            :delete-count (if (eq kind :delete)
+                                              (length deleted)
+                                            0)))))))
+
+(defun gdocs--push-insert-plan (state remote-body text mode)
+  "Build a fresh prepend/append insertion plan against STATE."
+  (let* ((remote (gdocs--push-comparison-body remote-body))
+         (ot-body (or (plist-get state :ot-body) ""))
+         (ot-start (if (eq mode :prepend) 1 (1+ (length ot-body)))))
+    (list :kind :insert
+          :op `((ty . "is") (ibi . ,ot-start) (s . ,text))
+          :ot-start ot-start
+          :inserted text
+          :post-body (if (eq mode :prepend)
+                         (concat text remote)
+                       (concat remote text))
+          :preflight-plan
+          (list :kind :incremental
+                :ranges (list (list :ot-start ot-start
+                                    :ot-end ot-start
+                                    :insert-at ot-start
+                                    :delete-count 0))))))
+
+(defun gdocs--push-full-plan (doc-id state local-body backend)
+  "Build a fresh full-bundle plan for BACKEND against STATE."
+  (let* ((ot-body (or (plist-get state :ot-body) ""))
+         (new-doc (gdocs-dm-from-org local-body))
+         (commands
+          (if (eq backend 'ot-incremental)
+              (let* ((ot-ops (plist-get state :ot-ops))
+                     (revision (plist-get state :revision))
+                     (title (plist-get state :title))
+                     (old-doc (and ot-ops
+                                   (gdocs-dm-from-ops
+                                    revision doc-id title ot-body ot-ops))))
+                (if old-doc
+                    (gdocs-dm-to-incremental-save-commands old-doc new-doc)
+                  (gdocs-dm-to-save-commands (length ot-body) new-doc)))
+            (gdocs-dm-to-save-commands (length ot-body) new-doc))))
+    (list :kind :full
+          :commands commands
+          :post-body (gdocs--push-comparison-body local-body)
+          :preflight-plan '(:kind :full-replace))))
+
+(defun gdocs--make-push-intent
+    (state local-body expected-body replan &optional label)
+  "Create an intent that can be replanned after a remote refetch."
+  (list :gdocs-push-intent t
+        :local-body local-body
+        :expected-body (gdocs--push-comparison-body expected-body)
+        :expected-revision (plist-get state :revision)
+        :replan replan
+        :label label))
+
+(defun gdocs--push-intent-p (value)
+  "Return non-nil when VALUE is a high-level push intent."
+  (and (listp value) (plist-get value :gdocs-push-intent)))
+
+(defun gdocs--push-plan-for-intent (intent state remote-body)
+  "Call INTENT's planner and annotate its current pre-operation snapshot."
+  (let* ((body (gdocs--push-comparison-body remote-body))
+         (expected (plist-get intent :expected-body))
+         (plan (funcall (plist-get intent :replan) state body)))
+    (unless (and plan
+                 (or (plist-get plan :post-body)
+                     (eq (plist-get plan :kind) :raw)))
+      (user-error "gdocs: high-level push intent produced no operation"))
+    (unless (or (null expected) (string= body expected))
+      (user-error "gdocs: remote body changed before replanning"))
+    (setq plan (plist-put plan :pre-body body))
+    (setq plan (plist-put plan :pre-revision (plist-get state :revision)))
+    ;; A /save batch advances the document revision once.  Keeping this
+    ;; expected value lets throttle verification reject a body that happens
+    ;; to look like our target but also contains an unrelated intervening
+    ;; revision.
+    (setq plan
+          (plist-put
+           plan :post-revision
+           (gdocs--push-next-revision (plist-get state :revision))))
+    plan))
+
+(defun gdocs--push-preflight-plan (intent state plan)
+  "Run the capability preflight required for PLAN on current STATE."
+  (let ((kind (plist-get plan :kind))
+        (local-body (or (plist-get intent :local-body)
+                        (plist-get plan :post-body))))
+    (pcase kind
+      (:insert
+       (gdocs--push-preflight-insertion
+        state (plist-get plan :ot-start) (plist-get plan :inserted)))
+      (:delete
+       ;; Deletion is the destructive step.  Re-run the complete range-aware
+       ;; analysis immediately before every ds, including after a retry.
+       (gdocs--push-preflight
+        state local-body (plist-get plan :preflight-plan)))
+      (:full
+       (gdocs--push-preflight
+        state local-body (plist-get plan :preflight-plan)))
+      (_
+       (user-error "gdocs: operation plan has no capability preflight")))))
+
+(defun gdocs--make-raw-push-intent (state op)
+  "Wrap a legacy raw OP without pretending it is safely replayable.
+
+Callers should use a real high-level intent.  This compatibility wrapper is
+kept for low-level users, but an ambiguous save cannot be retried because no
+expected post-operation body is available."
+  (list :gdocs-push-intent :raw
+        :local-body nil
+        :expected-body nil
+        :expected-revision (plist-get state :revision)
+        :replan (lambda (_state _body)
+                  (list :kind :raw :op op))))
+
+(defun gdocs--push-plan-commands (plan)
+  "Return the save command list represented by PLAN."
+  (or (plist-get plan :commands)
+      (let ((op (plist-get plan :op)))
+        (and op (list op)))))
+
+(defun gdocs--push-classify-refetched-state (doc-id state plan)
+  "Classify a refetched STATE relative to failed PLAN.
+
+Return `:committed' when the post-operation body is visible, `:retry' when
+the exact pre-operation revision/body is still present, `:conflict' for an
+unrelated change, and `:unknown' when the state cannot be decoded."
+  (if (eq (plist-get plan :kind) :raw)
+      :unknown
+    (let ((body (gdocs--push-state-body doc-id state))
+          (pre-body (plist-get plan :pre-body))
+          (post-body (plist-get plan :post-body))
+          (pre-rev (plist-get plan :pre-revision))
+          (post-rev (plist-get plan :post-revision))
+          (fresh-rev (and state (plist-get state :revision))))
+      (cond
+       ((null body) :unknown)
+       ((and (string= body post-body)
+             fresh-rev
+             (if post-rev
+                 (gdocs--push-revisions-equal-p fresh-rev post-rev)
+               (not (gdocs--push-revisions-equal-p fresh-rev pre-rev))))
+        :committed)
+       ((and (string= body pre-body)
+             (gdocs--push-revisions-equal-p fresh-rev pre-rev))
+        :retry)
+       ((and (string= body post-body)
+             (gdocs--push-revisions-equal-p fresh-rev pre-rev))
+        :unknown)
+       (t :conflict)))))
+
+(defun gdocs--push-throttle-outcome-error (outcome attempt)
+  "Signal a safe error for a failed throttle outcome."
+  (pcase outcome
+    (:conflict
+     (user-error "gdocs: conflict while verifying throttled save; remote content changed"))
+    (:unknown
+     (user-error "gdocs: ambiguous throttled save outcome; refusing to replay"))
+    (:retry
+     (user-error "gdocs: /save remained throttled after %d attempts; no operation was confirmed" attempt))
+    (_
+     (user-error "gdocs: unable to establish the throttled save outcome"))))
+
+(defun gdocs--push-verify-state (doc-id state expected-body expected-revision)
+  "Verify that STATE is exactly the expected post-operation snapshot."
+  (unless state
+    (user-error "gdocs: state refetch failed while verifying committed operation"))
+  (let ((actual-body (gdocs--push-state-body doc-id state))
+        (actual-revision (plist-get state :revision)))
+    (unless (and actual-body
+                 (string= actual-body
+                          (gdocs--push-comparison-body expected-body)))
+      (user-error "gdocs: state refetch found unexpected remote content"))
+    (unless (gdocs--push-revisions-equal-p actual-revision expected-revision)
+      (user-error "gdocs: state refetch saw rev %S, expected %S"
+                  actual-revision expected-revision))
+    t))
+
+(defun gdocs--save-response-revision (response state)
+  "Extract and validate the post-save revision from RESPONSE."
+  (let* ((meta (cdr (assq 'metadata response)))
+         (server-rev (cdr (assq 'serverRevision meta)))
+         (ranges (cdr (assq 'revisionRanges response)))
+         (range-rev (and ranges
+                         (let ((last (car (last ranges))))
+                           (and last (car (last last))))))
+         (new-rev (cond
+                   ((and server-rev range-rev) (max server-rev range-rev))
+                   (t (or range-rev server-rev))))
+         (old-rev (plist-get state :revision)))
+    (unless (and new-rev
+                 (not (gdocs--push-revisions-equal-p new-rev old-rev)))
+      (user-error "gdocs: /save returned no unambiguous new revision"))
+    new-rev))
+
+(defun gdocs--async-throttle-error-p (err)
+  "Return non-nil when async ERR has the structured throttle shape."
+  (and (listp err)
+       (= (or (plist-get err :http-code) 0) 550)
+       (= (or (plist-get err :err-code) 0) 13)
+       (plist-get err :di)))
+
+(defun gdocs--run-op-result-async-verify-throttle
+    (doc-id plan callback)
+  "Refetch after a throttle and callback with `(OUTCOME STATE ERR)'."
+  (run-with-timer
+   gdocs--rate-limit-retry-delay nil
+   (lambda ()
+     (gdocs--fetch-edit-state-async
+      doc-id
+      (lambda (fresh-state state-err)
+        (if state-err
+            (funcall callback nil nil
+                     (format "state refetch failed: %s" state-err))
+          (condition-case sig
+              (funcall callback
+                       (gdocs--push-classify-refetched-state
+                        doc-id fresh-state plan)
+                       fresh-state nil)
+            (error
+             (funcall callback nil nil (error-message-string sig))))))))))
+
+(defun gdocs--run-op-result-async-handle-throttle
+    (doc-id intent plan callback attempt outcome fresh-state verify-err)
+  "Handle a classified async throttle result."
+  (cond
+   (verify-err
+    (funcall callback nil verify-err))
+   ((eq outcome :committed)
+    (funcall callback
+             (list :revision (plist-get fresh-state :revision)
+                   :state fresh-state
+                   :plan plan)
+             nil))
+   ((and (eq outcome :retry) (< attempt 2))
+    ;; The replanner sees FRESH-STATE; PLAN and its positional operation are
+    ;; never replayed.
+    (gdocs--run-op-result-async-step
+     doc-id fresh-state intent callback (1+ attempt)))
+   (t
+    (condition-case sig
+        (gdocs--push-throttle-outcome-error outcome attempt)
+      (error
+       (funcall callback nil (error-message-string sig)))))))
+
+(defun gdocs--run-op-result-async-save-callback
+    (doc-id state intent plan callback attempt response err)
+  "Process one async save response for PLAN."
+  (condition-case sig
+      (cond
+       ((null err)
+        (funcall
+         callback
+         (list :revision (gdocs--save-response-revision response state)
+               :state state
+               :plan plan)
+         nil))
+       ((gdocs--async-throttle-error-p err)
+        (gdocs-log
+         'warn
+         "/save rejected (err 13, di %s) attempt %d, verifying in %ds"
+         (plist-get err :di) attempt gdocs--rate-limit-retry-delay)
+        (gdocs--run-op-result-async-verify-throttle
+         doc-id plan
+         (lambda (outcome fresh-state verify-err)
+           (gdocs--run-op-result-async-handle-throttle
+            doc-id intent plan callback attempt outcome fresh-state verify-err))))
+       ((listp err)
+        (funcall callback nil
+                 (format "/save rejected (http %s err %s)"
+                         (plist-get err :http-code)
+                         (plist-get err :err-code))))
+       (t (funcall callback nil (format "%s" err))))
+    (error
+     (funcall callback nil (error-message-string sig)))))
+
+(defun gdocs--run-op-result-async-step
+    (doc-id state intent callback attempt)
+  "Execute one async intent attempt; CALLBACK is already once-wrapped."
+  (let ((prepared
+         (condition-case sig
+             (let* ((current-body
+                     (or (gdocs--push-state-body doc-id state)
+                         (plist-get intent :expected-body)))
+                    (plan (gdocs--push-plan-for-intent
+                           intent state current-body))
+                    (commands (gdocs--push-plan-commands plan)))
+               (unless (and state commands)
+                 (user-error "gdocs: cannot send operation without a current state"))
+               (unless (eq (plist-get plan :kind) :raw)
+                 (gdocs--push-preflight-plan intent state plan))
+               (list plan commands))
+           (error (list :error (error-message-string sig))))))
+    (if (plist-get prepared :error)
+        (funcall callback nil (plist-get prepared :error))
+      (let ((plan (car prepared))
+            (commands (cadr prepared)))
+        (condition-case sig
+            (gdocs--save-request-async
+             doc-id state commands
+             (lambda (response err)
+               (gdocs--run-op-result-async-save-callback
+                doc-id state intent plan callback attempt response err)))
+          (error
+           (funcall callback nil (error-message-string sig))))))))
+
+(defun gdocs--run-op-result-async
+    (doc-id state intent callback &optional attempt)
+  "Run high-level INTENT asynchronously and return a result plist.
+
+CALLBACK receives `(RESULT ERR)'.  Every operation plan is rebuilt from the
+state used for its save request.  A throttled request is first classified by
+refetching the remote body: a visible post-body means the original request
+committed, the exact pre-state permits one freshly planned retry, and every
+other outcome fails closed."
+  (let ((done nil))
+    (gdocs--run-op-result-async-step
+     doc-id state intent
+     (lambda (result err)
+       (unless done
+         (setq done t)
+         (funcall callback result err)))
+     (or attempt 1))))
+
 (defun gdocs--run-op-async (doc-id state op callback &optional attempt)
-  "Async sibling of `gdocs--run-op'.
-CALLBACK = `(funcall CB NEW-REV ERR)'. ERR is nil on success, otherwise
-a string (user-recoverable). Retries once on a 550/err-13 throttle, with
-state refetched in between, as the sync path does."
-  (let ((attempt (or attempt 1)))
-    (gdocs--save-request-async
-     doc-id state (list op)
-     (lambda (resp err)
-       (cond
-        ((null err)
-         (let* ((meta (cdr (assq 'metadata resp)))
-                (server-rev (cdr (assq 'serverRevision meta)))
-                (ranges (cdr (assq 'revisionRanges resp)))
-                (range-rev (and ranges
-                                (let ((last (car (last ranges))))
-                                  (and last (car (last last))))))
-                (new-rev (cond
-                          ((and server-rev range-rev) (max server-rev range-rev))
-                          (t (or range-rev server-rev)))))
-           (if new-rev
-               (funcall callback new-rev nil)
-             (funcall callback nil "/save returned no new revision"))))
-        ((and (listp err)
-              (= (or (plist-get err :http-code) 0) 550)
-              (= (or (plist-get err :err-code) 0) 13)
-              (plist-get err :di)
-              (< attempt 2))
-         (gdocs-log 'warn "/save rejected (err 13, di %s) attempt %d, retrying in %ds"
-                    (plist-get err :di) attempt gdocs--rate-limit-retry-delay)
-         (run-with-timer
-          gdocs--rate-limit-retry-delay nil
-          (lambda ()
-            (gdocs--fetch-edit-state-async
-             doc-id
-             (lambda (new-state state-err)
-               (if state-err
-                   (funcall callback nil
-                            (format "state refetch failed: %s" state-err))
-                 (gdocs--run-op-async doc-id (or new-state state)
-                                      op callback (1+ attempt))))))))
-        ((listp err)
-         (funcall callback nil
-                  (format "/save rejected (http %s err %s)"
-                          (plist-get err :http-code) (plist-get err :err-code))))
-        (t (funcall callback nil (format "%s" err))))))))
+  "Compatibility wrapper for `gdocs--run-op-result-async'.
+
+Raw OP values are accepted for low-level callers, but they are deliberately
+not retryable after an ambiguous save.  Push code passes a high-level intent
+instead and receives the same `(NEW-REV ERR)' callback shape."
+  (let ((intent (if (gdocs--push-intent-p op)
+                    op
+                  (gdocs--make-raw-push-intent state op))))
+    (gdocs--run-op-result-async
+     doc-id state intent
+     (lambda (result err)
+       (funcall callback (and result (plist-get result :revision)) err))
+     attempt)))
 
 (defun gdocs--finalize-push-props (new-rev local-body)
   "Write GDOC_REVISION / hash / synced-at on the current buffer.
@@ -6170,229 +6652,317 @@ Caller must already be inside `with-current-buffer'."
   (gdocs--put-top-property "GDOC_SYNCED_AT" (gdocs--now-iso))
   (gdocs--mark-synced))
 
+(defun gdocs--apply-in-place-region-result-async
+    (doc-id state remote-body region buffer local-body callback)
+  "Apply REGION asynchronously and callback with `(RESULT ERR)'.
+
+The delete and insert stages each build an intent from the current body.  A
+successful stage is refetched and verified before the next stage is planned,
+so the insertion position is never copied from the delete plan."
+  (let ((done nil)
+        (committed-rev nil)
+        (initial-body (gdocs--push-comparison-body remote-body))
+        (target-body (gdocs--push-comparison-body
+                      (or local-body
+                          (gdocs--push-apply-region-body
+                           (gdocs--push-comparison-body remote-body)
+                           region)))))
+    (cl-labels
+        ((finish (result err)
+           (unless done
+             (setq done t)
+             (funcall callback result err)))
+         (run-stage (stage stage-state stage-body selector)
+           (let ((intent
+                  (gdocs--make-push-intent
+                   stage-state local-body stage-body
+                   (lambda (fresh-state fresh-body)
+                     (gdocs--push-region-plan
+                      fresh-state fresh-body target-body selector stage))
+                   (format "region-%s" stage))))
+             (gdocs--run-op-result-async
+              doc-id stage-state intent
+              (lambda (op-result op-err)
+                (condition-case callback-sig
+                    (if op-err
+                        (finish (or op-result
+                                    (and committed-rev
+                                         (list :revision committed-rev)))
+                                op-err)
+                      (let* ((plan (plist-get op-result :plan))
+                             (rev (plist-get op-result :revision))
+                             (post-body (plist-get plan :post-body))
+                             (deleted (plist-get plan :deleted))
+                             (inserted (plist-get plan :inserted))
+                             (ot-start (plist-get plan :ot-start)))
+                        (setq committed-rev rev)
+                        (when (and rev (buffer-live-p buffer))
+                          (with-current-buffer buffer
+                            (gdocs--shift-buffer-anchors
+                             (if (eq stage :delete) 'ds 'is)
+                             ot-start
+                             (length (if (eq stage :delete)
+                                         deleted
+                                       inserted)))
+                            ;; This is a committed stage revision, not
+                            ;; the final push baseline.  Do not write the
+                            ;; content hash until every stage succeeds.
+                            (gdocs--put-top-property
+                             "GDOC_REVISION" (number-to-string rev))))
+                        (gdocs--fetch-edit-state-async
+                         doc-id
+                         (lambda (fresh-state state-err)
+                           (condition-case verify-sig
+                               (if state-err
+                                   (finish op-result state-err)
+                                 (gdocs--push-verify-state
+                                  doc-id fresh-state post-body rev)
+                                 (let ((fresh-body
+                                        (gdocs--push-state-body
+                                         doc-id fresh-state)))
+                                   (if (and (eq stage :delete)
+                                            (length> inserted 0))
+                                       (run-stage
+                                        :insert
+                                        fresh-state
+                                        fresh-body
+                                        (list :start
+                                              (plist-get
+                                               (plist-get plan :region)
+                                               :start)
+                                              :deleted ""
+                                              :inserted inserted))
+                                     (finish
+                                      (list :revision rev
+                                            :state fresh-state
+                                            :body fresh-body
+                                            :plan plan)
+                                      nil))))
+                             (error
+                              (finish op-result
+                                      (error-message-string verify-sig))))))))
+                  (error
+                   (finish nil (error-message-string callback-sig)))))))))
+      ;; The selector is content-based.  It is only used to choose the same
+      ;; high-level region after a retry; the current diff supplies positions.
+      (run-stage (if (length> (or (plist-get region :deleted) "") 0)
+                     :delete
+                   :insert)
+                 state initial-body
+                 (gdocs--push-region-selector region)))))
+
 (defun gdocs--apply-in-place-region-async
-    (doc-id state remote-body region buffer callback)
-  "Async sibling of `gdocs--apply-in-place-region'.
-Runs ds (if any) → refetch state for verify → is (if any). CALLBACK is
-`(funcall CB NEW-REV ERR)'."
-  (let* ((start (plist-get region :start))
-         (rem-end (plist-get region :rem-end))
-         (deleted (plist-get region :deleted))
-         (inserted (plist-get region :inserted))
-         (ot-body (plist-get state :ot-body))
-         (ot-range (gdocs--locate-edit-in-ot
-                    ot-body remote-body start rem-end)))
-    (cond
-     ((null ot-range)
-      (funcall callback nil
-               "could not locate edit context uniquely in OT body"))
-     (t
-      (let* ((ot-start (car ot-range))
-             (ot-end (cdr ot-range))
-             (do-is (lambda (state-for-is callback2)
-                      (if (zerop (length inserted))
-                          (funcall callback2 nil nil)
-                        (condition-case sig
-                            (progn
-                              ;; The delete path refetches STATE before this
-                              ;; insertion. Reapply capability policy to
-                              ;; that current state rather than trusting the
-                              ;; initial push snapshot.
-                              (gdocs--push-preflight-insertion
-                               state-for-is ot-start inserted)
-                              (gdocs--run-op-async
-                               doc-id state-for-is
-                               `((ty . "is") (ibi . ,ot-start) (s . ,inserted))
-                               (lambda (rev err)
-                                 (when (and rev (buffer-live-p buffer))
-                                   (with-current-buffer buffer
-                                     (gdocs--shift-buffer-anchors
-                                      'is ot-start (length inserted))
-                                     (gdocs--put-top-property
-                                      "GDOC_REVISION" (number-to-string rev))))
-                                 (funcall callback2 rev err))))
-                          (error
-                           (funcall callback2 nil
-                                    (error-message-string sig))))))))
-        (cond
-         ((length> deleted 0)
-          (gdocs--run-op-async
-           doc-id state
-           `((ty . "ds") (si . ,ot-start) (ei . ,(1- ot-end)))
-           (lambda (ds-rev ds-err)
-             (cond
-              (ds-err (funcall callback nil ds-err))
-              (t
-               (when (and ds-rev (buffer-live-p buffer))
-                 (with-current-buffer buffer
-                   (gdocs--shift-buffer-anchors
-                    'ds ot-start (length deleted))
-                   (gdocs--put-top-property
-                    "GDOC_REVISION" (number-to-string ds-rev))))
-               (gdocs--fetch-edit-state-async
-                doc-id
-                (lambda (refreshed s-err)
-                  (cond
-                   (s-err (funcall callback nil s-err))
-                   ((not (equal (plist-get refreshed :revision) ds-rev))
-                    (funcall callback nil
-                             (format "state refetch saw rev %S, expected %S"
-                                     (plist-get refreshed :revision)
-                                     ds-rev)))
-                   (t (funcall do-is refreshed
-                               (lambda (is-rev is-err)
-                                 (funcall callback
-                                          (or is-rev ds-rev)
-                                          is-err))))))))))))
-         (t
-          (funcall do-is state callback))))))))
+    (doc-id state remote-body region buffer callback &optional local-body)
+  "Async sibling of `gdocs--apply-in-place-region'."
+  (gdocs--apply-in-place-region-result-async
+   doc-id state remote-body region buffer local-body
+   (lambda (result err)
+     (funcall callback (and result (plist-get result :revision)) err))))
+
+(defun gdocs--multi-regions-refetch-async
+    (doc-id current-state expected-body callback)
+  "Refetch and verify the boundary before another multi-region operation."
+  (gdocs--fetch-edit-state-async
+   doc-id
+   (lambda (fresh-state state-err)
+     (if state-err
+         (funcall callback nil state-err)
+       (condition-case sig
+           (progn
+             (gdocs--push-verify-state
+              doc-id fresh-state expected-body
+              (plist-get current-state :revision))
+             (funcall callback fresh-state nil))
+         (error
+          (funcall callback nil (error-message-string sig))))))))
 
 (defun gdocs--apply-multi-regions-async
-    (doc-id state remote-body regions buffer callback)
-  "Apply REGIONS (latest-first) sequentially, refetching state between.
-CALLBACK = `(funcall CB FINAL-REV ERR)'."
-  (if (null regions)
-      (funcall callback nil nil)
-    (let ((region (car regions))
-          (rest (cdr regions)))
-      (gdocs--apply-in-place-region-async
-       doc-id state remote-body region buffer
-       (lambda (rev err)
-         (cond
-          (err (funcall callback rev err))
-          ((null rest) (funcall callback rev nil))
-          (t
-           (run-with-timer
-            gdocs--inter-region-delay nil
-            (lambda ()
-              (gdocs--fetch-edit-state-async
-               doc-id
-               (lambda (next-state s-err)
-                 (if s-err
-                     (funcall callback rev s-err)
-                   (gdocs--apply-multi-regions-async
-                    doc-id next-state remote-body rest buffer
-                    (lambda (final-rev fr-err)
-                      (funcall callback (or final-rev rev) fr-err)))))))))))))))
+    (doc-id state remote-body regions buffer callback &optional local-body)
+  "Apply latest-first regions, rebuilding and verifying after every stage."
+  (let ((done nil)
+        (target-body (gdocs--push-comparison-body
+                      (or local-body
+                          (gdocs--push-target-body-from-regions
+                           remote-body regions))))
+        (remaining (length regions))
+        (current-state state)
+        (current-body (gdocs--push-comparison-body remote-body))
+        (last-rev nil))
+    (cl-labels
+        ((finish (rev err)
+           (unless done
+             (setq done t)
+             (funcall callback rev err)))
+         (step ()
+           (if (zerop remaining)
+               (finish last-rev nil)
+             (let ((prepared
+                    (condition-case sig
+                        (let* ((fresh-regions
+                                (gdocs--push-region-list
+                                 current-body target-body))
+                               ;; Always take the latest position from the
+                               ;; freshly computed diff.  `regions' is only
+                               ;; the count captured before the first op.
+                               (region (car (last fresh-regions))))
+                          (unless region
+                            (user-error
+                             "gdocs: remaining multi-region plan disappeared"))
+                          (list region))
+                      (error (list :error (error-message-string sig))))))
+               (if (plist-get prepared :error)
+                   (finish last-rev (plist-get prepared :error))
+                 (gdocs--apply-in-place-region-result-async
+                  doc-id current-state current-body (car prepared)
+                  buffer local-body
+                  (lambda (result err)
+                    (if err
+                        (finish (or (and result
+                                         (plist-get result :revision))
+                                    last-rev)
+                                err)
+                      (setq last-rev (plist-get result :revision)
+                            current-state (plist-get result :state)
+                            current-body (plist-get result :body))
+                      (cl-decf remaining)
+                      (if (zerop remaining)
+                          (finish last-rev nil)
+                        (run-with-timer
+                         gdocs--inter-region-delay nil
+                         (lambda ()
+                           (gdocs--multi-regions-refetch-async
+                            doc-id current-state current-body
+                            (lambda (fresh-state refetch-err)
+                              (if refetch-err
+                                  (finish last-rev refetch-err)
+                                (setq current-state fresh-state
+                                      current-body
+                                      (gdocs--push-state-body
+                                       doc-id fresh-state))
+                                (step)))))))))))))))
+      (if (zerop remaining)
+          (finish nil nil)
+        (step)))))
 
 (defun gdocs--apply-push-async
     (doc-id state local-body remote-body buffer callback)
   "Async sibling of `gdocs--apply-push'.
 CALLBACK = `(funcall CB NEW-REV ERR)'. BUFFER is where property writes go."
-  (let* ((raw-plan (gdocs--push-plan-for-diff state local-body remote-body))
-         ;; Direct callers of this low-level apply helper historically
-         ;; required an image guard even for a synthetic no-op. Keep that
-         ;; conservative contract; the public driver does not call this for
-         ;; a no-op.
-         (plan (if (eq (plist-get raw-plan :kind) :noop)
-                   (list :kind :full-replace)
-                 raw-plan)))
-    (gdocs--push-preflight state local-body plan)
-    (let* ((ot-body (plist-get state :ot-body))
-           (ot-len (gdocs--ot-body-length ot-body))
-           (local-stripped
-            (gdocs--inline-markers-as-ot-placeholders
-             (car (gdocs--strip-heading-drawers local-body))))
-           (remote-mappable
-            (gdocs--inline-markers-as-ot-placeholders remote-body))
-           (prepended (gdocs--diff-prepend remote-mappable local-stripped))
-           (appended (gdocs--diff-append remote-mappable local-stripped))
-           (finalize
-            (lambda (rev err extra)
-              (when (and rev (buffer-live-p buffer))
-                (with-current-buffer buffer
-                  (gdocs--finalize-push-props rev local-body)))
-              (when (and rev (not err))
-                (gdocs-log 'info "Pushed %s (rev %s)%s" doc-id rev (or extra "")))
-              (funcall callback rev err))))
-      (cond
-       ;; OT-encode backend: rebuild the doc-model from the buffer and ship
-       ;; a single multi-op /save bundle (ds + is + styles + entities). The
-       ;; plain-text diff branches below are bypassed since this is a full
-       ;; replacement, not a diff.
-       ((memq gdocs-push-backend '(ot-encode ot-incremental))
-        (let* ((new-doc (gdocs-dm-from-org local-body))
-               (backend gdocs-push-backend)
-               (cmds
-                (cond
-                 ((eq backend 'ot-incremental)
-                  (let* ((ot-ops (plist-get state :ot-ops))
-                         (rev (plist-get state :revision))
-                         (title (plist-get state :title))
-                         (old-doc (and ot-ops
-                                       (gdocs-dm-from-ops
-                                        rev doc-id title (or ot-body "") ot-ops))))
-                    (if old-doc
-                        (gdocs-dm-to-incremental-save-commands old-doc new-doc)
-                      ;; No live ops parsed — fall back to full-replace.
-                      (gdocs-dm-to-save-commands ot-len new-doc))))
-                 (t (gdocs-dm-to-save-commands ot-len new-doc))))
-               (label (cond ((null cmds) nil)
-                            ((eq backend 'ot-incremental) "ot-incremental")
-                            (t "ot-encode"))))
-          (cond
-           ((null cmds)
-            (gdocs-log 'info "Pushed %s: no-op (docs equal)" doc-id)
-            (funcall callback nil nil))
-           (t
-            (gdocs--save-request-async
-             doc-id state cmds
-             (lambda (parsed err)
-               (cond
-                (err (funcall callback nil (format "%s push failed: %S" label err)))
-                (t
-                 (let* ((meta (cdr (assq 'metadata parsed)))
-                        (server-rev (cdr (assq 'serverRevision meta)))
-                        (ranges (cdr (assq 'revisionRanges parsed)))
-                        (range-rev (and ranges
-                                        (let ((last (car (last ranges))))
-                                          (and last (car (last last))))))
-                        (new-rev (cond
-                                  ((and server-rev range-rev)
-                                   (max server-rev range-rev))
-                                  (t (or range-rev server-rev)))))
-                   (if new-rev
-                       (funcall finalize new-rev nil
-                                (format ", %s (%d ops)" label (length cmds)))
-                     (funcall callback nil
-                              (format "%s push: no rev in response" label))))))))))))
-       (prepended
-        (gdocs--run-op-async
-         doc-id state
-         `((ty . "is") (ibi . 1) (s . ,prepended))
-         (lambda (rev err)
-           (when (and rev (buffer-live-p buffer))
+  (let ((done nil))
+    (cl-labels
+        ((finish (rev err)
+           (unless done
+             (setq done t)
+             (funcall callback rev err)))
+         (finalize (rev err extra)
+           ;; A committed intermediate stage may report REV with ERR.  It is
+           ;; already recorded by the region helper, but it is not a
+           ;; successful push baseline and must not receive a content hash.
+           (when (and rev (null err) (buffer-live-p buffer))
              (with-current-buffer buffer
-               (gdocs--shift-buffer-anchors 'is 1 (length prepended))))
-           (funcall finalize rev err
-                    (format ", +%d prepended chars" (length prepended))))))
-       ((and appended ot-body)
-        (gdocs--run-op-async
-         doc-id state
-         `((ty . "is") (ibi . ,(1+ ot-len)) (s . ,appended))
-         (lambda (rev err)
-           (funcall finalize rev err
-                    (format ", +%d appended chars" (length appended))))))
-       (ot-body
-        (let* ((para-regions (gdocs--diff-paragraphs remote-mappable local-stripped))
-               (n-regions (length para-regions)))
+               (gdocs--finalize-push-props rev local-body)))
+           (when (and rev (null err))
+             (gdocs-log 'info "Pushed %s (rev %s)%s"
+                        doc-id rev (or extra "")))
+           (finish rev err)))
+      (let* ((raw-plan (gdocs--push-plan-for-diff state local-body remote-body))
+             ;; Direct callers historically required an image guard even for
+             ;; a synthetic no-op. Keep that conservative contract.
+             (preflight-plan (if (eq (plist-get raw-plan :kind) :noop)
+                                 (list :kind :full-replace)
+                               raw-plan)))
+        (gdocs--push-preflight state local-body preflight-plan)
+        (let* ((local-stripped
+                (gdocs--push-comparison-body local-body))
+               (remote-mappable
+                (gdocs--push-comparison-body remote-body))
+               (ot-body (plist-get state :ot-body))
+               (prepended (gdocs--diff-prepend remote-mappable local-stripped))
+               (appended (gdocs--diff-append remote-mappable local-stripped)))
           (cond
-           ((or (zerop n-regions) (= n-regions 1))
-            (let ((single (gdocs--diff-single-region
-                           remote-mappable local-stripped)))
-              (if single
-                  (gdocs--apply-in-place-region-async
-                   doc-id state remote-mappable single buffer
-                   (lambda (rev err) (funcall finalize rev err nil)))
-                (funcall callback nil nil))))
+           ;; Full OT bundles use the same intent engine.  A throttle is only
+           ;; retryable when the exact target body can be observed or the
+           ;; exact pre-state is still present for a fresh command rebuild.
+           ((memq gdocs-push-backend '(ot-encode ot-incremental))
+            (let* ((backend gdocs-push-backend)
+                   (initial (gdocs--push-full-plan
+                             doc-id state local-body backend))
+                   (commands (gdocs--push-plan-commands initial)))
+              (if (null commands)
+                  (finish nil nil)
+                (let ((intent
+                       (gdocs--make-push-intent
+                        state local-body remote-mappable
+                        (lambda (fresh-state _fresh-body)
+                          (gdocs--push-full-plan
+                           doc-id fresh-state local-body backend))
+                        (format "%s" backend))))
+                  (gdocs--run-op-result-async
+                   doc-id state intent
+                   (lambda (result err)
+                     (finalize (and result (plist-get result :revision))
+                               err
+                               (format ", %s (%d ops)"
+                                       backend (length commands)))))))))
+           (prepended
+            (let ((intent
+                   (gdocs--make-push-intent
+                    state local-body remote-mappable
+                    (lambda (fresh-state fresh-body)
+                      (gdocs--push-insert-plan
+                       fresh-state fresh-body prepended :prepend))
+                    "prepend")))
+              (gdocs--run-op-result-async
+               doc-id state intent
+               (lambda (result err)
+                 (when (and result (null err) (buffer-live-p buffer))
+                   (with-current-buffer buffer
+                     (gdocs--shift-buffer-anchors
+                      'is (plist-get (plist-get result :plan) :ot-start)
+                      (length prepended))))
+                 (finalize (and result (plist-get result :revision))
+                           err
+                           (format ", +%d prepended chars"
+                                   (length prepended)))))))
+           ((and appended ot-body)
+            (let ((intent
+                   (gdocs--make-push-intent
+                    state local-body remote-mappable
+                    (lambda (fresh-state fresh-body)
+                      (gdocs--push-insert-plan
+                       fresh-state fresh-body appended :append))
+                    "append")))
+              (gdocs--run-op-result-async
+               doc-id state intent
+               (lambda (result err)
+                 (finalize (and result (plist-get result :revision))
+                           err
+                           (format ", +%d appended chars"
+                                   (length appended)))))))
+           (ot-body
+            (let* ((para-regions
+                    (gdocs--diff-paragraphs remote-mappable local-stripped))
+                   (n-regions (length para-regions)))
+              (cond
+               ((or (zerop n-regions) (= n-regions 1))
+                (let ((single (gdocs--diff-single-region
+                               remote-mappable local-stripped)))
+                  (if single
+                      (gdocs--apply-in-place-region-result-async
+                       doc-id state remote-mappable single buffer local-body
+                       (lambda (result err)
+                         (finalize (and result (plist-get result :revision))
+                                   err nil)))
+                    (finish nil nil))))
+               (t
+                (gdocs--apply-multi-regions-async
+                 doc-id state remote-mappable
+                 (nreverse (copy-sequence para-regions)) buffer
+                 (lambda (rev err) (finalize rev err nil))
+                 local-body)))))
            (t
-            (gdocs--apply-multi-regions-async
-             doc-id state remote-mappable
-             (nreverse (copy-sequence para-regions)) buffer
-             (lambda (rev err) (funcall finalize rev err nil)))))))
-       (t
-        (funcall callback nil
-                 "edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)"))))))
+            (finish nil
+                    "edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)"))))))))
 
 (defun gdocs--diff-prepend (remote local)
   "If LOCAL = NEW + REMOTE for some NEW, return NEW; else nil.
@@ -6595,58 +7165,80 @@ Use this if Google has marked the current SID bad (rare)."
 Throttle signature observed empirically: HTTP 550, err-code 13, plus a
 `di' counter. ERR's data must be a plist (the format emitted by
 `gdocs--curl-post' on non-2xx)."
-  (and (eq (car err) 'gdocs-save-rejected)
+  (and (consp err)
+       (eq (car err) 'gdocs-save-rejected)
        (let ((data (cdr err)))
          (and (= (or (plist-get data :http-code) 0) 550)
               (= (or (plist-get data :err-code) 0) 13)
               (plist-get data :di)))))
 
-(defun gdocs--run-op (doc-id state op)
-  "Send a single OT op against STATE; return the new revision (int).
+(defun gdocs--run-op-result (doc-id state intent-or-op)
+  "Run a high-level push intent synchronously and return a result plist.
 
-Post-op rev comes from `revisionRanges' (last entry). `serverRevision'
-can lag (reports pre-op rev when the server advanced); we take the max
-defensively.
-
-On a `gdocs-save-rejected' with throttle shape (HTTP 550 + err-code 13),
-sleeps `gdocs--rate-limit-retry-delay' seconds, refetches STATE, retries
-once. A second rejection surfaces a recoverable `user-error' — callers
-should not assume the doc is unchanged, since a prior op in the same
-push may have committed. /save throttling is probabilistic per-request,
-so a subsequent manual push will often succeed."
-  (let ((attempt 0)
-        (result nil))
+The result contains `:revision', `:state', and the exact freshly planned
+`:plan' used for the successful save.  On a throttle, the refetched state is
+classified before any retry.  Only an exact unchanged pre-state is retryable;
+the retry calls the intent's replanner and therefore cannot reuse a stale OT
+operation."
+  (let* ((intent (if (gdocs--push-intent-p intent-or-op)
+                     intent-or-op
+                   (gdocs--make-raw-push-intent state intent-or-op)))
+         (current-state state)
+         (attempt 0)
+         (result nil))
     (while (and (null result) (< attempt 2))
       (cl-incf attempt)
-      (condition-case err
-          (let* ((resp (gdocs--save-request doc-id state (list op)))
-                 (meta (cdr (assq 'metadata resp)))
-                 (server-rev (cdr (assq 'serverRevision meta)))
-                 (ranges (cdr (assq 'revisionRanges resp)))
-                 (range-rev (and ranges
-                                 (let ((last (car (last ranges))))
-                                   (and last (car (last last))))))
-                 (new-rev (cond
-                           ((and server-rev range-rev) (max server-rev range-rev))
-                           (t (or range-rev server-rev)))))
-            (unless new-rev
-              (user-error "gdocs: /save returned no new revision (resp=%S)" resp))
-            (setq result new-rev))
-        (gdocs-save-rejected
-         (cond
-          ((and (gdocs--throttle-error-p err) (< attempt 2))
-           (gdocs-log 'warn "/save rejected (err 13, di %s) attempt %d, retrying in %ds"
-                      (plist-get (cdr err) :di) attempt
-                      gdocs--rate-limit-retry-delay)
-           (sleep-for gdocs--rate-limit-retry-delay)
-           (let ((refreshed (gdocs--fetch-edit-state doc-id)))
-             (when refreshed (setq state refreshed))))
-          ((gdocs--throttle-error-p err)
-           (user-error
-            "gdocs: /save rejected (err 13) after %d attempts. Retry the push; rev will resync."
-            attempt))
-          (t (signal (car err) (cdr err)))))))
+      (let* ((current-body
+              (or (gdocs--push-state-body doc-id current-state)
+                  (plist-get intent :expected-body)))
+             (plan (gdocs--push-plan-for-intent
+                    intent current-state current-body))
+             (commands (gdocs--push-plan-commands plan)))
+        (unless (and current-state commands)
+          (user-error "gdocs: cannot send operation without a current state"))
+        (unless (eq (plist-get plan :kind) :raw)
+          ;; This runs for every planned attempt, including a retry.
+          (gdocs--push-preflight-plan intent current-state plan))
+        (condition-case err
+            (let ((response (gdocs--save-request doc-id current-state commands)))
+              (setq result
+                    (list :revision
+                          (gdocs--save-response-revision response current-state)
+                          :state current-state
+                          :plan plan)))
+          (gdocs-save-rejected
+           (if (gdocs--throttle-error-p err)
+               (progn
+                 (gdocs-log
+                  'warn
+                  "/save rejected (err 13, di %s) attempt %d, verifying in %ds"
+                  (plist-get (cdr err) :di) attempt
+                  gdocs--rate-limit-retry-delay)
+                 (sleep-for gdocs--rate-limit-retry-delay)
+                 (let ((fresh-state (gdocs--fetch-edit-state doc-id)))
+                   (pcase (gdocs--push-classify-refetched-state
+                           doc-id fresh-state plan)
+                     (:committed
+                      (setq result
+                            (list :revision (plist-get fresh-state :revision)
+                                  :state fresh-state
+                                  :plan plan)))
+                     (:retry
+                      (if (< attempt 2)
+                          ;; The next loop invokes the high-level replanner.
+                          (setq current-state fresh-state)
+                        (gdocs--push-throttle-outcome-error :retry attempt)))
+                     (outcome
+                      (gdocs--push-throttle-outcome-error outcome attempt)))))
+             (signal (car err) (cdr err)))))))
     result))
+
+(defun gdocs--run-op (doc-id state op-or-intent)
+  "Send OP-OR-INTENT synchronously and return its committed revision.
+
+High-level intents are replanned after every refetch.  A legacy raw operation
+is accepted for compatibility but cannot be replayed after an ambiguous save."
+  (plist-get (gdocs--run-op-result doc-id state op-or-intent) :revision))
 
 (defun gdocs--strip-heading-drawers (body)
   "Strip per-heading `:PROPERTIES:' drawers from BODY.
@@ -6932,47 +7524,90 @@ pass as `ibi'; OT-END is meaningless and set equal to OT-START."
             (ot-end (1+ (aref map (1- end)))))
         (cons ot-start ot-end))))))
 
-(defun gdocs--apply-in-place-region (doc-id state remote-body region)
-  "Apply ONE in-place change REGION to the doc.
-Returns (NEW-REV . NEW-STATE) after the (ds, is) pair completes.
-REGION is a plist from `gdocs--diff-single-region' or
-`gdocs--diff-paragraphs'. STATE must reflect the doc's *current* rev
-and OT body — the caller is responsible for refetching between regions."
-  (let* ((start (plist-get region :start))
-         (rem-end (plist-get region :rem-end))
-         (deleted (plist-get region :deleted))
-         (inserted (plist-get region :inserted))
-         (ot-body (plist-get state :ot-body))
-         (ot-range (or (gdocs--locate-edit-in-ot
-                        ot-body remote-body start rem-end)
-                       (user-error "gdocs: could not locate edit context uniquely in OT body")))
-         (ot-start (car ot-range))
-         (ot-end (cdr ot-range))
-         (rev nil))
-    (when (length> deleted 0)
-      (setq rev (gdocs--run-op
-                 doc-id state
-                 `((ty . "ds") (si . ,ot-start) (ei . ,(1- ot-end)))))
-      (gdocs--shift-buffer-anchors 'ds ot-start (length deleted))
-      ;; Persist the new rev immediately. If the following `is' fails,
-      ;; the buffer still tracks the server's actual rev so the next
-      ;; push can diff from current state instead of being refused.
-      (gdocs--put-top-property "GDOC_REVISION" (number-to-string rev))
-      (setq state (gdocs--fetch-edit-state doc-id))
-      (unless (and state (equal (plist-get state :revision) rev))
-        (user-error "gdocs: state refetch after delete saw rev %S, expected %S"
-                    (and state (plist-get state :revision)) rev)))
-    (when (length> inserted 0)
-      (gdocs--push-preflight-insertion state ot-start inserted)
-      (setq rev (gdocs--run-op
-                 doc-id state
-                 `((ty . "is") (ibi . ,ot-start) (s . ,inserted))))
-      (gdocs--shift-buffer-anchors 'is ot-start (length inserted))
-      (gdocs--put-top-property "GDOC_REVISION" (number-to-string rev)))
-    (gdocs-log 'info
-               "Pushed %s (rev %s, edited %d→%d chars at OT %d)"
-               doc-id rev (length deleted) (length inserted) ot-start)
-    (cons rev state)))
+(defun gdocs--apply-in-place-region-result
+    (doc-id state remote-body region &optional local-body)
+  "Synchronously apply REGION and return a detailed result plist.
+
+Each stage is planned from the state it sends against, then refetched and
+verified before the next stage.  LOCAL-BODY is the complete desired Org body
+used for capability preflight; when omitted, REGION itself supplies the
+desired body for compatibility with low-level callers."
+  (let* ((initial-body (gdocs--push-comparison-body remote-body))
+         (target-body
+          (gdocs--push-comparison-body
+           (or local-body
+               (gdocs--push-apply-region-body initial-body region))))
+         (initial-selector (gdocs--push-region-selector region)))
+    (cl-labels
+        ((run-stage (stage stage-state stage-body selector)
+           (let* ((intent
+                   (gdocs--make-push-intent
+                    stage-state local-body stage-body
+                    (lambda (fresh-state fresh-body)
+                      (gdocs--push-region-plan
+                       fresh-state fresh-body target-body selector stage))))
+                  (operation (gdocs--run-op-result
+                              doc-id stage-state intent))
+                  (plan (plist-get operation :plan))
+                  (rev (plist-get operation :revision))
+                  (post-body (plist-get plan :post-body)))
+             (when rev
+               (gdocs--shift-buffer-anchors
+                (if (eq stage :delete) 'ds 'is)
+                (plist-get plan :ot-start)
+                (length (if (eq stage :delete)
+                            (plist-get plan :deleted)
+                          (plist-get plan :inserted))))
+               ;; This revision belongs to a committed stage.  The final
+               ;; content hash is written only by the outer successful push.
+               (gdocs--put-top-property "GDOC_REVISION"
+                                        (number-to-string rev)))
+             (let ((fresh-state (gdocs--fetch-edit-state doc-id)))
+               (gdocs--push-verify-state
+                doc-id fresh-state post-body rev)
+               (list :operation operation
+                     :state fresh-state
+                     :body (gdocs--push-state-body doc-id fresh-state)
+                     :plan plan)))))
+      (let* ((deleted (or (plist-get region :deleted) ""))
+             (inserted (or (plist-get region :inserted) ""))
+             (first
+              (if (length> deleted 0)
+                  (run-stage :delete state initial-body initial-selector)
+                (run-stage :insert state initial-body initial-selector)))
+             (first-operation (plist-get first :operation))
+             (first-plan (plist-get first :plan))
+             (final
+              (if (and (length> deleted 0) (length> inserted 0))
+                  (run-stage
+                   :insert
+                   (plist-get first :state)
+                   (plist-get first :body)
+                   (list :start (plist-get (plist-get first-plan :region)
+                                           :start)
+                         :deleted ""
+                         :inserted inserted))
+                first))
+             (operation (plist-get final :operation))
+             (plan (plist-get final :plan))
+             (rev (plist-get operation :revision)))
+        (gdocs-log 'info
+                   "Pushed %s (rev %s, edited %d→%d chars at OT %d)"
+                   doc-id rev (length deleted) (length inserted)
+                   (plist-get plan :ot-start))
+        (list :revision rev
+              :state (plist-get final :state)
+              :body (plist-get final :body)
+              :plan plan
+              :previous (and (not (eq first final)) first-operation))))))
+
+(defun gdocs--apply-in-place-region
+    (doc-id state remote-body region &optional local-body)
+  "Apply ONE in-place change REGION and return `(NEW-REV . NEW-STATE)'."
+  (let ((result (gdocs--apply-in-place-region-result
+                 doc-id state remote-body region local-body)))
+    (cons (plist-get result :revision)
+          (plist-get result :state))))
 
 (defun gdocs--apply-push (doc-id state local-body remote-body)
   "Dispatch on diff shape and apply the push.
@@ -6992,76 +7627,103 @@ hash are written back to buffer metadata."
   (let* ((raw-plan (gdocs--push-plan-for-diff state local-body remote-body))
          (plan (if (eq (plist-get raw-plan :kind) :noop)
                    (list :kind :full-replace)
-                 raw-plan)))
+                 raw-plan))
+         (local-stripped (gdocs--push-comparison-body local-body))
+         (remote-mappable (gdocs--push-comparison-body remote-body))
+         (ot-body (plist-get state :ot-body))
+         (prepended (gdocs--diff-prepend remote-mappable local-stripped))
+         (appended (gdocs--diff-append remote-mappable local-stripped))
+         (new-rev nil))
     (gdocs--push-preflight state local-body plan)
-    (let* ((ot-body (plist-get state :ot-body))
-           (ot-len (gdocs--ot-body-length ot-body))
-           (local-stripped
-            (gdocs--inline-markers-as-ot-placeholders
-             (car (gdocs--strip-heading-drawers local-body))))
-           (remote-mappable
-            (gdocs--inline-markers-as-ot-placeholders remote-body))
-           (prepended (gdocs--diff-prepend remote-mappable local-stripped))
-           (appended (gdocs--diff-append remote-mappable local-stripped))
-           (new-rev nil))
-      (cond
-       (prepended
-        (setq new-rev (gdocs--run-op
-                       doc-id state
-                       `((ty . "is") (ibi . 1) (s . ,prepended))))
-        (gdocs--shift-buffer-anchors 'is 1 (length prepended))
-        (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
-        (gdocs-log 'info "Pushed %s (rev %s, +%d prepended chars)"
-                   doc-id new-rev (length prepended)))
-       ((and appended ot-body)
-        (setq new-rev (gdocs--run-op
-                       doc-id state
-                       `((ty . "is") (ibi . ,(1+ ot-len)) (s . ,appended))))
-        (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
-        (gdocs-log 'info "Pushed %s (rev %s, +%d appended chars)"
-                   doc-id new-rev (length appended)))
-       (ot-body
-        (let* ((para-regions (gdocs--diff-paragraphs remote-mappable local-stripped))
-               (n-regions (length para-regions)))
-          (cond
-           ((zerop n-regions)
-            ;; Paragraph-level diff finds nothing but prepend/append didn't
-            ;; match — extremely rare; fall through to single-region.
-            (let ((single (gdocs--diff-single-region remote-mappable local-stripped)))
+    (cond
+     ((memq gdocs-push-backend '(ot-encode ot-incremental))
+      (let* ((initial (gdocs--push-full-plan
+                       doc-id state local-body gdocs-push-backend))
+             (commands (gdocs--push-plan-commands initial)))
+        (when commands
+          (let* ((intent
+                  (gdocs--make-push-intent
+                   state local-body remote-mappable
+                   (lambda (fresh-state _fresh-body)
+                     (gdocs--push-full-plan
+                      doc-id fresh-state local-body gdocs-push-backend))))
+                 (result (gdocs--run-op-result doc-id state intent)))
+            (setq new-rev (plist-get result :revision))))))
+     (prepended
+      (let* ((intent
+              (gdocs--make-push-intent
+               state local-body remote-mappable
+               (lambda (fresh-state fresh-body)
+                 (gdocs--push-insert-plan
+                  fresh-state fresh-body prepended :prepend))))
+             (result (gdocs--run-op-result doc-id state intent))
+             (op-plan (plist-get result :plan)))
+        (setq new-rev (plist-get result :revision))
+        (gdocs--shift-buffer-anchors
+         'is (plist-get op-plan :ot-start) (length prepended))
+        (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))))
+     ((and appended ot-body)
+      (let* ((intent
+              (gdocs--make-push-intent
+               state local-body remote-mappable
+               (lambda (fresh-state fresh-body)
+                 (gdocs--push-insert-plan
+                  fresh-state fresh-body appended :append))))
+             (result (gdocs--run-op-result doc-id state intent)))
+        (setq new-rev (plist-get result :revision))
+        (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))))
+     (ot-body
+      (let* ((para-regions (gdocs--diff-paragraphs
+                            remote-mappable local-stripped))
+             (n-regions (length para-regions)))
+        (if (<= n-regions 1)
+            (let ((single (gdocs--diff-single-region
+                           remote-mappable local-stripped)))
               (when single
-                (setq new-rev (car (gdocs--apply-in-place-region
-                                    doc-id state remote-mappable single))))))
-           ((= n-regions 1)
-            ;; Single paragraph touched — prefer the contracted single-region
-            ;; diff so we ship only the changed substring, not the whole para.
-            (let ((single (gdocs--diff-single-region remote-mappable local-stripped)))
-              (setq new-rev (car (gdocs--apply-in-place-region
-                                  doc-id state remote-mappable single)))))
-           (t
-            ;; Disjoint regions — apply latest-first, refetching state.
-            ;; Sleep between regions so we don't burst the /save rate budget.
-            (let ((regions (nreverse (copy-sequence para-regions)))
-                  (first t))
-              (dolist (region regions)
-                (unless first (sleep-for gdocs--inter-region-delay))
-                (setq first nil)
-                (setq state (gdocs--fetch-edit-state doc-id))
-                (let ((res (gdocs--apply-in-place-region
-                            doc-id state remote-mappable region)))
-                  (setq new-rev (car res)))))))))
-       (t
-        (user-error
-         "gdocs: edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)")))
-      ;; new-rev may be nil if no branch produced an op (e.g. the diff
-      ;; collapses to a no-op after stripping). Don't write garbage to the
-      ;; rev property in that case.
-      (when new-rev
-        (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
-        (gdocs--put-top-property "GDOC_CONTENT_HASH"
-                                 (secure-hash 'sha256 local-body))
-        (gdocs--put-top-property "GDOC_SYNCED_AT" (gdocs--now-iso))
-        (gdocs--mark-synced))
-      new-rev)))
+                (let ((result
+                       (gdocs--apply-in-place-region-result
+                        doc-id state remote-mappable single local-body)))
+                  (setq new-rev (plist-get result :revision)))))
+          ;; Recompute the remaining regions from the verified body after
+          ;; every successful operation.  The original region list is never
+          ;; sent to a newer remote snapshot.
+          (let ((current-state state)
+                (current-body remote-mappable))
+            (dotimes (index n-regions)
+              (when (> index 0)
+                (sleep-for gdocs--inter-region-delay)
+                ;; A concurrent edit can arrive after the previous
+                ;; operation's verification and before the next one.  Do a
+                ;; fresh revision/body check at that boundary as well.
+                (let ((fresh-state (gdocs--fetch-edit-state doc-id)))
+                  (gdocs--push-verify-state
+                   doc-id fresh-state current-body
+                   (plist-get current-state :revision))
+                  (setq current-state fresh-state
+                        current-body (gdocs--push-state-body
+                                      doc-id fresh-state))))
+              (let* ((fresh-regions
+                      (gdocs--push-region-list current-body local-stripped))
+                     (region (car (last fresh-regions))))
+                (unless region
+                  (user-error "gdocs: remaining multi-region plan disappeared"))
+                (let ((result
+                       (gdocs--apply-in-place-region-result
+                        doc-id current-state current-body region local-body)))
+                  (setq new-rev (plist-get result :revision)
+                        current-state (plist-get result :state)
+                        current-body (plist-get result :body)))))))))
+     (t
+      (user-error
+       "gdocs: edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)")))
+    ;; Never write a final baseline for a failed or ambiguous operation.
+    (when new-rev
+      (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
+      (gdocs--put-top-property "GDOC_CONTENT_HASH"
+                               (secure-hash 'sha256 local-body))
+      (gdocs--put-top-property "GDOC_SYNCED_AT" (gdocs--now-iso))
+      (gdocs--mark-synced))
+    new-rev))
 
 (defun gdocs-push-remotely (&optional doc-id)
   "Push buffer to remote via the cookie-authenticated /save endpoint.
