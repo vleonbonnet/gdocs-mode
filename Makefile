@@ -10,7 +10,7 @@ TEST_SETUP = --eval '(setq load-prefer-newer t)'
 test: ; $(EMACS_BATCH) $(TEST_SETUP) -l $(TEST_FILE) --eval '(ert-run-tests-batch-and-exit (quote (not (tag integration))))'
 
 byte-compile:
-@set -e; \
+	@set -e; \
 build_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/gdocs-mode-build.XXXXXX"); \
 trap 'status=$$?; rm -rf "$$build_dir"; exit $$status' EXIT HUP INT TERM; \
 GDOCS_MODE_BYTE_COMPILE_DIR="$$build_dir" \
@@ -18,7 +18,9 @@ $(EMACS) -Q --batch -L "$$build_dir" -L "$(ROOT_DIR)" -L "$(ROOT_DIR)/test" $(TE
 -l "$(TEST_FILE)" \
 --eval '(progn (require (quote bytecomp)) (setq byte-compile-dest-file-function (lambda (filename) (expand-file-name (concat (file-name-sans-extension (file-name-nondirectory filename)) ".elc") (getenv "GDOCS_MODE_BYTE_COMPILE_DIR")))))' \
 --eval '(unless (byte-compile-file "$(ROOT_DIR)/gdocs-mode.el") (error "Byte compilation failed for gdocs-mode.el"))' \
---eval '(unless (byte-compile-file "$(TEST_FILE)") (error "Byte compilation failed for $(TEST_FILE)"))'
+--eval '(unless (byte-compile-file "$(TEST_FILE)") (error "Byte compilation failed for $(TEST_FILE)"))'; \
+test -s "$$build_dir/gdocs-mode.elc"; \
+test -s "$$build_dir/gdocs-mode-test.elc"
 
 check: test byte-compile
 
