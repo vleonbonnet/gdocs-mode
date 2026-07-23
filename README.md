@@ -26,8 +26,11 @@ overwritten. Unchanged inline images can be preserved while an incremental
 text edit is proven not to touch them; edits that change, move, duplicate, or
 delete an image remain refused.
 - **Auto-sync** — an idle timer polls the remote revision. If the remote
-advanced and the local buffer is clean, it pulls automatically; if both sides
-changed, it surfaces a one-shot conflict warning and takes no action.
+revision changed and the local buffer is clean, it pulls automatically; if
+only the local buffer changed, it pushes automatically. If both sides changed,
+it surfaces one actionable conflict warning per remote revision and takes no
+action, so neither side is overwritten. Missing revisions or a failed state
+fetch also skip synchronization and report a diagnostic.
 - **Org link interception** — opening a `docs.google.com/document/d/...` link
 in Org opens it through `gdocs-mode` instead of the browser.
 

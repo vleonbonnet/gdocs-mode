@@ -127,6 +127,11 @@ at the moment of the last successful pull or push. Used by
 on `buffer-modified-p' (which is unreliable in temp/indirect buffers
 and not set when content is inserted programmatically).")
 
+(defvar-local gdocs--auto-sync-conflict-revision nil
+  "Remote revision for which auto-sync last warned about a conflict.
+A warning is emitted again when the remote revision changes or the
+conflict has disappeared and later recurs.")
+
 
 ;;; Logging
 
@@ -4858,7 +4863,8 @@ Synchronization metadata, including `GDOC_TITLE', is excluded. A body
 (defun gdocs--mark-synced ()
   "Record the current buffer body hash as the post-sync baseline.
 Call inside `with-current-buffer' after every successful pull or push."
-  (setq gdocs--last-synced-hash (gdocs--current-body-hash)))
+  (setq gdocs--last-synced-hash (gdocs--current-body-hash)
+        gdocs--auto-sync-conflict-revision nil))
 
 (defun gdocs--buffer-body-as-plain ()
   "Dump the pushable body, excluding synchronization metadata.
@@ -7947,10 +7953,10 @@ single-region diff, and the locate result (if any). Default OUT-FILE is
   "Sync this buffer with its remote Google Doc.
 
 Decision (resolved per tick after a single edit-state probe):
-  - Remote rev > local rev   → pull (remote always wins on conflict).
-  - Remote rev == local rev and buffer hash differs from
-    `gdocs--last-synced-hash' → push the local edits.
-  - Otherwise → noop.
+  - Remote and local revisions differ, and the buffer is clean → pull.
+  - Remote and local revisions match, and the buffer is dirty → push.
+  - Both revisions differ and the buffer is dirty → warn and do nothing.
+  - Either revision is unavailable → report the diagnostic and do nothing.
 
 Local-edit detection uses a buffer-local hash baseline refreshed by
 `gdocs--mark-synced' at every successful pull/push (not
@@ -7967,31 +7973,65 @@ transient network blip doesn't disable auto-sync."
       (gdocs--fetch-edit-state-async
        doc-id
        (lambda (state err)
-         (when (and (not err) state (buffer-live-p buf))
+         (cond
+          (err
+           (gdocs-log 'warn "Auto-sync state fetch failed for %s: %s"
+                      doc-id err))
+          ((null state)
+           (gdocs-log 'warn
+                      "Auto-sync skipped for %s: remote revision unavailable"
+                      doc-id))
+          ((buffer-live-p buf)
            (with-current-buffer buf
              (let* ((remote-rev (plist-get state :revision))
                     (local-rev (org-entry-get (point-min) "GDOC_REVISION" t))
-                    (have-revs (and remote-rev local-rev
-                                    (not (string-empty-p local-rev))))
+                    (remote-rev-number
+                     (cond
+                      ((integerp remote-rev) remote-rev)
+                      ((and (stringp remote-rev)
+                            (string-match-p "\\`[0-9]+\\'" remote-rev))
+                       (string-to-number remote-rev))))
+                    (local-rev-number
+                     (and (stringp local-rev)
+                          (string-match-p "\\`[0-9]+\\'" local-rev)
+                          (string-to-number local-rev)))
+                    (have-revs (and (numberp remote-rev-number)
+                                    (numberp local-rev-number)))
                     (stale (and have-revs
-                                (not (string= local-rev
-                                              (number-to-string remote-rev)))))
+                                (/= remote-rev-number local-rev-number)))
                     (cur-hash (gdocs--current-body-hash))
                     (dirty (and gdocs--last-synced-hash
                                 (not (string= cur-hash
                                               gdocs--last-synced-hash)))))
                (cond
-                (stale
-                 (gdocs-pull-locally
-                  doc-id
-                  (lambda (_body p-err)
-                    (when (and (not p-err) (buffer-live-p buf))
-                      (with-current-buffer buf
-                        (gdocs-log 'info "Auto-pulled %s to rev %S"
-                                   doc-id remote-rev))))))
-                (dirty
-                 (gdocs-log 'info "Auto-pushing %s (local edits)" doc-id)
-                 (gdocs-push-remotely doc-id)))))))))))
+                ((not have-revs)
+                 (gdocs-log 'warn
+                            "Auto-sync skipped for %s: revision unavailable (remote=%S local=%S)"
+                            doc-id remote-rev local-rev))
+                ((and stale dirty)
+                 (unless (equal gdocs--auto-sync-conflict-revision
+                                remote-rev-number)
+                   (setq gdocs--auto-sync-conflict-revision remote-rev-number)
+                   (gdocs-log
+                    'warn
+                    "Auto-sync conflict for %s at remote revision %s: local and remote changed; neither pull nor push was performed. Resolve the changes, then run `gdocs-pull-locally' or `gdocs-push-remotely'."
+                    doc-id remote-rev-number)))
+                (t
+                 ;; A valid non-conflicting state means an earlier conflict
+                 ;; no longer applies, even if the subsequent sync fails.
+                 (setq gdocs--auto-sync-conflict-revision nil)
+                 (cond
+                  (stale
+                   (gdocs-pull-locally
+                    doc-id
+                    (lambda (_body p-err)
+                      (when (and (not p-err) (buffer-live-p buf))
+                        (with-current-buffer buf
+                          (gdocs-log 'info "Auto-pulled %s to rev %S"
+                                     doc-id remote-rev-number))))))
+                  (dirty
+                   (gdocs-log 'info "Auto-pushing %s (local edits)" doc-id)
+                   (gdocs-push-remotely doc-id))))))))))))))
 
 (defun gdocs--enable ()
   (gdocs--mark-synced)
