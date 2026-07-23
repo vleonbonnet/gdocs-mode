@@ -16,23 +16,54 @@ properly sync.
 - **Pull** — fetches the current remote content and rewrites the local buffer.
 Headings, paragraphs, bold/italic/code spans, bullet and numbered lists,
 tables, code blocks, and inline image metadata convert to Org equivalents.
-Remote images are represented by explicit `#+gdocs_inline_object:` markers;
-the image bytes are not downloaded.
+Remote images are represented by explicit remote-object placeholders: standalone
+images use `#+gdocs_inline_object:` and images embedded in prose use
+`@@gdocs-inline-object:image ENTITY WIDTHxHEIGHT content-id=CONTENT@@`; the
+image bytes are not downloaded.
+Comments are pulled into a read-only local projection. Comments with unambiguous
+anchors get footnote references at those anchors, and all fetched comments are
+listed in a local `* Comments` subtree. The projection is stripped before push;
+editing or pushing comments is unsupported.
 - **Push** — converts the local Org buffer back to Google Docs format and
-writes it remotely. Sections that existed before the last pull are updated in
-place; new sections are appended. A push is refused if the remote document
-changed since the last pull, so concurrent edits are never silently
-overwritten. Unchanged inline images can be preserved while an incremental
-text edit is proven not to touch them; edits that change, move, duplicate, or
-delete an image remain refused.
-- **Auto-sync** — an idle timer polls the remote revision. If the remote
-revision changed and the local buffer is clean, it pulls automatically; if
-only the local buffer changed, it pushes automatically. If both sides changed,
-it surfaces one actionable conflict warning per remote revision and takes no
-action, so neither side is overwritten. Missing revisions or a failed state
-fetch also skip synchronization and report a diagnostic.
+writes it remotely. The configured `gdocs-push-backend` determines whether the
+push is a full replacement/re-encoding, a model-level incremental update, or a
+legacy plain-text diff. A push does not always update existing sections in
+place.
+- **Auto-sync** — a periodic timer (`run-with-timer`) polls the remote revision
+every `gdocs-auto-sync-interval` seconds. Its decision table is:
+
+| Remote/local revision state | Local body | Action |
+|-----------------------------|------------|--------|
+| Different                   | Clean      | Pull     |
+| Same                        | Dirty      | Push     |
+| Different                   | Dirty      | Warn once for that remote revision; take no action |
+| Same                        | Clean      | Take no action |
+| Either revision unavailable, or state fetch fails | Either | Report a diagnostic; take no action |
+
+Local dirty state is determined from a hash baseline refreshed after successful
+syncs, not from `buffer-modified-p`. A manual `gdocs-push-remotely` also refuses
+to push when the fetched remote revision differs from the buffer's
+`GDOC_REVISION`.
+
 - **Org link interception** — opening a `docs.google.com/document/d/...` link
 in Org opens it through `gdocs-mode` instead of the browser.
+
+### Push backends
+
+`gdocs-push-backend` defaults to `ot-encode`:
+
+| Backend | Behavior |
+|---------|----------|
+| `ot-encode` | Default. Rebuilds the document model from the local Org buffer and emits a full replacement/re-encoding, including supported styles and structure. |
+| `ot-incremental` | Decodes the live OT body into a document model and computes a paragraph-level model diff. Safe changes use incremental operations; changes involving lists, tables, or changed inline-object paragraphs fall back to a full replacement/re-encoding. |
+| `plain` | Legacy/experimental plain-text diff. Emits only `is`/`ds` text operations and no style information; it is lossy and not recommended. |
+
+Full replacements and incremental operations both go through capability
+preflight. Unsupported remote content is handled fail-closed: a full
+replacement is refused, while an incremental edit is allowed only when every
+unsupported capability has a known range, untouched preservation is explicitly
+proven, and no edited range intersects it. If that proof is unavailable, the
+push is refused.
 
 ### Spacing canonicalization
 
@@ -57,8 +88,8 @@ synthetic heading blank cannot become a new remote paragraph on every cycle.
 
 The supported round-trip surface is headings, paragraphs, inline emphasis,
 links, lists, tables, and source blocks. Google Docs inline images are
-pullable but intentionally not editable. A pulled image is rendered as an
-explicit remote placeholder such as:
+pullable but intentionally not editable. A standalone pulled image is rendered
+as an explicit remote placeholder such as:
 
 ```org
 #+gdocs_inline_object: image kix.example 468x102 content-id=s-blob-v1-IMAGE-example
@@ -66,17 +97,19 @@ explicit remote placeholder such as:
 
 The placeholder is metadata, not prose and not an Org image link. Its entity
 ID, object kind, content ID, and dimensions form its stable identity. Do not
-edit, remove, move, or recreate it and then push: the push is refused rather
-than silently deleting the remote image. Unrelated text edits may use the
-incremental backend when the image is proven untouched. If the
-entity-to-placeholder association cannot be established from Google's OT
-`te.spi` attachment, the document is marked unsupported and push remains
-refused.
+edit, remove, move, or recreate it and then push: a full-replacement push is
+refused rather than silently deleting the remote image. A safe incremental edit
+may proceed only when the remote image is matched to its unchanged local
+placeholder and the edit range is proven not to touch it. Image creation,
+deletion, movement, duplication, metadata changes, and ambiguous
+entity-to-placeholder associations remain refused.
 
 ## Requirements
 
 - Emacs **29.1+** (uses the built-in `sqlite-*` API for the cookie backend).
 - [`request`](https://github.com/tkf/emacs-request) **0.3.2+**.
+- `curl` available on `PATH` at runtime. Asynchronous networking invokes
+external `curl` subprocesses.
 
 ## Installation
 
@@ -96,12 +129,12 @@ directly from Git:
 ```elisp
 ;; elpaca
 (use-package gdocs-mode
-  :ensure (:host github :repo "vleonbonnet/gdocs-mode"))
+:ensure (:host github :repo "vleonbonnet/gdocs-mode"))
 
 ;; straight
 (use-package gdocs-mode
   :straight (gdocs-mode :host github :repo "vleonbonnet/gdocs-mode"))
-```
+  ```
 
 ## Authentication
 
@@ -205,8 +238,8 @@ These properties are maintained on the top-level node of every synced buffer:
 | Variable                  | Default     | Purpose                                                  |
 |---------------------------|-------------|----------------------------------------------------------|
 | `gdocs-auth-function`     | `nil`       | Returns the HTTP auth headers (see above). **Required.** |
-| `gdocs-push-backend`      | `ot-encode` | Push strategy. `ot-encode` preserves structure/styling.  |
-| `gdocs-auto-sync-interval`| `5`         | Idle seconds between background pull checks.             |
+| `gdocs-push-backend`      | `ot-encode` | Push strategy; see [Push backends](#push-backends).      |
+| `gdocs-auto-sync-interval`| `5`         | Seconds between periodic background sync checks.         |
 | `gdocs-log-level`         | `warn`      | One of `debug`, `info`, `warn`, `error`.                |
 | `gdocs-session-file`      | XDG cache   | Where the persistent `/save` SID + request id are kept. |
 
@@ -238,8 +271,10 @@ story yet.
 - **Format fidelity is best-effort.** Headings, paragraphs, inline emphasis,
 lists, tables, and code blocks round-trip. Inline images are pull-only
 placeholders; downloading, uploading, moving, replacing, and deleting them
-through push are unsupported. Docs-specific features with no Org equivalent
-(comments, suggestions, column layouts) are out of scope.
+through push are unsupported except for safe incremental text edits that prove
+the image was left untouched. Comments are pulled as a read-only footnote and
+`* Comments` projection, stripped before push, and cannot be edited or pushed.
+Suggestions and column layouts remain out of scope.
 - **Rate limiting.** Google's `/save` endpoint rejects malformed or
 excessively bursty requests; the mode persists a session SID to look like a
 single stable client.
