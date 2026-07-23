@@ -700,32 +700,33 @@ the doc or any buffer. The caller's `gdocs-auth-function' is used."
 (defsubst gdocs-dm-inline-objects (doc) (plist-get doc :inline-objects))
 (defsubst gdocs-dm-unsupported (doc) (plist-get doc :unsupported))
 
-;; Capability classification is deliberately separate from the doc-model.
-;; New Google entities or attributes can be added here without changing push
-;; policy: the decoder records a capability report and the preflight decides
-;; whether the planned OT edit can leave it untouched.
+;; The registry describes wire-level recognition only.  A recognized key is
+;; not necessarily a supported capability: the value-policy tables below
+;; distinguish fields that are faithfully round-tripped from fields that are
+;; merely normalized to the defaults emitted by this package.
 (defconst gdocs--capability-registry
   '((:operation
-     ("is" . :supported)
-     ("ds" . :supported)
+     ("is" . :recognized)
+     ("ds" . :recognized)
      ("as" . :attribute)
-     ("ae" . :entity)
+     ("ae" . :entity-definition)
      ("te" . :entity-attachment))
     (:entity
-     ("list" . :supported)
+     ("list" . :recognized)
      ("inline" . :recognized-not-editable))
     (:attribute
-     ("text" . :supported)
-     ("link" . :supported)
-     ("paragraph" . :supported)
-     ("list" . :supported)
-     ("tbl" . :supported)
+     ("text" . :recognized)
+     ("link" . :recognized)
+     ("paragraph" . :recognized)
+     ("list" . :recognized)
+     ("tbl" . :recognized)
      ("doco_anchor" . :recognized-not-editable)))
   "Central registry for raw Google Docs OT constructs.
 
-The values describe decoder coverage, not push safety. A recognized
-not-editable construct still becomes a structured `:unsupported' report;
-the push preflight may allow it only when an edit is proven not to touch it.")
+The values describe wire-level recognition, not push safety.  Semantic value
+support is defined by the capability policy tables, because recognizing a
+field name alone does not prove that its value survives a decode/encode
+round-trip.")
 
 (defun gdocs--capability-classify (category value)
   "Return the registry classification for CATEGORY and VALUE.
@@ -733,15 +734,87 @@ Unknown values are classified as `:unknown'."
   (or (cdr (assoc value (cdr (assq category gdocs--capability-registry))))
       :unknown))
 
-(defconst gdocs--capability-known-text-style-keys
-  '(ts_bd ts_bd_i ts_it ts_it_i ts_un ts_un_i ts_st ts_st_i
-          ts_ff ts_ff_i ts_fs ts_fs_i ts_fgc2 ts_fgc2_i ts_bgc2 ts_bgc2_i
-          ts_va ts_va_i ts_sc ts_sc_i ts_tw ts_tw_i)
-  "Text-style keys whose current decoder understands or intentionally
-normalizes their value.
+;; Policy values:
+;;   :supported    The semantic value is decoded and emitted faithfully.
+;;   :normalized   Only the canonical/default value is emitted; other values
+;;                 must be reported as potentially destructive.
+;;   :explicitness The key records inheritance/explicitness, not formatting.
+;; This is intentionally a table rather than a list of recognized names.
+(defconst gdocs--capability-text-style-key-policy
+  '((ts_bd . :supported) (ts_bd_i . :explicitness)
+    (ts_it . :supported) (ts_it_i . :explicitness)
+    (ts_un . :supported) (ts_un_i . :explicitness)
+    (ts_st . :supported) (ts_st_i . :explicitness)
+    (ts_ff . :normalized) (ts_ff_i . :explicitness)
+    (ts_fs . :normalized) (ts_fs_i . :explicitness)
+    (ts_fgc2 . :normalized) (ts_fgc2_i . :explicitness)
+    (ts_bgc2 . :normalized) (ts_bgc2_i . :explicitness)
+    (ts_va . :normalized) (ts_va_i . :explicitness)
+    (ts_sc . :normalized) (ts_sc_i . :explicitness)
+    (ts_tw . :normalized) (ts_tw_i . :explicitness))
+  "Classification table for observed text-style keys.
 
-The key list is conservative about *new* Google style dimensions while
-allowing the common explicitness/default fields already emitted by Docs.")
+The normalized entries are supported only for their canonical values.  Their
+non-default semantic values are not represented by the Org model and are
+therefore reported by the capability scanner.")
+
+(defconst gdocs--capability-known-text-style-keys
+  (mapcar #'car gdocs--capability-text-style-key-policy)
+  "Text-style keys understood by the scanner.
+
+This is a *known* key list, not a list of keys whose values are all
+supported.  See `gdocs--capability-text-style-key-policy'.")
+
+(defconst gdocs--capability-paragraph-style-key-policy
+  '((ps_hd . :supported) (ps_hd_i . :explicitness)
+    (ps_hdid . :supported) (ps_hdid_i . :explicitness)
+    (ps_il . :normalized) (ps_il_i . :explicitness)
+    (ps_ifl . :normalized) (ps_ifl_i . :explicitness)
+    (ps_al . :normalized) (ps_al_i . :explicitness))
+  "Classification table for observed paragraph-style keys.
+
+Heading levels and heading anchors have Org representations.  Indentation and
+alignment are decoded for pull diagnostics, but the current Org model does not
+emit them; only their ordinary defaults are therefore safe to normalize.")
+
+(defconst gdocs--capability-table-attribute-key-policy
+  '((tbls_tblid . :normalized) (tbls_cols . :normalized)
+    (cv . :normalized) (op . :normalized) (opValue . :normalized)
+    (col_wv . :normalized) (col_wt . :normalized)
+    (col_tdt . :normalized) (tdt_v . :normalized)
+    (col_tf . :normalized) (ttf_vn . :normalized)
+    (ttf_n . :normalized))
+  "Classification table for table attributes.
+
+The table shape and canonical column defaults are emitted, but the Org model
+has no table-width or table-specific formatting representation.  Any
+non-canonical column value is consequently destructive on replacement.")
+
+(defconst gdocs--capability-supported-font-family-mappings
+  '(("Arial" . :default)
+    ("Courier New" . :verbatim)
+    ("Roboto Mono" . :code))
+  "Font families with an exact representation in the Org model.
+
+The two monospace names are deliberate encoder/decoder markers.  Do not use
+substring matching here: an arbitrary family containing `Courier' or `Mono'
+would otherwise be silently replaced by one of these mappings.")
+
+(defconst gdocs--capability-default-text-size 11.0)
+(defconst gdocs--capability-default-foreground-color "#000000")
+(defconst gdocs--capability-default-vertical-alignment "nor")
+(defconst gdocs--capability-default-text-weight 400)
+
+(defun gdocs--capability-font-family-style (family)
+  "Return the exact Org style represented by FONT or nil.
+
+`:default' means that the family is the ordinary emitted family and carries
+no Org inline marker."
+  (cdr (assoc family gdocs--capability-supported-font-family-mappings)))
+
+(defun gdocs--capability-table-key-policy (key)
+  "Return the classification for table attribute KEY, or nil."
+  (cdr (assq key gdocs--capability-table-attribute-key-policy)))
 
 (defun gdocs--capability-kind-label (kind)
   "Return a concise, user-facing label for capability KIND."
@@ -964,8 +1037,11 @@ the older intermediate shape as well."
           (t 'unset))))
 
 (defun gdocs--styles-from-text-sm (sm)
-  "Convert a text-style SM to a plist of (:bold/:italic/.../ :code) flags
-plus optional :clears flag plist."
+  "Convert the supported semantic parts of text-style SM to Org flags.
+
+Font families are mapped only when an exact Org representation exists.  Other
+semantic dimensions are intentionally left to the capability scanner rather
+than being silently discarded here."
   (let (out)
     (pcase (gdocs--sm-bool sm 'ts_bd)
       ('t (setq out (plist-put out :bold t)))
@@ -982,20 +1058,23 @@ plus optional :clears flag plist."
     (let ((ff (alist-get 'ts_ff sm 'unset)))
       ;; Font family is our channel for distinguishing inline `=verbatim='
       ;; from `~code~' — Google Docs has only one inline-code style, but
-      ;; the font dimension is preserved across round-trips. We pick a
-      ;; specific monospace name per org marker on push (see
-      ;; `gdocs--sm-text-explicit') and decode it back here.
-      (cond
-       ((and (stringp ff) (string-match-p "Courier" ff))
-        (setq out (plist-put out :verbatim t))
-        (setq out (plist-put out :code nil)))
-       ((and (stringp ff) (string-match-p "Mono" ff))
-        (setq out (plist-put out :code t))
-        (setq out (plist-put out :verbatim nil)))
-       ((eq ff :json-false)
-        (setq out (plist-put out :code nil))
-        (setq out (plist-put out :verbatim nil)))))
-    out))
+      ;; these two exact names are preserved across round-trips.  All other
+      ;; families are reported by `gdocs--scan-unsupported-capabilities'.
+      (unless (eq ff 'unset)
+        (pcase (and (stringp ff) (gdocs--capability-font-family-style ff))
+          (:verbatim
+           (setq out (plist-put out :verbatim t))
+           (setq out (plist-put out :code nil)))
+          (:code
+           (setq out (plist-put out :code t))
+           (setq out (plist-put out :verbatim nil)))
+          ;; Arial, an explicit unset, or an unsupported family all mean that
+          ;; this range is not one of the two Org monospace mappings.  The
+          ;; unsupported case is blocked by the scanner before a push.
+          (_
+           (setq out (plist-put out :code nil))
+           (setq out (plist-put out :verbatim nil)))))
+      out)))
 
 (defun gdocs--styles-apply (cur new)
   "Layer NEW onto CUR. Both are style plists; NEW's keys override."
@@ -1119,8 +1198,12 @@ gets to reuse the URL from a neighboring range."
     vec))
 
 (defun gdocs--decode-para-attrs (ops)
-  "Walk paragraph-style ops; return an alist OT-POS → (:heading N
-:anchor S :indent-left X :indent-first X :align V)."
+  "Walk paragraph-style ops; return an alist OT-POS → decoded attributes.
+
+Heading levels and anchors are represented in the Org model.  Indentation and
+alignment are retained here so the capability scanner can report non-default
+values with their OT ranges; they are not silently treated as supported by
+the decoder merely because they are decoded."
   (let (out)
     (dolist (op ops)
       (when (and (equal (alist-get 'ty op) "as")
@@ -1157,18 +1240,25 @@ gets to reuse the URL from a neighboring range."
     out))
 
 (defun gdocs--decode-table-attrs (ops)
-  "Walk table-style ops; return alist OT-POS → (:table-id S :cols N)."
+  "Walk table-style ops; return alist OT-POS → (:table-id S :cols N).
+
+Only table identity and column count have a model representation.  Column
+widths and nested table attributes are validated separately by
+`gdocs--scan-unsupported-capabilities' before a push is allowed."
   (let (out)
     (dolist (op ops)
       (when (and (equal (alist-get 'ty op) "as")
                  (equal (alist-get 'st op) "tbl"))
         (let* ((si (alist-get 'si op))
                (sm (alist-get 'sm op))
-               (id (alist-get 'tbls_tblid sm))
-               (cols (alist-get 'tbls_cols sm))
-               (col-cv (alist-get 'cv cols))
-               (col-vec (alist-get 'opValue col-cv))
-               (ncols (length col-vec)))
+               (id (and (listp sm) (alist-get 'tbls_tblid sm)))
+               (cols (and (listp sm) (alist-get 'tbls_cols sm)))
+               (col-cv (and (listp cols) (alist-get 'cv cols)))
+               (col-vec (and (listp col-cv)
+                             (alist-get 'opValue col-cv)))
+               (ncols (if (or (listp col-vec) (vectorp col-vec))
+                          (length col-vec)
+                        0)))
           (push (cons si (list :table-id id :cols ncols)) out))))
     out))
 
@@ -1425,13 +1515,311 @@ operation order is deliberately ignored.  The result is a plist with
          (append (gdocs--capability-op-range op) props)))
 
 (defun gdocs--capability-unknown-style-keys (sm known)
-  "Return unknown top-level keys in style modifier SM."
+  "Return unknown semantic keys in style modifier SM.
+
+Explicitness/inheritance keys ending in `_i' are deliberately excluded:
+their presence does not carry a formatting value, and they are classified
+separately by the policy tables."
   (if (not (listp sm))
       '(:malformed-style)
     (cl-loop for entry in sm
              for key = (and (consp entry) (car entry))
-             unless (and key (memq key known))
+             unless (and key
+                         (or (memq key known)
+                             (and (symbolp key)
+                                  (string-suffix-p "_i" (symbol-name key)))))
              collect (or key :malformed-style))))
+
+(defun gdocs--capability-default-value-p (value)
+  "Return non-nil when VALUE means an ordinary unset/default value."
+  (memq value '(nil :json-false :null)))
+
+(defun gdocs--capability-number-equal-p (value expected)
+  "Return non-nil when numeric VALUE equals numeric EXPECTED."
+  (and (numberp value) (numberp expected) (= value expected)))
+
+(defun gdocs--capability-color-default-p (value default-color)
+  "Return non-nil when color VALUE has the emitted DEFAULT-COLOR semantics.
+
+Google represents colors as an object containing `hclr_color' and
+`clr_type'.  Missing/default components are accepted because they carry the
+same visible result as the canonical emitted object."
+  (cond
+   ((gdocs--capability-default-value-p value) t)
+   ((stringp value)
+    (if default-color
+        (string-equal (downcase value) (downcase default-color))
+      (string-empty-p value)))
+   ((listp value)
+    (and (cl-every
+          (lambda (entry)
+            (memq (car-safe entry) '(hclr_color clr_type)))
+          value)
+         (let* ((color-entry (assq 'hclr_color value))
+                (color (and color-entry (cdr color-entry)))
+                (type-entry (assq 'clr_type value))
+                (type (and type-entry (cdr type-entry))))
+           (and (or (null color-entry)
+                    (gdocs--capability-default-value-p color)
+                    (and (stringp color)
+                         (if default-color
+                             (string-equal (downcase color)
+                                           (downcase default-color))
+                           (string-empty-p color))))
+                (or (null type-entry)
+                    (gdocs--capability-default-value-p type)
+                    (gdocs--capability-number-equal-p type 0))))))
+   (t nil)))
+
+(defun gdocs--capability-text-style-value-supported-p (key value)
+  "Return non-nil when semantic text-style KEY/VALUE is round-trip safe."
+  (pcase key
+    ((or 'ts_bd 'ts_it 'ts_un 'ts_st)
+     (or (gdocs--capability-default-value-p value) (eq value t)))
+    ('ts_ff
+     (or (gdocs--capability-default-value-p value)
+         (and (stringp value)
+              (gdocs--capability-font-family-style value))))
+    ('ts_fs
+     (or (gdocs--capability-default-value-p value)
+         (gdocs--capability-number-equal-p
+          value gdocs--capability-default-text-size)))
+    ('ts_fgc2
+     (gdocs--capability-color-default-p
+      value gdocs--capability-default-foreground-color))
+    ('ts_bgc2
+     (gdocs--capability-color-default-p value nil))
+    ('ts_va
+     (or (gdocs--capability-default-value-p value)
+         (equal value gdocs--capability-default-vertical-alignment)))
+    ('ts_sc
+     (or (gdocs--capability-default-value-p value) (eq value nil)))
+    ('ts_tw
+     (or (gdocs--capability-default-value-p value)
+         (gdocs--capability-number-equal-p
+          value gdocs--capability-default-text-weight)))
+    (_ t)))
+
+(defun gdocs--capability-unsupported-value-report
+    (kind explanation op feature-type)
+  "Build a range-bearing report for unsupported semantic FEATURE-TYPE."
+  (gdocs--capability-report-for-op
+   kind explanation op
+   :feature-type feature-type
+   :preserve-untouched t :refuse-push nil
+   :push-policy :allow-if-untouched))
+
+(defun gdocs--scan-text-style-modifier (op sm)
+  "Return reports for unknown or non-round-trippable text modifier SM."
+  (append
+   (mapcar
+    (lambda (key)
+      (gdocs--capability-report-for-op
+       :unsupported-style
+       "A remote text-style dimension is not represented by the Org/OT model."
+       op :feature-type (format "%s" key)
+       :preserve-untouched t :refuse-push nil
+       :push-policy :allow-if-untouched))
+    (gdocs--capability-unknown-style-keys
+     sm gdocs--capability-known-text-style-keys))
+   (gdocs--scan-text-style-values op sm)))
+
+(defun gdocs--scan-text-style-values (op sm)
+  "Return reports for non-round-trippable semantic values in text SM."
+  (when (listp sm)
+    (cl-loop for (key . policy) in gdocs--capability-text-style-key-policy
+             for entry = (assq key sm)
+             when (and entry
+                       (not (eq policy :explicitness))
+                       (not (gdocs--capability-text-style-value-supported-p
+                             key (cdr entry))))
+             collect
+             (gdocs--capability-unsupported-value-report
+              :unsupported-style
+              "A remote text-style value is not represented by the Org model and would be replaced on push."
+              op (symbol-name key)))))
+
+(defun gdocs--scan-list-text-style (op sm)
+  "Return reports for the optional nested list text-style block in SM."
+  (when (listp sm)
+    (let ((list-style (alist-get 'ls_ts sm 'unset)))
+      (cond
+       ((or (eq list-style 'unset)
+            (gdocs--capability-default-value-p list-style))
+        nil)
+       ((listp list-style)
+        (gdocs--scan-text-style-modifier op list-style))
+       (t
+        (list
+         (gdocs--capability-unsupported-value-report
+          :unsupported-paragraph
+          "A remote list text-style block is not represented by the Org/OT model."
+          op "ls_ts")))))))
+
+(defun gdocs--paragraph-heading-value-supported-p (value)
+  "Return non-nil for paragraph heading values the Org model can emit."
+  (or (gdocs--capability-default-value-p value)
+      (and (integerp value)
+           (memq value '(0 1 2 3 4 5 100 101)))))
+
+(defun gdocs--paragraph-style-value-supported-p (key value attrs)
+  "Return non-nil when paragraph semantic KEY/VALUE survives emission.
+ATTRS is the effective decoded paragraph attribute plist at the operation's
+position, used to validate heading anchors that arrive in a separate op."
+  (pcase key
+    ('ps_hd (gdocs--paragraph-heading-value-supported-p value))
+    ('ps_hdid
+     (or (gdocs--capability-default-value-p value)
+         (and (stringp value)
+              (not (string-empty-p value))
+              (integerp (plist-get attrs :heading))
+              (memq (plist-get attrs :heading)
+                    '(1 2 3 4 5 100 101)))))
+    ((or 'ps_il 'ps_ifl 'ps_al)
+     (or (gdocs--capability-default-value-p value)
+         (gdocs--capability-number-equal-p value 0)))
+    (_ t)))
+
+(defun gdocs--scan-paragraph-style-values (op sm para-attrs)
+  "Return reports for non-round-trippable semantic values in paragraph SM."
+  (when (listp sm)
+    (let* ((si (alist-get 'si op))
+           (attrs (cdr (assq si para-attrs))))
+      (cl-loop for (key . policy) in gdocs--capability-paragraph-style-key-policy
+               for entry = (assq key sm)
+               when (and entry
+                         (not (eq policy :explicitness))
+                         (not (gdocs--paragraph-style-value-supported-p
+                               key (cdr entry) attrs)))
+               collect
+               (gdocs--capability-unsupported-value-report
+                :unsupported-paragraph
+                "A remote paragraph value is not represented by the Org model and would be replaced on push."
+                op (symbol-name key))))))
+
+(defun gdocs--capability-table-column-values (sm)
+  "Return table column values from table SM, or a validation sentinel.
+
+`:absent' and `:default' mean that no non-default column values are present;
+`:invalid' means the table attribute cannot be safely decoded."
+  (let ((entry (and (listp sm) (assq 'tbls_cols sm))))
+    (cond
+     ((null entry) :absent)
+     ((gdocs--capability-default-value-p (cdr entry)) :default)
+     ((not (listp (cdr entry))) :invalid)
+     (t
+      (let* ((cols (cdr entry))
+             (cv-entry (assq 'cv cols)))
+        (cond
+         ((null cv-entry) :default)
+         ((gdocs--capability-default-value-p (cdr cv-entry)) :default)
+         ((not (listp (cdr cv-entry))) :invalid)
+         (t
+          (let* ((cv (cdr cv-entry))
+                 (op-entry (assq 'op cv))
+                 (op (and op-entry (cdr op-entry)))
+                 (values-entry (assq 'opValue cv))
+                 (values (and values-entry (cdr values-entry))))
+            (cond
+             ((or (null op-entry) (equal op "unset")) :default)
+             ((not (equal op "set")) :invalid)
+             ((not (or (listp values) (vectorp values))) :invalid)
+             (t (if (vectorp values) (append values nil) values)))))))))))
+
+(defun gdocs--capability-table-column-unsupported-keys (column)
+  "Return semantic keys in COLUMN that differ from emitted defaults."
+  (cond
+   ((null column) nil)
+   ((not (listp column)) '(table-column))
+   (t
+    (cl-loop for entry in column
+             for key = (and (consp entry) (car entry))
+             for value = (and (consp entry) (cdr entry))
+             unless
+             (or (and (symbolp key)
+                      (string-suffix-p "_i" (symbol-name key)))
+                 (pcase key
+                   ('col_wv (gdocs--capability-number-equal-p value 0))
+                   ('col_wt (gdocs--capability-number-equal-p value 1))
+                   ('col_tdt
+                    (or (gdocs--capability-default-value-p value)
+                        (and (listp value)
+                             (cl-every
+                              (lambda (nested)
+                                (eq (car-safe nested) 'tdt_v))
+                              value)
+                             (let ((nested (assq 'tdt_v value)))
+                               (or (null nested)
+                                   (gdocs--capability-number-equal-p
+                                    (cdr nested) 0))))))
+                   ('col_tf
+                    (or (gdocs--capability-default-value-p value)
+                        (and (listp value)
+                             (cl-every
+                              (lambda (nested)
+                                (memq (car-safe nested) '(ttf_vn ttf_n)))
+                              value)
+                             (let ((version (assq 'ttf_vn value))
+                                   (name (assq 'ttf_n value)))
+                               (and (or (null version)
+                                        (gdocs--capability-number-equal-p
+                                         (cdr version) 0))
+                                    (or (null name)
+                                        (equal (cdr name) "")))))))
+                   (_ nil)))
+             collect (or key 'table-column)))))
+
+(defun gdocs--capability-table-unsupported-keys (sm)
+  "Return unsupported semantic table keys in table attribute SM."
+  (if (not (listp sm))
+      '(tbl)
+    (let (keys)
+      ;; `tbls_tblid' is an identity value and `tbls_cols' is validated below;
+      ;; explicitness fields are not semantic formatting values.
+      (dolist (entry sm)
+        (let ((key (and (consp entry) (car entry))))
+          (unless (or (and (memq key '(tbls_tblid tbls_cols))
+                           (gdocs--capability-table-key-policy key))
+                      (and (symbolp key)
+                           (string-suffix-p "_i" (symbol-name key))))
+            (push key keys))))
+      (let ((cols-entry (assq 'tbls_cols sm)))
+        (when cols-entry
+          (let ((cols (cdr cols-entry)))
+            (unless (gdocs--capability-default-value-p cols)
+              (if (not (listp cols))
+                  (push 'tbls_cols keys)
+                (dolist (entry cols)
+                  (let ((key (and (consp entry) (car entry))))
+                    (unless (or (eq key 'cv)
+                                (and (symbolp key)
+                                     (string-suffix-p "_i" (symbol-name key))))
+                      (push (or key 'tbls_cols) keys)))
+                  (let ((cv-entry (assq 'cv cols)))
+                    (when cv-entry
+                      (let ((cv (cdr cv-entry)))
+                        (unless (gdocs--capability-default-value-p cv)
+                          (if (not (listp cv))
+                              (push 'tbls_cols keys)
+                            (dolist (entry cv)
+                              (let ((key (and (consp entry) (car entry))))
+                                (unless (or (memq key '(op opValue))
+                                            (and (symbolp key)
+                                                 (string-suffix-p
+                                                  "_i" (symbol-name key))))
+                                  (push (or key 'tbls_cols) keys)))
+                              (let ((columns
+                                     (gdocs--capability-table-column-values sm)))
+                                (cond
+                                 ((eq columns :invalid)
+                                  (push 'tbls_cols keys))
+                                 ((listp columns)
+                                  (dolist (column columns)
+                                    (dolist (key
+                                             (gdocs--capability-table-column-unsupported-keys
+                                              column))
+                                      (push key keys))))))))))))))))
+          (delete-dups (nreverse keys)))))))
 
 (defun gdocs--scan-unsupported-capabilities (ops body)
   "Classify raw OPS and structural codepoints in BODY.
@@ -1441,7 +1829,8 @@ never copies an operation, style payload, URL, or entity contents into a
 report. Inline image reports are produced by
 `gdocs--decode-inline-objects'."
   (let ((reports nil)
-        (attachments (make-hash-table :test #'equal)))
+        (attachments (make-hash-table :test #'equal))
+        (para-attrs (gdocs--decode-para-attrs ops)))
     ;; Collect attachment positions first so an unknown entity can carry a
     ;; useful range when Google supplied a `te' operation for it.
     (dolist (op ops)
@@ -1510,9 +1899,13 @@ report. Inline image reports are produced by
                            (levels (and (listp epm)
                                         (alist-get 'le_nb epm))))
                       (dolist (level levels)
-                        (let ((glyph-type
-                               (and (listp (cdr level))
-                                    (alist-get 'b_gt (cdr level)))))
+                        (let* ((level-body (cdr level))
+                               (glyph-type
+                                (and (listp level-body)
+                                     (alist-get 'b_gt level-body)))
+                               (text-style
+                                (and (listp level-body)
+                                     (alist-get 'b_ts level-body 'unset))))
                           (unless (memq glyph-type '(9 10 13 15))
                             (push (gdocs--capability-report
                                    :unsupported-entity
@@ -1521,7 +1914,14 @@ report. Inline image reports are produced by
                                    :entity-id entity-id
                                    :feature-type "b_gt"
                                    :refuse-push t)
-                                  reports)))))
+                                  reports))
+                          (unless (or (eq text-style 'unset)
+                                      (gdocs--capability-default-value-p
+                                       text-style))
+                            (dolist (report
+                                     (gdocs--scan-text-style-modifier
+                                      op text-style))
+                              (push report reports))))))
                   (push (gdocs--capability-report
                          :unsupported-entity
                          "A list entity has no usable identifier."
@@ -1552,19 +1952,12 @@ report. Inline image reports are produced by
                        :refuse-push t)
                       reports))
                ((equal style "text")
-                (dolist (key (gdocs--capability-unknown-style-keys
-                              sm gdocs--capability-known-text-style-keys))
-                  (push (gdocs--capability-report-for-op
-                         :unsupported-style
-                         "A remote text-style dimension is not represented by the Org/OT model."
-                         op :feature-type (format "%s" key)
-                         :preserve-untouched t :refuse-push nil
-                         :push-policy :allow-if-untouched)
-                        reports)))
+                (dolist (report (gdocs--scan-text-style-modifier op sm))
+                  (push report reports)))
                ((equal style "paragraph")
                 (dolist (key (gdocs--capability-unknown-style-keys
-                              sm '(ps_hd ps_hd_i ps_hdid ps_hdid_i
-                                         ps_il ps_ifl ps_al)))
+                              sm (mapcar #'car
+                                         gdocs--capability-paragraph-style-key-policy)))
                   (push (gdocs--capability-report-for-op
                          :unsupported-paragraph
                          "A remote paragraph attribute is not represented by the Org/OT model."
@@ -1572,17 +1965,9 @@ report. Inline image reports are produced by
                          :preserve-untouched t :refuse-push nil
                          :push-policy :allow-if-untouched)
                         reports))
-                (let ((heading (alist-get 'ps_hd sm)))
-                  (when (and (integerp heading)
-                             (not (or (and (<= 1 heading) (<= heading 5))
-                                      (memq heading '(100 101)))))
-                    (push (gdocs--capability-report-for-op
-                           :unsupported-paragraph
-                           "A remote paragraph heading level is not supported by the Org/OT model."
-                           op :feature-type "ps_hd"
-                           :preserve-untouched t :refuse-push nil
-                           :push-policy :allow-if-untouched)
-                          reports))))
+                (dolist (report (gdocs--scan-paragraph-style-values
+                                 op sm para-attrs))
+                  (push report reports)))
                ((equal style "list")
                 (dolist (key (gdocs--capability-unknown-style-keys
                               sm '(ls_id ls_nest ls_ts)))
@@ -1593,6 +1978,8 @@ report. Inline image reports are produced by
                          :preserve-untouched t :refuse-push nil
                          :push-policy :allow-if-untouched)
                         reports))
+                (dolist (report (gdocs--scan-list-text-style op sm))
+                  (push report reports))
                 (let ((nest (alist-get 'ls_nest sm)))
                   (when (and nest
                              (not (and (integerp nest)
@@ -1604,6 +1991,18 @@ report. Inline image reports are produced by
                            :preserve-untouched t :refuse-push nil
                            :push-policy :allow-if-untouched)
                           reports))))
+               ((equal style "tbl")
+                (dolist (key (gdocs--capability-table-unsupported-keys sm))
+                  (push (gdocs--capability-report-for-op
+                         :unsupported-paragraph
+                         "A remote table attribute is not represented by the Org/OT model and would be replaced on push."
+                         op :feature-type
+                         (if (symbolp key)
+                             (format "tbl.%s" (symbol-name key))
+                           "tbl")
+                         :preserve-untouched t :refuse-push nil
+                         :push-policy :allow-if-untouched)
+                        reports)))
                ((equal style "link")
                 (let ((action (gdocs--link-sm-action sm)))
                   (when (eq (plist-get action :action) :invalid)
@@ -4793,18 +5192,25 @@ one-to-one proof must use `gdocs--capability-object-matching-errors'."
   "Return non-nil when an edit in RANGES touches REPORT.
 
 Each range is a plist with `:ot-start' and `:ot-end' inclusive for deleted
-content, `:delete-count', and optional `:insert-at'. Insertions at a
-boundary do not touch an existing capability; deletions do."
+content, `:delete-count', and optional `:insert-at'. Insertions strictly
+inside a capability range touch it; insertions at a boundary do not. Any
+deletion that overlaps the range touches it."
   (let ((cap-range (gdocs--capability-report-range report)))
     (and cap-range
          (cl-some
           (lambda (range)
-            (let ((start (plist-get range :ot-start))
-                  (end (plist-get range :ot-end)))
-              (and (> (or (plist-get range :delete-count) 0) 0)
-                   (integerp start) (integerp end)
-                   (<= (car cap-range) end)
-                   (<= start (cdr cap-range)))))
+            (let* ((start (plist-get range :ot-start))
+                   (end (plist-get range :ot-end))
+                   (insert-at (or (plist-get range :insert-at) start))
+                   (delete-count (or (plist-get range :delete-count) 0)))
+              (and (integerp start) (integerp end)
+                   (or (and (> delete-count 0)
+                            (<= (car cap-range) end)
+                            (<= start (cdr cap-range)))
+                       (and (= delete-count 0)
+                            (integerp insert-at)
+                            (> insert-at (car cap-range))
+                            (< insert-at (cdr cap-range)))))))
           ranges))))
 
 (defun gdocs--inline-markers-as-ot-placeholders (text)
@@ -4843,8 +5249,8 @@ and, for incremental edits, a `:ranges' list.  The optional
 `:inline-object-scope' value `:partial' marks an insertion payload rather than
 the complete local document.  A full replacement is never allowed in the
 presence of destructive unsupported content. An incremental edit is allowed
-only when every report has a known range, explicitly allows untouched
-preservation, and no deletion range intersects it. The caller must pass STATE
+ only when every report has a known range, explicitly allows untouched
+ preservation, and no edit range touches it. The caller must pass STATE
 obtained from the current /edit fetch; raw `:ot-ops' are decoded again here so
 stale buffer-local capability metadata cannot bypass policy."
   (let* ((remote (gdocs--remote-capability-analysis state))

@@ -865,6 +865,7 @@ END is the inclusive final OT position."
          (table (car (gdocs-dm-paragraphs doc))))
     (should (eq (plist-get table :kind) :table))
     (should (= (plist-get table :cols) 2))
+    (should-not (gdocs-dm-unsupported doc))
     (should (equal (gdocs-test--normalize-org (gdocs-dm-to-org doc))
                    "| A1 | B1 |\n| A2 | B2 |\n\nAfter the table\n"))
     (let* ((org-doc (gdocs-dm-from-org "| A1 | B1 |\n| A2 | B2 |\n"))
@@ -2359,6 +2360,156 @@ that a removed preflight guard would be observed as an unexpected success."
     (should (plist-get structural :preserve-untouched))
     (should paragraph)
     (should (equal (plist-get paragraph :feature-type) "ps_pb"))))
+
+(ert-deftest gdocs-test-capability-default-text-style-is-not-reported ()
+  "Canonical Google text defaults do not create unsupported reports."
+  (let* ((body "Default\n")
+         (ops (list
+               (gdocs-test--insert-op body)
+               `((ty . "as") (st . "text") (si . 1) (ei . 7)
+                 (sm . ((ts_bd . :json-false) (ts_bd_i . t)
+                        (ts_it . :json-false) (ts_it_i . t)
+                        (ts_un . :json-false) (ts_un_i . t)
+                        (ts_st . :json-false) (ts_st_i . t)
+                        (ts_ff . "Arial") (ts_ff_i . t)
+                        (ts_fs . 11.0) (ts_fs_i . t)
+                        (ts_fgc2 . ((hclr_color . "#000000") (clr_type . 0)))
+                        (ts_fgc2_i . t)
+                        (ts_bgc2 . ((hclr_color) (clr_type . 0)))
+                        (ts_bgc2_i . t)
+                        (ts_va . "nor") (ts_va_i . t)
+                        (ts_sc . :json-false) (ts_sc_i . t)
+                        (ts_tw . 400) (ts_tw_i . t))))))
+         (doc (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+    (should-not (gdocs-dm-unsupported doc))))
+
+(ert-deftest gdocs-test-capability-reports-unsupported-text-style-values ()
+  "Non-default text dimensions are reported with ranges, not payloads."
+  (let* ((body "styled\n")
+         (ops (list
+               (gdocs-test--insert-op body)
+               '((ty . "as") (st . "text") (si . 1) (ei . 6)
+                 (sm . ((ts_fs . 12.0)
+                        (ts_fgc2 . ((hclr_color . "#ff0000") (clr_type . 0)))
+                        (ts_bgc2 . ((hclr_color . "#ffff00") (clr_type . 0)))
+                        (ts_ff . "Comic Sans MS")
+                        (ts_va . "sup")
+                        (ts_sc . t)
+                        (ts_tw . 700)
+                        (ts_fs_i . :json-false))))))
+         (reports (gdocs-dm-unsupported
+                   (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+         (features (mapcar (lambda (report)
+                             (plist-get report :feature-type))
+                           reports)))
+    (dolist (feature '("ts_fs" "ts_fgc2" "ts_bgc2" "ts_ff"
+                       "ts_va" "ts_sc" "ts_tw"))
+      (should (member feature features)))
+    (should (= (length reports) 7))
+    (dolist (report reports)
+      (should (= (plist-get report :ot-start) 1))
+      (should (= (plist-get report :ot-end) 6)))
+    (let ((printed (format "%S" reports)))
+      (should-not (string-match-p "12\\.0\\|ff0000\\|ffff00\\|Comic Sans\\|700"
+                                  printed)))))
+
+(ert-deftest gdocs-test-capability-font-family-uses-only-exact-org-mappings ()
+  "Only the default and exact Org font-family mappings are supported."
+  (let* ((body "a b c\n")
+         (ops (list
+               (gdocs-test--insert-op body)
+               '((ty . "as") (st . "text") (si . 1) (ei . 1)
+                 (sm . ((ts_ff . "Courier New"))))
+               '((ty . "as") (st . "text") (si . 3) (ei . 3)
+                 (sm . ((ts_ff . "Roboto Mono"))))
+               '((ty . "as") (st . "text") (si . 5) (ei . 5)
+                 (sm . ((ts_ff . "Courier Prime"))))))
+         (doc (gdocs-dm-from-ops 7 "synthetic" nil body ops))
+         (reports (gdocs-dm-unsupported doc))
+         (run (seq-find (lambda (candidate)
+                          (equal (plist-get candidate :text) "c"))
+                        (plist-get (car (gdocs-dm-paragraphs doc)) :runs))))
+    (should (= (length reports) 1))
+    (should (equal (plist-get (car reports) :feature-type) "ts_ff"))
+    ;; The unsupported family must not be guessed as the verbatim mapping.
+    (should-not (memq :verbatim (plist-get run :styles)))))
+
+(ert-deftest gdocs-test-capability-reports-paragraph-alignment-and-indentation ()
+  "Non-default paragraph alignment and indentation are unsupported."
+  (let* ((body "one\ntwo\n")
+         (ops (list
+               (gdocs-test--insert-op body)
+               '((ty . "as") (st . "paragraph") (si . 4) (ei . 4)
+                 (sm . ((ps_il . 18.0) (ps_ifl . 9.0)
+                        (ps_al . 1) (ps_al_i . t))))))
+         (reports (gdocs-dm-unsupported
+                   (gdocs-dm-from-ops 7 "synthetic" nil body ops))))
+    (should (= (length reports) 3))
+    (dolist (feature '("ps_il" "ps_ifl" "ps_al"))
+      (let ((report (seq-find (lambda (candidate)
+                                (equal (plist-get candidate :feature-type)
+                                       feature))
+                              reports)))
+        (should report)
+        (should (= (plist-get report :ot-start) 4))
+        (should (= (plist-get report :ot-end) 4))))))
+
+(ert-deftest gdocs-test-capability-validates-table-attributes ()
+  "Non-default table columns and table attributes are reported safely."
+  (let* ((body (gdocs-test--table-body '(("A" "B"))))
+         (column '((col_wv . 72.0)
+                   (col_wt . 1)
+                   (col_tdt . ((tdt_v . 0)))
+                   (col_tf . ((ttf_vn . 0) (ttf_n . "")))))
+         (table-op
+          `((ty . "as") (st . "tbl") (si . 1) (ei . 1)
+            (sm . ((tbls_tblid . "table.synthetic")
+                   (tbls_extra . "not-emitted")
+                   (tbls_cols . ((cv . ((op . "set")
+                                        (opValue . (,column))))))))))
+         (ops (list (gdocs-test--insert-op body) table-op))
+         (reports (gdocs-dm-unsupported
+                   (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+         (features (mapcar (lambda (report)
+                             (plist-get report :feature-type))
+                           reports))
+         (printed (format "%S" reports)))
+    (should (member "tbl.col_wv" features))
+    (should (member "tbl.tbls_extra" features))
+    (dolist (report reports)
+      (should (= (plist-get report :ot-start) 1))
+      (should (= (plist-get report :ot-end) 1)))
+    (should-not (string-match-p "72\\.0\\|not-emitted" printed))))
+
+(ert-deftest gdocs-test-capability-preflight-protects-unsupported-style-ranges ()
+  "Replacement is refused, while unrelated incremental text remains safe."
+  (let* ((body "styled\nplain\n")
+         (style-op '((ty . "as") (st . "text") (si . 1) (ei . 6)
+                     (sm . ((ts_fs . 12.0)))))
+         (state (list :revision 7 :ot-body body
+                      :ot-ops (list (gdocs-test--insert-op body) style-op)))
+         (safe-plan '(:kind :incremental
+                            :ranges ((:ot-start 8 :ot-end 12
+                                                :insert-at 8 :delete-count 5))))
+         (unsafe-plan '(:kind :incremental
+                              :ranges ((:ot-start 3 :ot-end 3
+                                                  :insert-at 3 :delete-count 1))))
+         (message nil))
+    (should-error (gdocs--push-preflight state "styled\nchanged\n"
+                                         '(:kind :full-replace))
+                  :type 'user-error)
+    (should (gdocs--push-preflight state "styled\nchanged\n" safe-plan))
+    (condition-case err
+        (gdocs--push-preflight state "stXled\nplain\n" unsafe-plan)
+      (user-error (setq message (error-message-string err))))
+    (should (string-match-p "intersects" message))
+    ;; A pure insertion in the interior is not proven safe either.
+    (should-error
+     (gdocs--push-preflight
+      state "stXyled\nplain\n"
+      '(:kind :incremental
+              :ranges ((:ot-start 3 :ot-end 3 :insert-at 3 :delete-count 0))))
+     :type 'user-error)))
 
 (ert-deftest gdocs-test-auto-sync-never-selects-lossy-override ()
   "Auto-sync invokes the normal guarded push entry point only."
