@@ -947,7 +947,85 @@ END is the inclusive final OT position."
          (doc (gdocs-dm-from-ops nil nil nil body
                                  (gdocs-test--fixture-ops fixture))))
     (should (equal (gdocs-test--normalize-org (gdocs-dm-to-org doc))
-                   "- Bullet one\n  - Nested bullet\n1. Number one\n  1. Nested number\n"))))
+                   (concat "- Bullet one\n"
+                           "  1. Nested number one\n"
+                           "     - Deep bullet\n"
+                           "  2. Nested number two\n"
+                           "- Bullet two\n"
+                           "1. Number one\n"
+                           "   - Nested bullet\n"
+                           "After list\n")))))
+
+(ert-deftest gdocs-test-org-nested-lists-preserve-items-nests-and-order ()
+  "Nested mixed lists produce one ordered model paragraph per item."
+  (let* ((source (concat "- top\n"
+                         "  1. child\n"
+                         "     - grandchild\n"
+                         "  2. sibling\n"
+                         "- next\n\n"
+                         "After\n"))
+         (doc (gdocs-dm-from-org source))
+         (paragraphs (gdocs-dm-paragraphs doc))
+         (items (seq-filter (lambda (paragraph)
+                              (eq (plist-get paragraph :kind) :list))
+                            paragraphs))
+         (bullet-id (plist-get (nth 0 items) :list-id))
+         (number-id (plist-get (nth 1 items) :list-id)))
+    (should (equal (mapcar (lambda (item)
+                             (gdocs-dm-runs-text (plist-get item :runs)))
+                           items)
+                   '("top" "child" "grandchild" "sibling" "next")))
+    (should (equal (mapcar (lambda (item) (plist-get item :nest)) items)
+                   '(0 1 2 1 0)))
+    (should (equal (mapcar (lambda (item) (plist-get item :glyph)) items)
+                   '(:bullet :number :bullet :number :bullet)))
+    (should (equal (mapcar (lambda (item) (plist-get item :list-id)) items)
+                   (list bullet-id number-id bullet-id number-id bullet-id)))
+    (should (equal (gdocs-dm-runs-text
+                    (plist-get (car (last paragraphs)) :runs))
+                   "After"))
+    (should (equal (gdocs-dm-to-org doc) source))))
+
+(ert-deftest gdocs-test-nested-list-model-ot-model-round-trip ()
+  "Confirmed `ls_nest' bindings preserve mixed three-level list structure."
+  (let* ((source (concat "- top\n"
+                         "  1. child\n"
+                         "     - grandchild\n"
+                         "  2. sibling\n"
+                         "- next\n\n"
+                         "After\n"))
+         (original (gdocs-dm-from-org source))
+         (built (gdocs-dm-to-ot original))
+         (body (car built))
+         (ops (cdr built))
+         (bindings (seq-filter
+                    (lambda (op) (equal (alist-get 'st op) "list"))
+                    ops))
+         (round-tripped (gdocs-dm-from-ops nil nil nil body ops)))
+    (should (equal (mapcar (lambda (op)
+                             (alist-get 'ls_nest (alist-get 'sm op)))
+                           bindings)
+                   '(0 1 2 1 0)))
+    (should-not (gdocs-dm-unsupported round-tripped))
+    (should (equal (gdocs-test--model-view original)
+                   (gdocs-test--model-view round-tripped)))
+    (should (equal (gdocs-dm-to-org round-tripped) source))))
+
+(ert-deftest gdocs-test-list-nesting-beyond-ot-range-fails-closed ()
+  "Org parsing retains deep items even when the OT encoder must refuse them."
+  (let* ((source
+          (mapconcat (lambda (nest)
+                       (format "%s- level %d\n"
+                               (make-string (* 2 nest) ?\s) nest))
+                     (number-sequence 0 9) ""))
+         (doc (gdocs-dm-from-org source))
+         (items (seq-filter (lambda (paragraph)
+                              (eq (plist-get paragraph :kind) :list))
+                            (gdocs-dm-paragraphs doc))))
+    (should (= (length items) 10))
+    (should (equal (mapcar (lambda (item) (plist-get item :nest)) items)
+                   (number-sequence 0 9)))
+    (should-error (gdocs-dm-to-ot doc) :type 'user-error)))
 
 (ert-deftest gdocs-test-render-table-model ()
   "Table structure and cell text survive decode and Org rendering."

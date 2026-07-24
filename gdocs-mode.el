@@ -2897,15 +2897,16 @@ emitted; we won't re-emit them inside."
   "Return N stars for heading LEVEL (1..5). Levels >5 are clamped to 5."
   (make-string (min 5 (max 1 level)) ?*))
 
-(defun gdocs--render-list-bullet (glyph nest &optional ordinal)
+(defun gdocs--render-list-bullet (glyph nest &optional ordinal indent)
   "Return the leading bullet text for a list item.
 GLYPH is :bullet or :number; NEST is 0-based. ORDINAL is the 1-based
 sequence number within the current numbered list at this nest level
-\(only used when GLYPH is :number; defaults to 1)."
-  (let ((indent (make-string (* 2 (max 0 nest)) ?\s)))
-    (concat indent (if (eq glyph :number)
-                       (format "%d. " (or ordinal 1))
-                     "- "))))
+\(only used when GLYPH is :number; defaults to 1). INDENT, when non-nil,
+is the syntax-aware leading column computed from the parent item marker."
+  (concat (make-string (or indent (* 2 (max 0 nest))) ?\s)
+          (if (eq glyph :number)
+              (format "%d. " (or ordinal 1))
+            "- ")))
 
 (defun gdocs--render-table-para (para)
   "Render a :kind=:table paragraph to an org-mode table."
@@ -2921,7 +2922,7 @@ sequence number within the current numbered list at this nest level
            rows)))
     (string-join lines "\n")))
 
-(defun gdocs--render-paragraph-line (para &optional ordinal)
+(defun gdocs--render-paragraph-line (para &optional ordinal list-indent)
   "Render PARA to its org line (no trailing newline).
 ORDINAL applies to numbered list items only — see `gdocs--render-list-bullet'."
   (let* ((kind (plist-get para :kind))
@@ -2949,7 +2950,8 @@ ORDINAL applies to numbered list items only — see `gdocs--render-list-bullet'.
       (:list
        (let* ((glyph (plist-get para :glyph))
               (nest (or (plist-get para :nest) 0)))
-         (concat (gdocs--render-list-bullet glyph nest ordinal) text)))
+         (concat (gdocs--render-list-bullet glyph nest ordinal list-indent)
+                 text)))
       (:code text)
       (:table (gdocs--render-table-para para))
       (_ text))))
@@ -2994,18 +2996,18 @@ than to the final text, so it never appears inside a source block."
   (let ((paras (gdocs--normalize-paragraphs (gdocs-dm-paragraphs doc)))
         (entries nil)
         (code-lines nil)
-        (list-counters (make-vector 10 0))
-        (last-list-id nil))
+        (list-counters (make-hash-table :test #'equal))
+        (list-content-indents (make-hash-table :test #'eql)))
     ;; First turn paragraphs into logical render entries. A source block is
     ;; one entry, which makes the later heading-padding pass unable to insert
     ;; a line between two of its source lines.
     (dolist (p paras)
       (let ((kind (plist-get p :kind)))
         ;; Reset numbered-list counters whenever we leave a list. A new
-        ;; list (different :list-id) also resets them on entry below.
+        ;; contiguous list starts fresh when ordinary content intervenes.
         (unless (eq kind :list)
-          (fillarray list-counters 0)
-          (setq last-list-id nil))
+          (clrhash list-counters)
+          (clrhash list-content-indents))
         (cond
          ((eq kind :code)
           (push (mapconcat (lambda (r) (or (plist-get r :text) ""))
@@ -3019,23 +3021,42 @@ than to the final text, so it never appears inside a source block."
                                        (list "#+end_src")))
                   entries)
             (setq code-lines nil))
-          (let ((ordinal nil))
-            (when (and (eq kind :list)
-                       (eq (plist-get p :glyph) :number))
-              (let* ((nest (min 9 (max 0 (or (plist-get p :nest) 0))))
-                     (list-id (plist-get p :list-id)))
-                (unless (equal list-id last-list-id)
-                  (fillarray list-counters 0)
-                  (setq last-list-id list-id))
-                ;; Counters at deeper nest levels reset whenever we step
-                ;; back up — re-entering a sublist starts at 1 again.
-                (let ((i (1+ nest)))
-                  (while (< i (length list-counters))
-                    (aset list-counters i 0)
-                    (cl-incf i)))
-                (aset list-counters nest (1+ (aref list-counters nest)))
-                (setq ordinal (aref list-counters nest))))
-            (let ((line (gdocs--render-paragraph-line p ordinal)))
+          (let ((ordinal nil)
+                (list-indent nil))
+            (when (eq kind :list)
+              (let* ((nest (max 0 (or (plist-get p :nest) 0)))
+                     (list-id (plist-get p :list-id))
+                     (glyph (plist-get p :glyph))
+                     (counter-key (cons list-id nest)))
+                (let (deeper-keys)
+                  (maphash (lambda (key _value)
+                             (when (> (cdr key) nest)
+                               (push key deeper-keys)))
+                           list-counters)
+                  (dolist (key deeper-keys)
+                    (remhash key list-counters)))
+                (setq list-indent
+                      (if (zerop nest)
+                          0
+                        (or (gethash (1- nest) list-content-indents)
+                            (* 2 nest))))
+                (when (eq glyph :number)
+                  (setq ordinal (1+ (gethash counter-key list-counters 0)))
+                  (puthash counter-key ordinal list-counters))
+                (let* ((marker (if (eq glyph :number)
+                                   (format "%d. " (or ordinal 1))
+                                 "- "))
+                       (content-indent (+ list-indent (length marker))))
+                  (puthash nest content-indent list-content-indents)
+                  (let (deeper-indents)
+                    (maphash (lambda (level _indent)
+                               (when (> level nest)
+                                 (push level deeper-indents)))
+                             list-content-indents)
+                    (dolist (level deeper-indents)
+                      (remhash level list-content-indents))))))
+            (let ((line (gdocs--render-paragraph-line
+                         p ordinal list-indent)))
               (push (list :kind kind
                           :heading (gdocs--org-heading-line-p line)
                           :blank (string-empty-p line)
@@ -3520,12 +3541,16 @@ visible content."
   "Return runs for a headline element HL by parsing its :raw-value."
   (gdocs--org-inline-content-runs (plist-get (cadr hl) :raw-value)))
 
+(defun gdocs--org-item-paragraph (item)
+  "Return ITEM's direct paragraph child, or nil."
+  (seq-find (lambda (element)
+              (and (consp element) (eq (car element) 'paragraph)))
+            (cddr item)))
+
 (defun gdocs--org-item-runs (item)
   "Return runs for a plain-list item ITEM."
-  (let ((par (seq-find (lambda (e)
-                         (and (consp e) (eq (car e) 'paragraph)))
-                       (cddr item))))
-    (when par (gdocs--paragraph-content-runs par))))
+  (let ((paragraph (gdocs--org-item-paragraph item)))
+    (when paragraph (gdocs--paragraph-content-runs paragraph))))
 
 (defun gdocs--item-glyph (item)
   "Return :bullet or :number based on the item's leading bullet text."
@@ -3535,17 +3560,43 @@ visible content."
      ((string-match-p "^[0-9]+[.)]" bullet) :number)
      (t :bullet))))
 
-(defun gdocs--item-nest (item)
-  "Approximate nest depth from the item's :pre-blank+structure indent."
-  ;; org-element doesn't directly expose nest level; infer from
-  ;; :structure if available, otherwise from leading indentation.
-  (let* ((begin (plist-get (cadr item) :begin))
-         (struct (plist-get (cadr item) :structure))
-         (indent
-          (or (cl-some (lambda (row) (and (eq (car row) begin) (nth 1 row)))
-                       struct)
-              0)))
-    (/ indent 2)))
+(defun gdocs--org-list-id (plain-list glyph ids)
+  "Return PLAIN-LIST's stable parse-local ID for GLYPH from IDS."
+  (or (gethash glyph ids)
+      (let ((id (format "kix.l%s"
+                        (substring
+                         (md5 (format "%S-%S-%d" plain-list glyph (random)))
+                         0 12))))
+        (puthash glyph id ids)
+        id)))
+
+(defun gdocs--walk-org-list (plain-list nest ids &optional source-spans)
+  "Convert PLAIN-LIST recursively at logical NEST using glyph ID table IDS."
+  (let (paragraphs)
+    (dolist (item (cddr plain-list))
+      (when (and (consp item) (eq (car item) 'item))
+        (let* ((glyph (gdocs--item-glyph item))
+               (paragraph (gdocs--org-item-paragraph item))
+               (model (list :kind :list
+                            :glyph glyph
+                            :nest nest
+                            :list-id (gdocs--org-list-id plain-list glyph ids)
+                            :runs (gdocs--org-item-runs item))))
+          (push (if source-spans
+                    (gdocs--org-annotate-paragraph
+                     model
+                     (gdocs--org-element-line-number (or paragraph item))
+                     (gdocs--org-element-last-line-number (or paragraph item)))
+                  model)
+                paragraphs)
+          (dolist (child (cddr item))
+            (when (and (consp child) (eq (car child) 'plain-list))
+              (setq paragraphs
+                    (nconc (nreverse
+                            (gdocs--walk-org-list child (1+ nest) ids
+                                                  source-spans))
+                           paragraphs)))))))
+    (nreverse paragraphs)))
 
 (defun gdocs--coalesce-table-cell-runs (runs)
   "Coalesce adjacent table RUNS with identical style and link metadata.
@@ -3777,50 +3828,8 @@ caller can distinguish meaningful blank lines from heading padding."
                     (gdocs--org-element-last-line-number el))
                  para)))))
     ('plain-list
-     (let ((nest-base nil)
-           (cur-glyph nil)
-           (cur-id nil)
-           (items (seq-filter (lambda (c) (and (consp c) (eq (car c) 'item)))
-                              (cddr el))))
-       (mapcar
-        (lambda (item)
-          (let* ((raw-nest (gdocs--item-nest item))
-                 (nest (progn
-                         (unless nest-base (setq nest-base raw-nest))
-                         (max 0 (- raw-nest (or nest-base 0)))))
-                 (glyph (gdocs--item-glyph item)))
-            ;; Allocate a fresh list-id whenever the glyph kind changes so
-            ;; bullet and numbered runs don't share one `ae list' def
-            ;; (which would force both to render with the same marker).
-            (unless (and cur-id (eq cur-glyph glyph))
-              (setq cur-glyph glyph
-                    cur-id (format "kix.l%s"
-                                   (substring
-                                    (md5 (format "%S-%S-%d" el glyph (random)))
-                                    0 12))))
-            (let ((para (list :kind :list
-                              :glyph glyph
-                              :nest nest
-                              :list-id cur-id
-                              :runs (gdocs--org-item-runs item))))
-              (if source-spans
-                  (gdocs--org-annotate-paragraph
-                   para (gdocs--org-element-line-number
-                         (or (seq-find
-                              (lambda (child)
-                                (and (consp child)
-                                     (eq (car child) 'paragraph)))
-                              (cddr item))
-                             item))
-                   (gdocs--org-element-last-line-number
-                    (or (seq-find
-                         (lambda (child)
-                           (and (consp child)
-                                (eq (car child) 'paragraph)))
-                         (cddr item))
-                        item)))
-                para))))
-        items)))
+     (let ((ids (make-hash-table :test #'eq)))
+       (gdocs--walk-org-list el 0 ids source-spans)))
     ('src-block
      (let* ((start (gdocs--org-element-line-number el))
             (paragraphs (gdocs--src-block-paragraphs el))
@@ -4039,15 +4048,18 @@ both `ae list' per-level `b_ts' and `as st=list' `ls_ts'. The cookie
     (ts_st . :json-false) (ts_bd . :json-false)
     (ts_fgc2_i . t) (ts_sc_i . t) (ts_tw . 400)))
 
-(defun gdocs--emit-list-style-op (list-id _nest pos)
+(defun gdocs--emit-list-style-op (list-id nest pos)
   "Emit one `as st=list' binding op at OT position POS (1-based, the
-paragraph-terminator newline) for LIST-ID. Mirrors the live shape:
-`sm' must carry both the canonical `ls_ts' text-style block and the
-`ls_id'. Nest level is encoded indirectly via paragraph indent (not
-on this op); `ls_nest' is therefore omitted."
+paragraph-terminator newline) for LIST-ID at zero-based NEST.  Sanitized OT
+fixtures confirm `ls_nest' on the binding; the list definition supplies the
+matching per-level indentation and glyph data."
+  (unless (and (integerp nest) (<= 0 nest) (<= nest 8))
+    (user-error "gdocs: list nesting level %S is outside the supported range 0..8"
+                nest))
   `((ty . "as") (st . "list") (si . ,pos) (ei . ,pos)
     (sm . ((ls_ts . ,(gdocs--ts-block-canonical))
-           (ls_id . ,list-id)))))
+           (ls_id . ,list-id)
+           (ls_nest . ,nest)))))
 
 (defun gdocs--gen-table-id ()
   "Generate a fresh Google-style table id (e.g. `table.abc123def456`)."
