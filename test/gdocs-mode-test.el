@@ -3274,6 +3274,108 @@ that a removed preflight guard would be observed as an unexpected success."
         (gdocs--auto-sync-tick))
       (should (equal called '("synthetic-id"))))))
 
+(ert-deftest gdocs-test-enable-restores-clean-persisted-baseline ()
+  "Reopening an unchanged buffer restores a known-clean baseline."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nBody\n")
+    (org-mode)
+    (gdocs--put-top-property "GDOC_CONTENT_HASH" (gdocs--current-body-hash))
+    (let ((before (buffer-string)))
+      (cl-letf (((symbol-function 'run-with-timer) (lambda (&rest _args) 'timer)))
+        (gdocs--enable))
+      (should (eq (gdocs--sync-state) 'clean))
+      (should (equal (buffer-string) before)))))
+
+(ert-deftest gdocs-test-enable-restores-dirty-persisted-baseline ()
+  "Reopening saved unpushed edits preserves the prior clean baseline."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nBody\n")
+    (org-mode)
+    (gdocs--put-top-property "GDOC_CONTENT_HASH" (gdocs--current-body-hash))
+    (goto-char (point-max))
+    (insert "Saved local edit\n")
+    (cl-letf (((symbol-function 'run-with-timer) (lambda (&rest _args) 'timer)))
+      (gdocs--enable))
+    (should (eq (gdocs--sync-state) 'dirty))))
+
+(ert-deftest gdocs-test-sync-state-ignores-metadata-only-changes ()
+  "Synchronization metadata does not make a clean body dirty."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nBody\n")
+    (org-mode)
+    (gdocs--mark-synced)
+    (gdocs--put-top-property "GDOC_TITLE" "Changed metadata")
+    (gdocs--put-top-property "GDOC_REVISION" "2")
+    (should (eq (gdocs--sync-state) 'clean))))
+
+(ert-deftest gdocs-test-auto-sync-unknown-baseline-does-not-mutate ()
+  "Missing and malformed persisted baselines cannot trigger auto-sync."
+  (dolist (persisted-hash (list nil "not-a-sha256"))
+    (let ((gdocs-mode t)
+          (gdocs--sync-mutex nil)
+          (fetch-count 0)
+          (pull-count 0)
+          (push-count 0))
+      (with-temp-buffer
+        (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nBody\n")
+        (org-mode)
+        (when persisted-hash
+          (gdocs--put-top-property "GDOC_CONTENT_HASH" persisted-hash))
+        (gdocs--restore-sync-baseline)
+        (let ((before (buffer-string)))
+          (cl-letf (((symbol-function 'gdocs--fetch-edit-state-async)
+                     (lambda (&rest _args) (cl-incf fetch-count)))
+                    ((symbol-function 'gdocs-pull-locally)
+                     (lambda (&rest _args) (cl-incf pull-count)))
+                    ((symbol-function 'gdocs-push-remotely)
+                     (lambda (&rest _args) (cl-incf push-count))))
+            (gdocs--auto-sync-tick))
+          (should (eq (gdocs--sync-state) 'unknown))
+          (should (equal (buffer-string) before))
+          (should (= fetch-count 0))
+          (should (= pull-count 0))
+          (should (= push-count 0)))))))
+
+(ert-deftest gdocs-test-reopened-dirty-buffer-and-newer-remote-conflict ()
+  "Saved local edits are not overwritten when the remote is newer."
+  (let ((gdocs-mode t)
+        (gdocs--sync-mutex nil)
+        (pull-count 0)
+        (push-count 0))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nBody\n")
+      (org-mode)
+      (gdocs--put-top-property "GDOC_CONTENT_HASH" (gdocs--current-body-hash))
+      (goto-char (point-max))
+      (insert "Saved local edit\n")
+      (gdocs--restore-sync-baseline)
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-state-async)
+                 (lambda (_doc callback)
+                   (funcall callback '(:revision 2) nil)))
+                ((symbol-function 'gdocs-pull-locally)
+                 (lambda (&rest _args) (cl-incf pull-count)))
+                ((symbol-function 'gdocs-push-remotely)
+                 (lambda (&rest _args) (cl-incf push-count))))
+        (gdocs--auto-sync-tick))
+      (should (= pull-count 0))
+      (should (= push-count 0))
+      (should (equal gdocs--auto-sync-conflict-revision 2)))))
+
+(ert-deftest gdocs-test-manual-pull-establishes-unknown-baseline ()
+  "A successful manual pull turns an unknown baseline into known clean."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nLocal\n")
+    (org-mode)
+    (setq gdocs--last-synced-hash nil)
+    (should (eq (gdocs--sync-state) 'unknown))
+    (cl-letf (((symbol-function 'gdocs--flash-regions) #'ignore))
+      (gdocs--apply-pull-into-buffer
+       "synthetic-id" (current-buffer) "Drive title"
+       ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Drive title\n:GDOC_REVISION: 2\n:END:\n\nRemote\n"))
+    (should (eq (gdocs--sync-state) 'clean))
+    (should (equal gdocs--last-synced-hash
+                   (gdocs--top-property-value "GDOC_CONTENT_HASH")))))
+
 (ert-deftest gdocs-test-auto-sync-noop-when-remote-and-local-unchanged ()
   "Matching revisions and a clean local buffer dispatch no operation."
   (let ((gdocs-mode t)
