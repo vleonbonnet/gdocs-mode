@@ -3827,6 +3827,113 @@ that a removed preflight guard would be observed as an unexpected success."
       (should (equal arguments '("local" "remote")))
       (should-not gdocs--sync-mutex))))
 
+(ert-deftest gdocs-test-fresh-ot-incremental-plan-retains-capability-ranges ()
+  "Fresh OT command generation preserves its incremental preflight metadata."
+  (let* ((body "styled\nplain\n")
+         (style-op '((ty . "as") (st . "text") (si . 1) (ei . 6)
+                     (sm . ((ts_fs . 12.0)))))
+         (state (list :revision 7 :ot-body body
+                      :ot-ops (list (gdocs-test--insert-op body) style-op)))
+         (safe-local "styled\n\nchanged\n")
+         (unsafe-local "changed\n\nplain\n")
+         (safe (gdocs--push-full-plan
+                "synthetic" state safe-local 'ot-incremental))
+         (unsafe (gdocs--push-full-plan
+                  "synthetic" state unsafe-local 'ot-incremental)))
+    (should (eq (plist-get safe :kind) :incremental))
+    (should (plist-get safe :commands))
+    (should (plist-get safe :ranges))
+    (should (equal (plist-get safe :post-body) safe-local))
+    (should (gdocs--push-preflight state safe-local safe))
+    (should (eq (plist-get unsafe :kind) :incremental))
+    (should-error (gdocs--push-preflight state unsafe-local unsafe)
+                  :type 'user-error)))
+
+(ert-deftest gdocs-test-fresh-ot-incremental-structural-fallback-is-explicit ()
+  "Changed list and table models explicitly classify their bundles as replacement."
+  (let* ((run (lambda (text) (list (gdocs-dm-make-run text))))
+         (old-list (gdocs-dm-make-doc
+                    :paragraphs
+                    (list (list :kind :list :glyph :bullet :nest 0
+                                :runs (funcall run "old")))))
+         (new-list (gdocs-dm-make-doc
+                    :paragraphs
+                    (list (list :kind :list :glyph :bullet :nest 0
+                                :runs (funcall run "new")))))
+         (table (lambda (text)
+                  (list :kind :table :cols 1
+                        :rows (list (list (list (funcall run text)))))))
+         (old-table (gdocs-dm-make-doc
+                     :paragraphs (list (funcall table "old"))))
+         (new-table (gdocs-dm-make-doc
+                     :paragraphs (list (funcall table "new")))))
+    (dolist (plan (list (gdocs-dm-to-incremental-save-plan old-list new-list)
+                        (gdocs-dm-to-incremental-save-plan
+                         old-table new-table)))
+      (should (eq (plist-get plan :kind) :full-replace))
+      (should (plist-get plan :commands))
+      (should-not (plist-get plan :ranges)))))
+
+(ert-deftest gdocs-test-fresh-ot-incremental-plan-preserves-unrelated-image ()
+  "An unchanged image outside a freshly generated range remains preservable."
+  (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
+         (body (plist-get fixture :body))
+         (ops (plist-get fixture :ops))
+         (state (list :revision 17 :ot-body body :ot-ops ops))
+         (remote (gdocs-dm-to-org
+                  (gdocs-dm-from-ops 17 nil nil body ops)))
+         (local (replace-regexp-in-string "Before" "Changed" remote))
+         (plan (gdocs--push-full-plan
+                "synthetic" state local 'ot-incremental)))
+    (should (eq (plist-get plan :kind) :incremental))
+    (should (plist-get plan :ranges))
+    (should (gdocs--push-preflight state local plan))))
+
+(ert-deftest gdocs-test-fresh-ot-retry-reclassifies-concurrent-fallback ()
+  "A retry uses the fresh generator's kind rather than the configured backend."
+  (let* ((gdocs--rate-limit-retry-delay 0)
+         (body "plain\n")
+         (initial (list :revision 1 :remote-body body :ot-body body
+                        :ot-ops (list (gdocs-test--insert-op body))))
+         (definitions (gdocs--emit-list-defs
+                       '(("list.concurrent" . :bullet))))
+         (binding (gdocs--emit-list-style-op
+                   "list.concurrent" 0 (gdocs-test--line-end-pos body 1)))
+         (fresh (list :revision 1 :remote-body body :ot-body body
+                      :ot-ops (append (list (gdocs-test--insert-op body))
+                                      definitions (list binding))))
+         (local "changed\n")
+         (kinds nil)
+         (preflight-kinds nil)
+         (save-count 0)
+         (intent
+          (gdocs--make-push-intent
+           initial local body
+           (lambda (state _remote-body)
+             (let ((plan (gdocs--push-full-plan
+                          "synthetic" state local 'ot-incremental)))
+               (push (plist-get plan :kind) kinds)
+               plan))))
+         (original-preflight (symbol-function 'gdocs--push-preflight)))
+    (cl-letf (((symbol-function 'gdocs--save-request)
+               (lambda (_doc _state _commands)
+                 (cl-incf save-count)
+                 (if (= save-count 1)
+                     (signal 'gdocs-save-rejected
+                             '(:http-code 550 :err-code 13 :di 1))
+                   '((metadata . ((serverRevision . 2)))))))
+              ((symbol-function 'gdocs--fetch-edit-state)
+               (lambda (_doc) fresh))
+              ((symbol-function 'gdocs--push-preflight)
+               (lambda (state body plan)
+                 (push (plist-get plan :kind) preflight-kinds)
+                 (funcall original-preflight state body plan))))
+      (should (= (gdocs--run-op "synthetic" initial intent) 2)))
+    (should (= save-count 2))
+    (should (equal (nreverse kinds) '(:incremental :full-replace)))
+    (should (equal (nreverse preflight-kinds)
+                   '(:incremental :full-replace)))))
+
 ;;; Optional integration category
 
 (ert-deftest gdocs-test-integration-category-gate ()

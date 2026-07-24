@@ -4406,8 +4406,40 @@ rendered docs.  Malformed tables are never equal."
 
 (defun gdocs--paragraphs-ot-length (paras)
   (if (null paras) 0
-    (length (car (gdocs-dm-to-ot
-                  (gdocs-dm-make-doc :paragraphs paras))))))
+    (let ((sanitized
+           (mapcar
+            (lambda (paragraph)
+              (let ((copy (copy-tree paragraph)))
+                (if (eq (plist-get copy :kind) :inline-object)
+                    (list :kind :para :runs (list (gdocs-dm-make-run "*")))
+                  (cl-labels
+                      ((sanitize-runs
+                        (runs)
+                        (mapcar
+                         (lambda (run)
+                           (if (plist-get run :inline-object)
+                               (gdocs-dm-make-run "*")
+                             run))
+                         runs)))
+                    (if (eq (plist-get copy :kind) :table)
+                        (setq copy
+                              (plist-put
+                               copy :rows
+                               (mapcar
+                                (lambda (row)
+                                  (mapcar
+                                   (lambda (cell)
+                                     (mapcar #'sanitize-runs cell))
+                                   row))
+                                (plist-get copy :rows))))
+                      (setq copy
+                            (plist-put copy :runs
+                                       (sanitize-runs
+                                        (plist-get copy :runs))))))
+                  copy)))
+            paras)))
+      (length (car (gdocs-dm-to-ot
+                    (gdocs-dm-make-doc :paragraphs sanitized)))))))
 
 (defun gdocs--shift-op-positions (op shift)
   (mapcar (lambda (kv)
@@ -4416,15 +4448,16 @@ rendered docs.  Malformed tables are never equal."
               (_ kv)))
           op))
 
-(defun gdocs-dm-to-incremental-save-commands (old-doc new-doc)
-  "Compute paragraph-level diff between OLD-DOC and NEW-DOC and emit
-minimal save commands.
+(defun gdocs-dm-to-incremental-save-plan (old-doc new-doc &optional classify-only)
+  "Compute a paragraph-level save plan from OLD-DOC to NEW-DOC.
 
 Falls back to a full-replace bundle if the diff region includes any
 list, table, or inline-object paragraphs — those carry structure or
 entity data whose live values we cannot safely rewrite in place.
 
-Returns a list of OT save commands (possibly empty if docs are equal)."
+The returned plist contains `:commands', an explicit `:kind', and the OT
+`:ranges' touched by an incremental plan.  When CLASSIFY-ONLY is non-nil, a
+fallback plan omits commands that would re-encode unsupported local entities."
   (let* ((old-paras (gdocs--normalize-paragraphs-for-ot
                      (gdocs-dm-paragraphs old-doc)))
          (new-paras (gdocs--normalize-paragraphs-for-ot
@@ -4438,7 +4471,7 @@ Returns a list of OT save commands (possibly empty if docs are equal)."
                              (- (length new-paras) suf))))
     (cond
      ((and (null old-mid) (null new-mid))
-      nil)
+       '(:commands nil :kind :noop :ranges nil))
      ((cl-some (lambda (p)
                  (or (memq (plist-get p :kind)
                            '(:list :table :inline-object))
@@ -4446,8 +4479,12 @@ Returns a list of OT save commands (possibly empty if docs are equal)."
                                 (plist-get run :inline-object))
                               (plist-get p :runs))))
                (append old-mid new-mid))
-      (gdocs-dm-to-save-commands
-       (gdocs--paragraphs-ot-length old-paras) new-doc))
+       (list :commands
+             (and (not classify-only)
+                  (gdocs-dm-to-save-commands
+                   (gdocs--paragraphs-ot-length old-paras) new-doc))
+             :kind :full-replace
+             :ranges nil))
      (t
       (let* ((old-pre-len (gdocs--paragraphs-ot-length
                            (cl-subseq old-paras 0 pre)))
@@ -4469,7 +4506,22 @@ Returns a list of OT save commands (possibly empty if docs are equal)."
           (push `((ty . "is") (ibi . ,(1+ old-pre-len))
                   (s . ,mid-body))
                 cmds))
-        (append (nreverse cmds) shifted-ops))))))
+         (list :commands (append (nreverse cmds) shifted-ops)
+               :kind :incremental
+               :ranges
+               (list (list :ot-start (1+ old-pre-len)
+                           :ot-end (if (> old-mid-len 0)
+                                       (+ old-pre-len old-mid-len)
+                                     (1+ old-pre-len))
+                           :insert-at (1+ old-pre-len)
+                           :delete-count old-mid-len))))))))
+
+(defun gdocs-dm-to-incremental-save-commands (old-doc new-doc)
+  "Return OT commands for the paragraph-level diff from OLD-DOC to NEW-DOC.
+
+Use `gdocs-dm-to-incremental-save-plan' when the fallback classification and
+touched OT ranges are needed for capability preflight."
+  (plist-get (gdocs-dm-to-incremental-save-plan old-doc new-doc) :commands))
 
 (defun gdocs-dm-to-save-commands (current-ot-len doc)
   "Produce the OT save-command list to fully replace a doc of length
@@ -5850,25 +5902,27 @@ stale buffer-local capability metadata cannot bypass policy."
                         nil (plist-get state :title)
                         (or (plist-get state :ot-body) "") ot-ops)))
          (new-doc (gdocs-dm-from-org local-body)))
-    (if (null old-doc)
-        t
-      (let* ((old-paras (gdocs--normalize-paragraphs-for-ot
-                         (gdocs-dm-paragraphs old-doc)))
-             (new-paras (gdocs--normalize-paragraphs-for-ot
-                         (gdocs-dm-paragraphs new-doc)))
-             (pre (gdocs--paragraphs-common-prefix old-paras new-paras))
-             (suf (gdocs--paragraphs-common-suffix
-                   (nthcdr pre old-paras) (nthcdr pre new-paras)))
-             (old-mid (cl-subseq old-paras pre
-                                 (- (length old-paras) suf)))
-             (new-mid (cl-subseq new-paras pre
-                                 (- (length new-paras) suf))))
-        (cl-some (lambda (para)
-                   (or (memq (plist-get para :kind) '(:list :table :inline-object))
-                       (cl-some (lambda (run)
-                                  (plist-get run :inline-object))
-                                (plist-get para :runs))))
-                 (append old-mid new-mid))))))
+    (or (null old-doc)
+        (eq (plist-get (gdocs-dm-to-incremental-save-plan old-doc new-doc t)
+                       :kind)
+            :full-replace))))
+
+(defun gdocs--incremental-plan-for-state (state local-body)
+  "Build an explicit incremental-backend plan against STATE."
+  (let* ((ot-ops (plist-get state :ot-ops))
+         (old-doc (and ot-ops
+                       (gdocs-dm-from-ops
+                        (plist-get state :revision)
+                        nil (plist-get state :title)
+                        (or (plist-get state :ot-body) "") ot-ops)))
+         (new-doc (gdocs-dm-from-org local-body)))
+    (if old-doc
+        (gdocs-dm-to-incremental-save-plan old-doc new-doc t)
+      (list :commands
+            (gdocs-dm-to-save-commands
+             (length (or (plist-get state :ot-body) "")) new-doc)
+            :kind :full-replace
+            :ranges nil))))
 
 (defun gdocs--push-plan-for-diff (state local-body remote-body)
   "Return the preflight plan for the configured push backend."
@@ -5902,25 +5956,24 @@ stale buffer-local capability metadata cannot bypass policy."
                (car (gdocs--strip-heading-drawers local-body))))
              (remote-mappable
               (gdocs--inline-markers-as-ot-placeholders remote-body))
-             ;; Placeholder normalization intentionally hides image metadata
-             ;; and therefore cannot establish a no-op on its own.  Decode the
-             ;; models before treating equal placeholder text as unchanged.
-             (model-requires-full
-              (gdocs--incremental-needs-full-replace-p state local-body))
-             (kind
-              (cond
-               ((and (string= remote-mappable local-stripped)
-                     (not model-requires-full))
-                :noop)
-               ((eq gdocs-push-backend 'ot-encode) :full-replace)
-               ((and (eq gdocs-push-backend 'ot-incremental)
-                     model-requires-full)
-                :full-replace)
-               (t :incremental))))
+              (incremental-plan
+               (and (eq gdocs-push-backend 'ot-incremental)
+                    (gdocs--incremental-plan-for-state state local-body)))
+              (kind
+               (cond
+                ((eq gdocs-push-backend 'ot-incremental)
+                 (plist-get incremental-plan :kind))
+                ((string= remote-mappable local-stripped) :noop)
+                ((eq gdocs-push-backend 'ot-encode) :full-replace)
+                (t :incremental))))
         (list :kind kind
-              :ranges (and (eq kind :incremental)
-                           (gdocs--push-plan-ranges
-                            state remote-body local-body)))))))
+              :ranges (cond
+                       ((and incremental-plan (eq kind :incremental))
+                        (plist-get incremental-plan :ranges))
+                       ((eq kind :incremental)
+                        (gdocs--push-plan-ranges
+                         state remote-body local-body)))
+              :post-body (gdocs--push-comparison-body local-body))))))
 
 (defun gdocs--assert-push-safe (state &optional local-body)
   "Compatibility guard for callers that require full-replacement safety.
@@ -6787,7 +6840,7 @@ complete desired canonical body.  STAGE is `:delete' or `:insert'."
   "Build a fresh full-bundle plan for BACKEND against STATE."
   (let* ((ot-body (or (plist-get state :ot-body) ""))
          (new-doc (gdocs-dm-from-org local-body))
-         (commands
+         (generated
           (if (eq backend 'ot-incremental)
               (let* ((ot-ops (plist-get state :ot-ops))
                      (revision (plist-get state :revision))
@@ -6796,13 +6849,19 @@ complete desired canonical body.  STAGE is `:delete' or `:insert'."
                                    (gdocs-dm-from-ops
                                     revision doc-id title ot-body ot-ops))))
                 (if old-doc
-                    (gdocs-dm-to-incremental-save-commands old-doc new-doc)
-                  (gdocs-dm-to-save-commands (length ot-body) new-doc)))
-            (gdocs-dm-to-save-commands (length ot-body) new-doc))))
-    (list :kind :full
-          :commands commands
-          :post-body (gdocs--push-comparison-body local-body)
-          :preflight-plan '(:kind :full-replace))))
+                    (gdocs-dm-to-incremental-save-plan old-doc new-doc)
+                  (list :commands
+                        (gdocs-dm-to-save-commands (length ot-body) new-doc)
+                        :kind :full-replace
+                        :ranges nil)))
+            (list :commands
+                  (gdocs-dm-to-save-commands (length ot-body) new-doc)
+                  :kind :full-replace
+                  :ranges nil))))
+    (list :kind (plist-get generated :kind)
+          :commands (plist-get generated :commands)
+          :ranges (plist-get generated :ranges)
+          :post-body (gdocs--push-comparison-body local-body))))
 
 (defun gdocs--make-push-intent
     (state local-body expected-body replan &optional label)
@@ -6855,9 +6914,8 @@ complete desired canonical body.  STAGE is `:delete' or `:insert'."
        ;; analysis immediately before every ds, including after a retry.
        (gdocs--push-preflight
         state local-body (plist-get plan :preflight-plan)))
-      (:full
-       (gdocs--push-preflight
-        state local-body (plist-get plan :preflight-plan)))
+      ((or :incremental :full-replace :noop)
+       (gdocs--push-preflight state local-body plan))
       (_
        (user-error "gdocs: operation plan has no capability preflight")))))
 
