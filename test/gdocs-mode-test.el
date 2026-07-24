@@ -3374,7 +3374,110 @@ that a removed preflight guard would be observed as an unexpected success."
        ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Drive title\n:GDOC_REVISION: 2\n:END:\n\nRemote\n"))
     (should (eq (gdocs--sync-state) 'clean))
     (should (equal gdocs--last-synced-hash
-                   (gdocs--top-property-value "GDOC_CONTENT_HASH")))))
+                    (gdocs--top-property-value "GDOC_CONTENT_HASH")))))
+
+(defun gdocs-test--run-guarded-pull (before-completion)
+  "Run a synthetic pull, invoking BEFORE-COMPLETION while it is pending."
+  (let ((fetch-callback nil)
+        (callback-results nil)
+        (gdocs--sync-mutex nil))
+    (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+               (lambda (_doc callback) (setq fetch-callback callback)))
+              ((symbol-function 'gdocs--fetch-docdetails-async)
+               (lambda (_doc _state callback) (funcall callback nil nil)))
+              ((symbol-function 'gdocs--ot-decode-pipeline)
+               (lambda (&rest _args)
+                 (cons "Remote title"
+                       ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Remote title\n:GDOC_REVISION: 2\n:END:\n\nRemote body\n")))
+              ((symbol-function 'gdocs--parse-model-chunk-full)
+               (lambda (_html) '(:ops nil)))
+              ((symbol-function 'gdocs--decode-doco-anchors)
+               (lambda (_ops) nil))
+              ((symbol-function 'gdocs--docos-sync-raw-async)
+               (lambda (_doc _state callback) (funcall callback nil nil)))
+              ((symbol-function 'gdocs--flash-regions) #'ignore))
+      (gdocs-pull-locally
+       "synthetic-id"
+       (lambda (body err) (push (list body err) callback-results)))
+      (funcall before-completion)
+      (funcall fetch-callback '(:revision 2 :ot-body "Remote body\n")
+               "synthetic-html" nil))
+    (nreverse callback-results)))
+
+(ert-deftest gdocs-test-guarded-pull-applies-when-local-state-is-unchanged ()
+  "An unchanged dispatch snapshot permits the fetched pull to apply."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nLocal body\n")
+    (org-mode)
+    (let ((results (gdocs-test--run-guarded-pull #'ignore)))
+      (should (= (length results) 1))
+      (should-not (cadar results))
+      (should (string= (gdocs--buffer-body-as-plain) "Remote body\n"))
+      (should (equal (gdocs--top-property-value "GDOC_REVISION") "2"))
+      (should (eq (gdocs--sync-state) 'clean))
+      (should-not gdocs--auto-sync-conflict-revision))))
+
+(ert-deftest gdocs-test-guarded-pull-aborts-after-delayed-local-edit ()
+  "A pushable edit made during fetch is preserved and reported once."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Local title\n:GDOC_REVISION: 1\n:END:\n\nLocal body\n")
+    (org-mode)
+    (gdocs--mark-synced)
+    (gdocs--put-top-property "GDOC_CONTENT_HASH" gdocs--last-synced-hash)
+    (goto-char (point-max))
+    (let ((baseline gdocs--last-synced-hash)
+          (persisted-baseline
+           (gdocs--top-property-value "GDOC_CONTENT_HASH"))
+          point-after-edit
+          content-after-edit)
+      (let ((results
+             (gdocs-test--run-guarded-pull
+              (lambda ()
+                (insert "Delayed edit\n")
+                (setq point-after-edit (point)
+                      content-after-edit (buffer-string))))))
+      (should (= (length results) 1))
+      (should (string-match-p "pull conflict.*local body changed"
+                              (or (cadar results) "")))
+      (should (equal (buffer-string) content-after-edit))
+      (should (= (point) point-after-edit))
+      (should (equal (gdocs--top-property-value "GDOC_REVISION") "1"))
+      (should (equal gdocs--last-synced-hash baseline))
+      (should (equal (gdocs--top-property-value "GDOC_CONTENT_HASH")
+                     persisted-baseline))
+      (should (eq (gdocs--sync-state) 'dirty))
+      (should (equal gdocs--auto-sync-conflict-revision 2))))))
+
+(ert-deftest gdocs-test-guarded-pull-aborts-after-local-revision-change ()
+  "A revision metadata change during fetch prevents every pull mutation."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nLocal body\n")
+    (org-mode)
+    (let (content-after-change)
+      (let ((results
+             (gdocs-test--run-guarded-pull
+              (lambda ()
+                (gdocs--put-top-property "GDOC_REVISION" "9")
+                (setq content-after-change (buffer-string))))))
+      (should (= (length results) 1))
+      (should (string-match-p "pull conflict.*local revision changed"
+                              (or (cadar results) "")))
+      (should (equal (buffer-string) content-after-change))
+      (should (equal (gdocs--top-property-value "GDOC_REVISION") "9"))
+      (should-not gdocs--last-synced-hash)))))
+
+(ert-deftest gdocs-test-guarded-pull-allows-unrelated-metadata-change ()
+  "Metadata other than revision is not part of the guarded local body."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Local title\n:GDOC_REVISION: 1\n:END:\n\nLocal body\n")
+    (org-mode)
+    (let ((results (gdocs-test--run-guarded-pull
+                    (lambda ()
+                      (gdocs--put-top-property "GDOC_TITLE" "Interim title")))))
+      (should (= (length results) 1))
+      (should-not (cadar results))
+      (should (equal (gdocs--top-property-value "GDOC_TITLE") "Remote title"))
+      (should (string= (gdocs--buffer-body-as-plain) "Remote body\n")))))
 
 (ert-deftest gdocs-test-auto-sync-noop-when-remote-and-local-unchanged ()
   "Matching revisions and a clean local buffer dispatch no operation."

@@ -132,6 +132,11 @@ and not set when content is inserted programmatically).")
 A warning is emitted again when the remote revision changes or the
 conflict has disappeared and later recurs.")
 
+(defvar-local gdocs--pull-generation 0
+  "Identity of the most recently dispatched pull for this buffer.")
+
+(define-error 'gdocs-pull-conflict "GDocs pull conflict")
+
 
 ;;; Logging
 
@@ -4970,22 +4975,72 @@ CALLBACK is `(funcall CB BODY ERR)' on completion."
           (cb (or callback (lambda (_b _e) nil))))
       (gdocs--pull-locally-async-1 doc-id buf cb))))
 
+(defun gdocs--capture-pull-snapshot (buf)
+  "Capture the local state that a pull into BUF must not overwrite."
+  (unless (buffer-live-p buf)
+    (signal 'gdocs-pull-conflict '("destination buffer was killed")))
+  (with-current-buffer buf
+    (setq gdocs--pull-generation (1+ gdocs--pull-generation))
+    (list :buffer buf
+          :generation gdocs--pull-generation
+          :body-hash (gdocs--current-body-hash)
+          :revision (gdocs--top-property-value "GDOC_REVISION"))))
+
+(defun gdocs--pull-conflict-revision (revision)
+  "Return REVISION as a conflict-state number, or nil if unavailable."
+  (cond
+   ((integerp revision) revision)
+   ((and (stringp revision)
+         (string-match-p "\\`[0-9]+\\'" revision))
+    (string-to-number revision))))
+
+(defun gdocs--assert-pull-snapshot-current (buf snapshot remote-revision)
+  "Refuse to apply a pull when BUF no longer matches SNAPSHOT."
+  (let ((reason
+         (cond
+          ((not (buffer-live-p buf)) "destination buffer was killed")
+          ((not (eq buf (plist-get snapshot :buffer)))
+           "destination buffer identity changed")
+          (t
+           (with-current-buffer buf
+             (cond
+              ((not (equal gdocs--pull-generation
+                           (plist-get snapshot :generation)))
+               "a newer pull was dispatched")
+              ((not (equal (gdocs--top-property-value "GDOC_REVISION")
+                           (plist-get snapshot :revision)))
+               "local revision changed while the pull was in flight")
+              ((not (equal (gdocs--current-body-hash)
+                           (plist-get snapshot :body-hash)))
+               "local body changed while the pull was in flight")))))))
+    (when reason
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (setq gdocs--auto-sync-conflict-revision
+                (gdocs--pull-conflict-revision remote-revision))))
+      (signal 'gdocs-pull-conflict (list reason)))))
+
 (defun gdocs--pull-locally-async-1 (doc-id buf cb)
   "Background driver for `gdocs-pull-locally'.
 Single GET on /edit gives us both the state and the raw HTML whose
 modelChunk we need for the op stream. Comments live in the cookie-auth
 `/docos/p/sync' endpoint — chain a POST there and append the
 `* Comments' subtree if any."
-  (let ((release (lambda (err)
-                   (setq gdocs--sync-mutex nil)
+  (let ((snapshot (gdocs--capture-pull-snapshot buf))
+        (done nil))
+    (cl-labels ((finish
+                 (body err)
+                 (unless done
+                   (setq done t
+                         gdocs--sync-mutex nil)
                    (when err (gdocs-log 'warn "Pull %s: %s" doc-id err))
-                   (funcall cb nil err))))
+                   (funcall cb body err))))
     (gdocs--fetch-edit-page-async
      doc-id
      (lambda (state edit-html err)
        (cond
-        (err (funcall release err))
-        (t
+         (err (finish nil err))
+         (t
          (gdocs--fetch-docdetails-async
           doc-id state
           (lambda (details details-err)
@@ -5023,11 +5078,12 @@ modelChunk we need for the op stream. Comments live in the cookie-auth
                                                    (gdocs--render-comments-section
                                                     comments))
                                          body-with-refs)))
-                           (gdocs--apply-pull-into-buffer doc-id buf title final)
-                           (setq gdocs--sync-mutex nil)
-                           (funcall cb final nil))
-                       (error (funcall release (error-message-string sig2)))))))
-              (error (funcall release (error-message-string sig))))))))))))
+                            (gdocs--apply-pull-into-buffer
+                             doc-id buf title final snapshot
+                             (plist-get state :revision))
+                            (finish final nil))
+                        (error (finish nil (error-message-string sig2)))))))
+              (error (finish nil (error-message-string sig)))))))))))))
 
 (defface gdocs-pull-flash
   '((((background dark))  :background "#264f3a" :extend t)
@@ -5236,7 +5292,8 @@ Edits are applied in reverse order so earlier offsets stay valid."
                   flash)))))
     flash))
 
-(defun gdocs--apply-pull-into-buffer (doc-id buf title body)
+(defun gdocs--apply-pull-into-buffer (doc-id buf title body
+                                            &optional snapshot remote-revision)
   "Update BUF so its body matches BODY, preserving point and metadata.
 
 The Drive name is stored in `GDOC_TITLE'. Body Title/Subtitle keywords in
@@ -5249,6 +5306,8 @@ Falls back to a full body replace if the diff would touch the whole document
 anyway."
   (unless (and body (not (string-empty-p body)))
     (error "GDocs pull returned empty content"))
+  (when snapshot
+    (gdocs--assert-pull-snapshot-current buf snapshot remote-revision))
   (when (buffer-live-p buf)
     (with-current-buffer buf
       (let* ((inhibit-read-only t)
