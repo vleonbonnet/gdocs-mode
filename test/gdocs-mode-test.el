@@ -2859,6 +2859,118 @@ that a removed preflight guard would be observed as an unexpected success."
          (doc (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
     (should-not (gdocs-dm-unsupported doc))))
 
+(ert-deftest gdocs-test-capability-canonical-lists-are-not-reported ()
+  "Canonical emitted bullet and number definitions remain pushable."
+  (let* ((body "Bullet\nNumber\n")
+         (definitions
+          (gdocs--emit-list-defs
+           '(("list.canonical-bullet" . :bullet)
+             ("list.canonical-number" . :number))))
+         (bindings
+          (list (gdocs--emit-list-style-op
+                 "list.canonical-bullet" 0
+                 (gdocs-test--line-end-pos body 1))
+                (gdocs--emit-list-style-op
+                 "list.canonical-number" 0
+                 (gdocs-test--line-end-pos body 2))))
+         (ops (append (list (gdocs-test--insert-op body))
+                      definitions bindings))
+         (state (list :revision 7 :ot-body body :ot-ops ops)))
+    (should-not (gdocs-dm-unsupported
+                 (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+    (should (gdocs--push-preflight
+             state "- Bullet\n1. Number\n" '(:kind :full-replace)))))
+
+(ert-deftest gdocs-test-capability-reports-every-custom-list-value ()
+  "Custom list glyph, layout, numbering, and nested styles are reported."
+  (let* ((body "Custom\nPlain\n")
+         (definition
+          (copy-tree
+           (car (gdocs--emit-list-defs '(("list.custom" . :bullet))))))
+         (level (cdr (assq 'nl_0
+                           (alist-get 'le_nb (alist-get 'epm definition)))))
+         (binding (copy-tree
+                   (gdocs--emit-list-style-op
+                    "list.custom" 0 (gdocs-test--line-end-pos body 1))))
+         (binding-sm (alist-get 'sm binding)))
+    (setcdr (assq 'b_gt level) 10)
+    (setcdr (assq 'b_gs level) "◆")
+    (setcdr (assq 'b_gf level) "%0)")
+    (setcdr (assq 'b_ifl level) 27.0)
+    (setcdr (assq 'b_il level) 72.0)
+    (setcdr (assq 'b_a level) 1)
+    (setcdr (assq 'b_sn level) 4)
+    (setcdr (assq 'b_ts level)
+            '((ts_bd . t)
+              (ts_fgc2 . ((hclr_color . "#ff0000") (clr_type . 0)))
+              (ts_ff . "Comic Sans MS")
+              (ts_fs . 14.0)
+              (ts_bd_i . :json-false)))
+    (setcdr (assq 'ls_ts binding-sm)
+            '((ts_bd . t) (ts_it . t)
+              (ts_fgc2 . ((hclr_color . "#0000ff") (clr_type . 0)))
+              (ts_ff . "Roboto Mono") (ts_fs . 16.0)
+              (ts_it_i . :json-false)))
+    (let* ((ops (list (gdocs-test--insert-op body) definition binding))
+           (state (list :revision 7 :ot-body body :ot-ops ops))
+           (reports (gdocs-dm-unsupported
+                     (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+           (features (mapcar (lambda (report)
+                               (plist-get report :feature-type))
+                             reports))
+           (safe-plan '(:kind :incremental
+                              :ranges ((:ot-start 8 :ot-end 13
+                                                  :insert-at 8
+                                                  :delete-count 6))))
+           (unsafe-plan '(:kind :incremental
+                                :ranges ((:ot-start 2 :ot-end 2
+                                                    :insert-at 2
+                                                    :delete-count 1)))))
+      (dolist (feature '("b_gt" "b_gs" "b_gf" "b_ifl" "b_il" "b_a"
+                         "b_sn" "b_ts.ts_bd" "b_ts.ts_fgc2" "b_ts.ts_ff"
+                         "b_ts.ts_fs" "ls_ts.ts_bd" "ls_ts.ts_it"
+                         "ls_ts.ts_fgc2" "ls_ts.ts_ff" "ls_ts.ts_fs"))
+        (should (member feature features)))
+      (should (= (length reports) 16))
+      (dolist (report reports)
+        (should (= (plist-get report :ot-start) 1))
+        (should (= (plist-get report :ot-end) 7))
+        (should (plist-get report :preserve-untouched))
+        (should-not (plist-get report :refuse-push)))
+      (should-error
+       (gdocs--push-preflight state "- Custom\nChanged\n"
+                              '(:kind :full-replace))
+       :type 'user-error)
+      (should (gdocs--push-preflight state "- Custom\nChanged\n" safe-plan))
+      (should-error
+       (gdocs--push-preflight state "- CXstom\nPlain\n" unsafe-plan)
+       :type 'user-error))))
+
+(ert-deftest gdocs-test-capability-unbound-custom-list-refuses-incremental-push ()
+  "A custom list entity without a paragraph binding has no preservation proof."
+  (let* ((body "Plain\n")
+         (definition
+          (copy-tree
+           (car (gdocs--emit-list-defs '(("list.unbound" . :bullet))))))
+         (level (cdr (assq 'nl_0
+                           (alist-get 'le_nb (alist-get 'epm definition))))))
+    (setcdr (assq 'b_gs level) "◆")
+    (let* ((ops (list (gdocs-test--insert-op body) definition))
+           (state (list :revision 7 :ot-body body :ot-ops ops))
+           (report (car (gdocs-dm-unsupported
+                         (gdocs-dm-from-ops
+                          7 "synthetic" nil body ops)))))
+      (should (equal (plist-get report :feature-type) "b_gs"))
+      (should-not (plist-get report :ot-start))
+      (should (plist-get report :refuse-push))
+      (should-error
+       (gdocs--push-preflight
+        state "Changed\n"
+        '(:kind :incremental
+                :ranges ((:ot-start 1 :ot-end 5
+                                      :insert-at 1 :delete-count 5))))
+       :type 'user-error))))
+
 (ert-deftest gdocs-test-capability-reports-unsupported-text-style-values ()
   "Non-default text dimensions are reported with ranges, not payloads."
   (let* ((body "styled\n")

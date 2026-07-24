@@ -778,6 +778,20 @@ therefore reported by the capability scanner.")
 This is a *known* key list, not a list of keys whose values are all
 supported.  See `gdocs--capability-text-style-key-policy'.")
 
+(defconst gdocs--capability-list-level-key-policy
+  '((b_gf . :normalized) (b_ts . :nested-style)
+    (b_ifl . :normalized) (b_gs . :normalized)
+    (b_a . :normalized) (b_sn . :normalized)
+    (b_gt . :normalized) (b_il . :normalized))
+  "Classification table for list-level entity fields.
+
+The encoder emits, for levels 0 through 8, `b_gt' 9 for bullets or 13 for
+numbers, `b_gs' cycling through ●/○/■ for bullets or the empty string for
+numbers, `b_gf' as %N or %N., `b_ifl' as 18+36N, `b_il' as 36+36N,
+`b_a' as 0, `b_sn' as 1, and the block returned by
+`gdocs--ts-block-canonical' as `b_ts'.  Observed semantic values outside
+those exact canonical forms cannot be reproduced by full replacement.")
+
 (defconst gdocs--capability-paragraph-style-key-policy
   '((ps_hd . :supported) (ps_hd_i . :explicitness)
     (ps_hdid . :supported) (ps_hdid_i . :explicitness)
@@ -1239,7 +1253,7 @@ the decoder merely because they are decoded."
     out))
 
 (defun gdocs--decode-list-bindings (ops)
-  "Walk list-style ops; return alist OT-POS → (:list-id S :nest N)."
+  "Walk list-style ops; return alist OT-POS → decoded list attributes."
   (let (out)
     (dolist (op ops)
       (when (and (equal (alist-get 'ty op) "as")
@@ -1247,9 +1261,11 @@ the decoder merely because they are decoded."
         (let* ((si (alist-get 'si op))
                (sm (alist-get 'sm op))
                (id (alist-get 'ls_id sm))
-               (nest (or (alist-get 'ls_nest sm) 0)))
+               (nest (or (alist-get 'ls_nest sm) 0))
+               (text-style (alist-get 'ls_ts sm 'unset)))
           (when (stringp id)
-            (push (cons si (list :list-id id :nest nest)) out)))))
+            (push (cons si (list :list-id id :nest nest
+                                 :text-style text-style)) out)))))
     out))
 
 (defun gdocs--decode-table-attrs (ops)
@@ -1277,7 +1293,7 @@ widths and nested table attributes are validated separately by
 
 (defun gdocs--decode-list-defs (ops)
   "Collect ae list entity defs. Return alist (LIST-ID . NESTS) where
-NESTS is alist N → (:gt N :gs S :gf S)."
+NESTS is alist N → decoded semantic list-level fields."
   (let (defs)
     (dolist (op ops)
       (when (and (equal (alist-get 'ty op) "ae")
@@ -1294,7 +1310,12 @@ NESTS is alist N → (:gt N :gs S :gf S)."
                          when n collect
                          (cons n (list :gt (alist-get 'b_gt body)
                                        :gs (alist-get 'b_gs body)
-                                       :gf (alist-get 'b_gf body))))))
+                                       :gf (alist-get 'b_gf body)
+                                       :text-style (alist-get 'b_ts body 'unset)
+                                       :indent-first (alist-get 'b_ifl body)
+                                       :indent-left (alist-get 'b_il body)
+                                       :alignment (alist-get 'b_a body)
+                                       :start-number (alist-get 'b_sn body))))))
           (push (cons id nests) defs))))
     (nreverse defs)))
 
@@ -1652,22 +1673,145 @@ same visible result as the canonical emitted object."
               "A remote text-style value is not represented by the Org model and would be replaced on push."
               op (symbol-name key)))))
 
-(defun gdocs--scan-list-text-style (op sm)
-  "Return reports for the optional nested list text-style block in SM."
+(defun gdocs--capability-list-text-style-value-canonical-p (key value)
+  "Return non-nil when list text-style KEY/VALUE has emitted semantics."
+  (pcase key
+    ((or 'ts_bd 'ts_it 'ts_un 'ts_st 'ts_sc)
+     (gdocs--capability-default-value-p value))
+    ('ts_ff
+     (or (gdocs--capability-default-value-p value)
+         (equal value "Arial")))
+    ('ts_fs
+     (or (gdocs--capability-default-value-p value)
+         (gdocs--capability-number-equal-p value 11.0)))
+    ('ts_fgc2
+     (gdocs--capability-color-default-p value "#000000"))
+    ('ts_bgc2
+     (gdocs--capability-color-default-p value nil))
+    ('ts_va
+     (or (gdocs--capability-default-value-p value)
+         (equal value "nor")))
+    ('ts_tw
+     (or (gdocs--capability-default-value-p value)
+         (gdocs--capability-number-equal-p value 400)))
+    (_ nil)))
+
+(defun gdocs--capability-list-text-style-features (style prefix)
+  "Return noncanonical semantic feature names in list STYLE under PREFIX."
+  (cond
+   ((or (eq style 'unset) (gdocs--capability-default-value-p style)) nil)
+   ((not (listp style)) (list prefix))
+   (t
+    (cl-loop for entry in style
+             for key = (car-safe entry)
+             for policy = (cdr (assq key
+                                      gdocs--capability-text-style-key-policy))
+             unless (or (and (symbolp key)
+                             (string-suffix-p "_i" (symbol-name key)))
+                        (and policy
+                             (gdocs--capability-list-text-style-value-canonical-p
+                              key (cdr entry))))
+             collect (if (symbolp key)
+                         (format "%s.%s" prefix (symbol-name key))
+                       prefix)))))
+
+(defun gdocs--list-binding-paragraph-range (op body)
+  "Return the paragraph range proven by list binding OP in BODY."
+  (let ((si (alist-get 'si op))
+        (ei (alist-get 'ei op)))
+    (when (and (integerp si) (>= si 1) (equal si ei)
+               (<= si (length (or body "")))
+               (= (aref body (1- si)) ?\n))
+      (let ((previous (cl-position ?\n body :from-end t :end (1- si))))
+        (list :ot-start (if previous (+ previous 2) 1)
+              :ot-end si)))))
+
+(defun gdocs--capability-list-report
+    (kind explanation feature &optional range entity-id)
+  "Build a list capability report for FEATURE and its proven RANGE."
+  (apply #'gdocs--capability-report kind explanation
+         (append (when range range)
+                 (when entity-id
+                   (list :entity-type "list" :entity-id entity-id))
+                 (list :feature-type feature
+                       :preserve-untouched (and range t)
+                       :refuse-push (not range)
+                       :push-policy (if range :allow-if-untouched :refuse)))))
+
+(defun gdocs--scan-list-text-style (op sm body)
+  "Return reports for noncanonical nested `ls_ts' values in list binding SM."
   (when (listp sm)
-    (let ((list-style (alist-get 'ls_ts sm 'unset)))
-      (cond
-       ((or (eq list-style 'unset)
-            (gdocs--capability-default-value-p list-style))
-        nil)
-       ((listp list-style)
-        (gdocs--scan-text-style-modifier op list-style))
-       (t
-        (list
-         (gdocs--capability-unsupported-value-report
+    (let ((range (gdocs--list-binding-paragraph-range op body)))
+      (mapcar
+       (lambda (feature)
+         (gdocs--capability-list-report
           :unsupported-paragraph
-          "A remote list text-style block is not represented by the Org/OT model."
-          op "ls_ts")))))))
+          "A remote list text-style value is not reproduced by the OT encoder."
+          feature range))
+       (gdocs--capability-list-text-style-features
+        (alist-get 'ls_ts sm 'unset) "ls_ts")))))
+
+(defun gdocs--capability-list-level-features (level level-body)
+  "Return every noncanonical semantic feature in LEVEL-BODY at LEVEL."
+  (if (not (and (integerp level) (<= 0 level) (<= level 8)
+                (listp level-body)))
+      (list "le_nb")
+    (let* ((gt (alist-get 'b_gt level-body 'unset))
+           (numbered (memq gt '(10 13 15)))
+           (bullet-glyphs ["●" "○" "■" "●" "○" "■" "●" "○" "■"])
+           features)
+      (dolist (entry level-body)
+        (let* ((key (car-safe entry))
+               (value (cdr entry))
+               (known (assq key gdocs--capability-list-level-key-policy))
+               (canonical
+                (pcase key
+                  ('b_gt (memq value '(9 13)))
+                  ('b_gs (equal value (if numbered ""
+                                       (aref bullet-glyphs level))))
+                  ('b_gf (equal value (format "%%%d%s" level
+                                              (if numbered "." ""))))
+                  ('b_ifl (gdocs--capability-number-equal-p
+                           value (+ 18 (* 36 level))))
+                  ('b_il (gdocs--capability-number-equal-p
+                          value (* 36 (1+ level))))
+                  ('b_a (gdocs--capability-number-equal-p value 0))
+                  ('b_sn (gdocs--capability-number-equal-p value 1))
+                  ('b_ts t)
+                  (_ nil))))
+          (cond
+           ((and (symbolp key) (string-suffix-p "_i" (symbol-name key))))
+           ((not known)
+            (push (if (symbolp key) (symbol-name key) "list-level") features))
+           ((eq key 'b_ts)
+            (setq features
+                  (nconc (gdocs--capability-list-text-style-features
+                          value "b_ts") features)))
+           ((not canonical)
+            (push (symbol-name key) features)))))
+      (nreverse features))))
+
+(defun gdocs--list-entity-binding-ranges (ops body)
+  "Return list entity binding ranges and whether every binding was proven."
+  (let (bindings)
+    (dolist (op ops)
+      (when (and (equal (alist-get 'ty op) "as")
+                 (equal (alist-get 'st op) "list"))
+        (let* ((sm (alist-get 'sm op))
+               (id (and (listp sm) (alist-get 'ls_id sm)))
+               (range (gdocs--list-binding-paragraph-range op body)))
+          (when (stringp id)
+            (let* ((cell (assoc id bindings))
+                   (info (or (cdr cell) (list :ranges nil :complete t))))
+              (if range
+                  (setq info (plist-put
+                              info :ranges
+                              (cons range (plist-get info :ranges))))
+                (setq info (plist-put info :complete nil)))
+              (if cell
+                  (setcdr cell info)
+                (push (cons id info) bindings)))))))
+    bindings))
 
 (defun gdocs--paragraph-heading-value-supported-p (value)
   "Return non-nil for paragraph heading values the Org model can emit."
@@ -1843,7 +1987,8 @@ report. Inline image reports are produced by
 `gdocs--decode-inline-objects'."
   (let ((reports nil)
         (attachments (make-hash-table :test #'equal))
-        (para-attrs (gdocs--decode-para-attrs ops)))
+        (para-attrs (gdocs--decode-para-attrs ops))
+        (list-binding-ranges (gdocs--list-entity-binding-ranges ops body)))
     ;; Collect attachment positions first so an unknown entity can carry a
     ;; useful range when Google supplied a `te' operation for it.
     (dolist (op ops)
@@ -1910,31 +2055,52 @@ report. Inline image reports are produced by
                 (if (stringp entity-id)
                     (let* ((epm (alist-get 'epm op))
                            (levels (and (listp epm)
-                                        (alist-get 'le_nb epm))))
-                      (dolist (level levels)
-                        (let* ((level-body (cdr level))
-                               (glyph-type
-                                (and (listp level-body)
-                                     (alist-get 'b_gt level-body)))
-                               (text-style
-                                (and (listp level-body)
-                                     (alist-get 'b_ts level-body 'unset))))
-                          (unless (memq glyph-type '(9 10 13 15))
-                            (push (gdocs--capability-report
-                                   :unsupported-entity
-                                   "A list glyph type is not supported by the Org/OT model."
-                                   :entity-type "list"
-                                   :entity-id entity-id
-                                   :feature-type "b_gt"
-                                   :refuse-push t)
-                                  reports))
-                          (unless (or (eq text-style 'unset)
-                                      (gdocs--capability-default-value-p
-                                       text-style))
-                            (dolist (report
-                                     (gdocs--scan-text-style-modifier
-                                      op text-style))
-                              (push report reports))))))
+                                        (alist-get 'le_nb epm)))
+                           (binding-info
+                            (cdr (assoc entity-id list-binding-ranges)))
+                           (ranges (and (plist-get binding-info :complete)
+                                        (plist-get binding-info :ranges)))
+                           features)
+                      (when (listp epm)
+                        (dolist (entry epm)
+                          (let ((key (car-safe entry)))
+                            (unless (or (eq key 'le_nb)
+                                        (and (symbolp key)
+                                             (string-suffix-p
+                                              "_i" (symbol-name key))))
+                              (push (if (symbolp key)
+                                        (symbol-name key) "list-entity")
+                                    features)))))
+                      (if (not (listp levels))
+                          (push "le_nb" features)
+                        (dolist (level levels)
+                          (let* ((name (car-safe level))
+                                 (name-string (and (symbolp name)
+                                                   (symbol-name name)))
+                                 (level-number
+                                  (and name-string
+                                       (string-match
+                                        "^nl_\\([0-9]+\\)$" name-string)
+                                       (string-to-number
+                                        (match-string 1 name-string)))))
+                            (setq features
+                                  (nconc
+                                   (gdocs--capability-list-level-features
+                                    level-number (cdr-safe level))
+                                   features)))))
+                      (dolist (feature (nreverse features))
+                        (if ranges
+                            (dolist (range ranges)
+                              (push (gdocs--capability-list-report
+                                     :unsupported-entity
+                                     "A remote list definition value is not reproduced by the OT encoder."
+                                     feature range entity-id)
+                                    reports))
+                          (push (gdocs--capability-list-report
+                                 :unsupported-entity
+                                 "A remote list definition value is not reproduced by the OT encoder."
+                                 feature nil entity-id)
+                                reports))))
                   (push (gdocs--capability-report
                          :unsupported-entity
                          "A list entity has no usable identifier."
@@ -1984,25 +2150,23 @@ report. Inline image reports are produced by
                ((equal style "list")
                 (dolist (key (gdocs--capability-unknown-style-keys
                               sm '(ls_id ls_nest ls_ts)))
-                  (push (gdocs--capability-report-for-op
+                  (push (gdocs--capability-list-report
                          :unsupported-paragraph
                          "A remote list attribute is not represented by the Org/OT model."
-                         op :feature-type (format "%s" key)
-                         :preserve-untouched t :refuse-push nil
-                         :push-policy :allow-if-untouched)
+                         (format "%s" key)
+                         (gdocs--list-binding-paragraph-range op body))
                         reports))
-                (dolist (report (gdocs--scan-list-text-style op sm))
+                (dolist (report (gdocs--scan-list-text-style op sm body))
                   (push report reports))
-                (let ((nest (alist-get 'ls_nest sm)))
+                (let ((nest (and (listp sm) (alist-get 'ls_nest sm))))
                   (when (and nest
                              (not (and (integerp nest)
                                        (<= 0 nest) (<= nest 8))))
-                    (push (gdocs--capability-report-for-op
+                    (push (gdocs--capability-list-report
                            :unsupported-paragraph
                            "A remote list nesting level is outside the supported range."
-                           op :feature-type "ls_nest"
-                           :preserve-untouched t :refuse-push nil
-                           :push-policy :allow-if-untouched)
+                           "ls_nest"
+                           (gdocs--list-binding-paragraph-range op body))
                           reports))))
                ((equal style "tbl")
                 (dolist (key (gdocs--capability-table-unsupported-keys sm))
@@ -3852,7 +4016,7 @@ both `ae list' per-level `b_ts' and `as st=list' `ls_ts'. The cookie
 paragraph-terminator newline) for LIST-ID. Mirrors the live shape:
 `sm' must carry both the canonical `ls_ts' text-style block and the
 `ls_id'. Nest level is encoded indirectly via paragraph indent (not
-on this op); we always emit at level 0."
+on this op); `ls_nest' is therefore omitted."
   `((ty . "as") (st . "list") (si . ,pos) (ei . ,pos)
     (sm . ((ls_ts . ,(gdocs--ts-block-canonical))
            (ls_id . ,list-id)))))
@@ -3956,8 +4120,11 @@ synthesizes an id for paragraphs that don't carry one yet."
 
 Each per-level alist mirrors the live shape: `b_gf' glyph format,
 canonical `b_ts' text-style block, `b_ifl'/`b_il' indents stepped by
-36pt per level (18pt first-line offset). For LISTS, each entry is
-\(LIST-ID . GLYPH), where GLYPH is :bullet or :number.
+36pt per level (18pt first-line offset), `b_a'=0, and `b_sn'=1. For
+level N, bullets emit `b_gt'=9, `b_gs' cycling ●/○/■, and `b_gf'=%N;
+numbers emit `b_gt'=13, an empty `b_gs', and `b_gf'=%N.  `b_ifl' is
+18+36N and `b_il' is 36+36N. For LISTS, each entry is \(LIST-ID . GLYPH),
+where GLYPH is :bullet or :number.
 
 Bullet glyphs cycle ●/○/■ across levels; numbered uses no glyph string
 \(b_gt=13 already tells the renderer to compute the number)."
