@@ -51,6 +51,9 @@
   (error "Expected one production source load, got %d"
          gdocs-test--production-load-count))
 
+(defconst gdocs-test--production-curl-async
+  (symbol-function 'gdocs--curl-async))
+
 (ert-deftest gdocs-test-production-loaded-once-from-explicit-source ()
   "The suite loads exactly the checked-out production source once."
   (should (= gdocs-test--production-load-count 1))
@@ -3294,7 +3297,8 @@ that a removed preflight guard would be observed as an unexpected success."
                (lambda (&rest _args) "Remote\n"))
               ((symbol-function 'gdocs--apply-push-async)
                (lambda (&rest _args) (setq applied t))))
-      (gdocs--push-remotely-async-1 "synthetic-id" nil "8" "Changed\n")
+      (gdocs--push-remotely-async-1
+       "synthetic-id" nil "8" "Changed\n" gdocs--sync-mutex)
       (should-not applied)
       (should-not gdocs--sync-mutex))))
 
@@ -4364,6 +4368,102 @@ that a removed preflight guard would be observed as an unexpected success."
       (should-error (gdocs-push-remotely "synthetic-id") :type 'user-error)
       (should-not gdocs--sync-mutex))))
 
+(ert-deftest gdocs-test-sync-invalid-id-error-releases-owner ()
+  "An ID resolution signal cannot strand the global sync lock."
+  (let ((gdocs--sync-mutex nil))
+    (with-temp-buffer
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--get-doc-id)
+                 (lambda (&optional _doc-id)
+                   (user-error "synthetic invalid ID"))))
+        (should-error (gdocs-pull-locally) :type 'user-error)))
+    (should-not gdocs--sync-mutex)))
+
+(ert-deftest gdocs-test-sync-auth-error-releases-owner ()
+  "A synchronous authentication signal cannot strand the sync lock."
+  (let ((gdocs--sync-mutex nil)
+        (gdocs-auth-function
+         (lambda () (error "synthetic authentication failure"))))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:END:\n\nBody\n")
+      (org-mode)
+      (should-error (gdocs-pull-locally "synthetic-id") :type 'error))
+    (should-not gdocs--sync-mutex)))
+
+(ert-deftest gdocs-test-sync-process-creation-error-releases-owner ()
+  "A synchronous process creation signal cannot strand the sync lock."
+  (let ((gdocs--sync-mutex nil)
+        (gdocs-auth-function (lambda () '(("Cookie" . "synthetic")))))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:END:\n\nBody\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--curl-async)
+                 gdocs-test--production-curl-async)
+                ((symbol-function 'make-process)
+                 (lambda (&rest _args)
+                   (signal 'file-error '("synthetic process failure")))))
+        (should-error (gdocs-pull-locally "synthetic-id")
+                      :type 'file-error)))
+    (should-not gdocs--sync-mutex)))
+
+(ert-deftest gdocs-test-sync-successful-dispatch-retains-owner-until-completion ()
+  "A dispatched push owns the lock until its completion callback runs."
+  (let ((gdocs--sync-mutex nil)
+        fetch-callback)
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 7\n:END:\n\nsame\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                 (lambda (_doc callback) (setq fetch-callback callback)))
+                ((symbol-function 'gdocs--ot-remote-org-body)
+                 (lambda (&rest _args) "same\n"))
+                ((symbol-function 'gdocs--push-preflight) #'ignore))
+        (gdocs-push-remotely "synthetic-id")
+        (let ((owner gdocs--sync-mutex))
+          (should owner)
+          (funcall fetch-callback
+                   '(:revision 7 :token "token" :ouid "ouid")
+                   "synthetic-html" nil)
+          (should-not gdocs--sync-mutex)
+          (should-not (gdocs--sync-release owner)))))))
+
+(ert-deftest gdocs-test-sync-stale-callback-cannot-release-newer-owner ()
+  "A delayed callback releases only the operation token it captured."
+  (let ((gdocs--sync-mutex nil)
+        fetch-callback)
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:END:\n\nBody\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                 (lambda (_doc callback) (setq fetch-callback callback))))
+        (gdocs-pull-locally "synthetic-id")
+        (let ((old-owner gdocs--sync-mutex))
+          (should (gdocs--sync-release old-owner))
+          (let ((new-owner (gdocs--sync-acquire)))
+            (should new-owner)
+            (funcall fetch-callback nil nil "late failure")
+            (should (eq gdocs--sync-mutex new-owner))
+            (should (gdocs--sync-release new-owner))))))))
+
+(ert-deftest gdocs-test-sync-another-buffer-dispatches-after-setup-failure ()
+  "A setup failure in one buffer does not block a second buffer."
+  (let ((gdocs--sync-mutex nil)
+        second-callback)
+    (with-temp-buffer
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--get-doc-id)
+                 (lambda (&optional _doc-id) (user-error "invalid ID"))))
+        (should-error (gdocs-pull-locally) :type 'user-error)))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: second-synthetic-id\n:END:\n\nBody\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                 (lambda (_doc callback) (setq second-callback callback))))
+        (gdocs-pull-locally "second-synthetic-id")
+        (should gdocs--sync-mutex)
+        (funcall second-callback nil nil "synthetic completion")))
+    (should-not gdocs--sync-mutex)))
+
 (ert-deftest gdocs-test-push-preflight-refuses-stale-remote-state ()
   "A mocked remote revision mismatch refuses push without applying changes."
   (let ((gdocs--sync-mutex t)
@@ -4376,7 +4476,8 @@ that a removed preflight guard would be observed as an unexpected success."
                           "synthetic-html" nil)))
               ((symbol-function 'gdocs--apply-push-async)
                (lambda (&rest _args) (setq applied t))))
-      (gdocs--push-remotely-async-1 "synthetic-id" nil "7" "local")
+      (gdocs--push-remotely-async-1
+       "synthetic-id" nil "7" "local" gdocs--sync-mutex)
       (should-not applied)
       (should-not gdocs--sync-mutex))))
 
@@ -4791,7 +4892,8 @@ that a removed preflight guard would be observed as an unexpected success."
                (lambda (&rest _args) "same"))
               ((symbol-function 'gdocs--apply-push-async)
                (lambda (&rest _args) (setq called t))))
-      (gdocs--push-remotely-async-1 "synthetic-id" nil "7" "same")
+      (gdocs--push-remotely-async-1
+       "synthetic-id" nil "7" "same" gdocs--sync-mutex)
       (should-not called)
       (should-not gdocs--sync-mutex)))
   (let ((gdocs--sync-mutex t)
@@ -4808,7 +4910,8 @@ that a removed preflight guard would be observed as an unexpected success."
                (lambda (_doc _state local remote _buffer callback)
                  (setq called t arguments (list local remote))
                  (funcall callback 8 nil))))
-      (gdocs--push-remotely-async-1 "synthetic-id" nil "7" "local")
+      (gdocs--push-remotely-async-1
+       "synthetic-id" nil "7" "local" gdocs--sync-mutex)
       (should called)
       (should (equal arguments '("local" "remote")))
       (should-not gdocs--sync-mutex))))
@@ -4838,7 +4941,8 @@ that a removed preflight guard would be observed as an unexpected success."
                   ((symbol-function 'gdocs--apply-push-async)
                    (lambda (&rest _args) (cl-incf apply-count))))
           (gdocs--push-remotely-async-1
-           "synthetic-id" (current-buffer) "6" local-body))
+            "synthetic-id" (current-buffer) "6" local-body
+            gdocs--sync-mutex))
         (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "7"))
         (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
                        expected-hash))

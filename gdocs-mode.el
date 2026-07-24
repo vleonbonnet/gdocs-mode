@@ -124,7 +124,20 @@ Default `warn' keeps *Messages* quiet during normal pull/push; set to
   "Generation of the current auto-sync lifecycle.")
 
 (defvar gdocs--sync-mutex nil
-  "Global mutex for sync operations.")
+  "Ownership token for the global sync operation, or nil when unlocked.")
+
+(defun gdocs--sync-acquire ()
+  "Acquire the global sync lock and return its unique ownership token."
+  (unless gdocs--sync-mutex
+    (let ((owner (list 'gdocs-sync-owner)))
+      (setq gdocs--sync-mutex owner)
+      owner)))
+
+(defun gdocs--sync-release (owner)
+  "Release the global sync lock when OWNER still owns it."
+  (when (and owner (eq owner gdocs--sync-mutex))
+    (setq gdocs--sync-mutex nil)
+    t))
 
 (defvar-local gdocs--last-synced-hash nil
   "SHA-256 of the pushable buffer body (sans synchronization metadata)
@@ -5156,11 +5169,16 @@ CALLBACK is `(funcall CB BODY ERR)' on completion."
   (interactive)
   (if gdocs--sync-mutex
       (gdocs-log 'warn "Mutex locked - skipping pull")
-    (setq gdocs--sync-mutex t)
-    (let ((buf (current-buffer))
-          (doc-id (gdocs--get-doc-id doc-id))
-          (cb (or callback (lambda (_b _e) nil))))
-      (gdocs--pull-locally-async-1 doc-id buf cb))))
+    (let ((owner (gdocs--sync-acquire))
+          (dispatched nil))
+      (unwind-protect
+          (let ((buf (current-buffer))
+                (doc-id (gdocs--get-doc-id doc-id))
+                (cb (or callback (lambda (_b _e) nil))))
+            (gdocs--pull-locally-async-1 doc-id buf cb owner)
+            (setq dispatched t))
+        (unless dispatched
+          (gdocs--sync-release owner))))))
 
 (defun gdocs--capture-pull-snapshot (buf)
   "Capture the local state that a pull into BUF must not overwrite."
@@ -5207,7 +5225,7 @@ CALLBACK is `(funcall CB BODY ERR)' on completion."
                 (gdocs--pull-conflict-revision remote-revision))))
       (signal 'gdocs-pull-conflict (list reason)))))
 
-(defun gdocs--pull-locally-async-1 (doc-id buf cb)
+(defun gdocs--pull-locally-async-1 (doc-id buf cb owner)
   "Background driver for `gdocs-pull-locally'.
 Single GET on /edit gives us both the state and the raw HTML whose
 modelChunk we need for the op stream. Comments live in the cookie-auth
@@ -5217,10 +5235,10 @@ modelChunk we need for the op stream. Comments live in the cookie-auth
         (done nil))
     (cl-labels ((finish
                  (body err)
-                 (unless done
-                   (setq done t
-                         gdocs--sync-mutex nil)
-                   (when err (gdocs-log 'warn "Pull %s: %s" doc-id err))
+                  (unless done
+                    (setq done t)
+                    (gdocs--sync-release owner)
+                    (when err (gdocs-log 'warn "Pull %s: %s" doc-id err))
                    (funcall cb body err))))
     (gdocs--fetch-edit-page-async
      doc-id
@@ -8560,23 +8578,29 @@ GDOC_CONTENT_HASH from the response."
   (interactive)
   (if gdocs--sync-mutex
       (progn (gdocs-log 'warn "Mutex locked - skipping push") nil)
-    (setq gdocs--sync-mutex t)
-    (let* ((buf (current-buffer))
-           (doc-id (gdocs--get-doc-id doc-id))
-           (local-rev (org-entry-get (point-min) "GDOC_REVISION" t))
-           (local-body (gdocs--buffer-body-as-plain)))
-      (unless (and local-rev (not (string-empty-p local-rev)))
-        (setq gdocs--sync-mutex nil)
-        (user-error "gdocs: no GDOC_REVISION on this buffer — pull first"))
-      (gdocs--push-remotely-async-1 doc-id buf local-rev local-body))))
+    (let ((owner (gdocs--sync-acquire))
+          (dispatched nil))
+      (unwind-protect
+          (let* ((buf (current-buffer))
+                 (doc-id (gdocs--get-doc-id doc-id))
+                 (local-rev (org-entry-get (point-min) "GDOC_REVISION" t))
+                 (local-body (gdocs--buffer-body-as-plain)))
+            (unless (and local-rev (not (string-empty-p local-rev)))
+              (user-error "gdocs: no GDOC_REVISION on this buffer — pull first"))
+            (gdocs--push-remotely-async-1
+             doc-id buf local-rev local-body owner)
+            (setq dispatched t))
+        (unless dispatched
+          (gdocs--sync-release owner))))))
 
-(defun gdocs--push-remotely-async-1 (doc-id buf local-rev local-body)
+(defun gdocs--push-remotely-async-1
+    (doc-id buf local-rev local-body owner)
   "Background driver for `gdocs-push-remotely'.
 Single GET on /edit gives both the edit state and the modelChunk we
 decode into the org view we diff against. Releases the sync mutex on
 completion or error."
   (let ((release (lambda (err)
-                   (setq gdocs--sync-mutex nil)
+                   (gdocs--sync-release owner)
                    (when err (gdocs-log 'warn "Push %s: %s" doc-id err)))))
     (gdocs--fetch-edit-page-async
      doc-id
@@ -8605,7 +8629,7 @@ completion or error."
                    (when (buffer-live-p buf)
                      (with-current-buffer buf
                        (gdocs--finalize-push-props remote-rev local-body)))
-                   (setq gdocs--sync-mutex nil)
+                   (gdocs--sync-release owner)
                    (gdocs-log 'info "Push: no local changes for %s" doc-id))
                   ((not (string= local-rev (format "%s" remote-rev)))
                    (funcall release
@@ -8615,7 +8639,7 @@ completion or error."
                    (gdocs--apply-push-async
                     doc-id state local-body remote-body buf
                     (lambda (_rev e2)
-                      (setq gdocs--sync-mutex nil)
+                      (gdocs--sync-release owner)
                       (when e2 (gdocs-log 'warn "Push %s: %s" doc-id e2)))))))
              (error (funcall release (error-message-string sig)))))))))))
 
