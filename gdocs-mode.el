@@ -3200,34 +3200,39 @@ than to the final text, so it never appears inside a source block."
   "Parse an inline-object dimension TOKEN, or return nil."
   (when (and (stringp token)
              (string-match-p "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" token))
-    (string-to-number token)))
+    (let ((dimension (string-to-number token)))
+      (and (> dimension 0) dimension))))
 
 (defun gdocs--parse-inline-object-spec (value)
   "Parse the payload of a `gdocs_inline_object' Org placeholder.
 
 The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT'."
   (let* ((fields (split-string (string-trim (or value ""))
-                               "[ \t]+" t))
+                                "[ \t]+" t))
          (dimensions (nth 2 fields))
          (content-field (nth 3 fields))
+         (content-id (and (stringp content-field)
+                          (string-prefix-p "content-id=" content-field)
+                          (substring content-field (length "content-id="))))
          (width-token nil)
          (height-token nil))
-    (when (and (equal (car fields) "image")
+    (when (and (= (length fields) 4)
+               (equal (car fields) "image")
                (stringp (nth 1 fields))
+               (not (string-empty-p (nth 1 fields)))
                (stringp dimensions)
                (string-match
                 "\\`\\([^x]+\\)x\\([^x]+\\)\\'" dimensions))
       (setq width-token (match-string 1 dimensions)
             height-token (match-string 2 dimensions))
       (when (and (gdocs--inline-object-dimension width-token)
-                 (gdocs--inline-object-dimension height-token)
-                 (or (null content-field)
-                     (string-prefix-p "content-id=" content-field)))
+                  (gdocs--inline-object-dimension height-token)
+                  (stringp content-id)
+                  (not (string-empty-p content-id)))
         (list :kind :inline-object
               :entity-id (nth 1 fields)
               :object-kind :image
-              :content-id (and content-field
-                               (substring content-field (length "content-id=")))
+              :content-id content-id
               :width (gdocs--inline-object-dimension width-token)
               :height (gdocs--inline-object-dimension height-token))))))
 

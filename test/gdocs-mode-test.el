@@ -2664,6 +2664,50 @@ END is the inclusive final OT position."
       (should-not (plist-get analysis :objects))
       (should (= (length (plist-get analysis :inline-marker-errors)) 1)))))
 
+(ert-deftest gdocs-test-inline-object-spec-requires-exact-complete-grammar ()
+  "Inline-object specs have exactly four complete, positive fields."
+  (let ((object
+         (gdocs--parse-inline-object-spec
+          "image kix.synthetic 1.5x2 content-id=s-blob-v1-IMAGE-synthetic")))
+    (should (equal (plist-get object :entity-id) "kix.synthetic"))
+    (should (= (plist-get object :width) 1.5))
+    (should (= (plist-get object :height) 2))
+    (should (equal (plist-get object :content-id)
+                   "s-blob-v1-IMAGE-synthetic")))
+  (dolist (spec '("image kix.synthetic 1x1"
+                  "image kix.synthetic 1x1 content-id="
+                  "image kix.synthetic 1x1 content-id=content extra"
+                  "image 1x1 content-id=content"
+                  "image kix.synthetic 0x1 content-id=content"
+                  "image kix.synthetic 1x0 content-id=content"
+                  "image kix.synthetic -1x1 content-id=content"
+                  "image kix.synthetic 1x-1 content-id=content"
+                  "image kix.synthetic invalidx1 content-id=content"
+                  "image kix.synthetic 1xinvalid content-id=content"
+                  "image kix.synthetic 1x1x1 content-id=content"))
+    (should-not (gdocs--parse-inline-object-spec spec))))
+
+(ert-deftest gdocs-test-malformed-inline-object-grammar-is-never-normalized ()
+  "Malformed standalone and embedded specs remain visible hard errors."
+  (let ((plain-state '(:ot-body "plain\n" :ot-ops nil)))
+    (dolist (spec '("image kix.synthetic 1x1"
+                    "image kix.synthetic 1x1 content-id="
+                    "image kix.synthetic 1x1 content-id=content extra"
+                    "image 1x1 content-id=content"
+                    "image kix.synthetic 0x1 content-id=content"
+                    "image kix.synthetic -1x1 content-id=content"
+                    "image kix.synthetic invalidx1 content-id=content"))
+      (dolist (body (list (format "#+gdocs_inline_object: %s\n" spec)
+                          (format "Before @@gdocs-inline-object:%s@@ after\n"
+                                  spec)))
+        (let ((analysis (gdocs--local-capability-analysis body)))
+          (should-not (plist-get analysis :objects))
+          (should (= (length (plist-get analysis :inline-marker-errors)) 1)))
+        (should (equal (gdocs--inline-markers-as-ot-placeholders body) body))
+        (should-error
+         (gdocs--push-preflight plain-state body '(:kind :noop))
+         :type 'user-error)))))
+
 (ert-deftest gdocs-test-inline-object-normalization-is-structural ()
   "Placeholder normalization leaves marker-like literal text untouched."
   (let* ((spec "image kix.synthetic 1x1 content-id=s-blob-v1-IMAGE-synthetic")
