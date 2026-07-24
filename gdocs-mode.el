@@ -5331,10 +5331,11 @@ Synchronization metadata, including `GDOC_TITLE', is excluded. A body
 `#+title:' remains part of the hashed text."
   (secure-hash 'sha256 (gdocs--buffer-body-as-plain)))
 
-(defun gdocs--mark-synced ()
-  "Record the current buffer body hash as the post-sync baseline.
+(defun gdocs--mark-synced (&optional committed-hash)
+  "Record COMMITTED-HASH or the current body hash as the sync baseline.
 Call inside `with-current-buffer' after every successful pull or push."
-  (setq gdocs--last-synced-hash (gdocs--current-body-hash)
+  (setq gdocs--last-synced-hash (or committed-hash
+                                    (gdocs--current-body-hash))
         gdocs--auto-sync-conflict-revision nil))
 
 (defun gdocs--buffer-body-as-plain ()
@@ -7159,11 +7160,11 @@ instead and receives the same `(NEW-REV ERR)' callback shape."
 (defun gdocs--finalize-push-props (new-rev local-body)
   "Write GDOC_REVISION / hash / synced-at on the current buffer.
 Caller must already be inside `with-current-buffer'."
-  (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
-  (gdocs--put-top-property "GDOC_CONTENT_HASH"
-                           (secure-hash 'sha256 local-body))
-  (gdocs--put-top-property "GDOC_SYNCED_AT" (gdocs--now-iso))
-  (gdocs--mark-synced))
+  (let ((committed-hash (secure-hash 'sha256 local-body)))
+    (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
+    (gdocs--put-top-property "GDOC_CONTENT_HASH" committed-hash)
+    (gdocs--put-top-property "GDOC_SYNCED_AT" (gdocs--now-iso))
+    (gdocs--mark-synced committed-hash)))
 
 (defun gdocs--apply-in-place-region-result-async
     (doc-id state remote-body region buffer local-body callback)

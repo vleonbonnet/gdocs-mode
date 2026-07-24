@@ -2635,6 +2635,90 @@ END is the inclusive final OT position."
       (should (equal callback-revision (nth 2 outcome)))
       (should (equal callback-error (nth 3 outcome))))))
 
+(ert-deftest gdocs-test-async-push-committed-body-remains-clean ()
+  "A successful push records the captured body as the clean baseline."
+  (let ((gdocs-push-backend 'plain))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nA\n")
+      (org-mode)
+      (let* ((local-body (gdocs--buffer-body-as-plain))
+             (committed-hash (secure-hash 'sha256 local-body)))
+        (cl-letf (((symbol-function 'gdocs--push-plan-for-diff)
+                   (lambda (&rest _args) '(:kind :incremental)))
+                  ((symbol-function 'gdocs--push-preflight) #'ignore)
+                  ((symbol-function 'gdocs--run-op-result-async)
+                   (lambda (_doc _state _intent callback)
+                     (funcall callback '(:revision 2 :plan (:ot-start 1)) nil))))
+          (gdocs--apply-push-async
+           "synthetic-id" '(:revision 1 :ot-body "")
+           local-body "" (current-buffer) #'ignore))
+        (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                       committed-hash))
+        (should (equal gdocs--last-synced-hash committed-hash))
+        (should (equal (gdocs--current-body-hash) committed-hash))))))
+
+(ert-deftest gdocs-test-async-push-edit-during-request-remains-dirty ()
+  "An edit after capture remains dirty and is selected by the next auto-sync."
+  (let ((gdocs-push-backend 'plain)
+        (gdocs-mode t)
+        (gdocs--sync-mutex nil)
+        (push-count 0)
+        transport-callback)
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n:END:\n\nA\n")
+      (org-mode)
+      (let* ((local-body (gdocs--buffer-body-as-plain))
+             (committed-hash (secure-hash 'sha256 local-body)))
+        (cl-letf (((symbol-function 'gdocs--push-plan-for-diff)
+                   (lambda (&rest _args) '(:kind :incremental)))
+                  ((symbol-function 'gdocs--push-preflight) #'ignore)
+                  ((symbol-function 'gdocs--run-op-result-async)
+                   (lambda (_doc _state _intent callback)
+                     (setq transport-callback callback))))
+          (gdocs--apply-push-async
+           "synthetic-id" '(:revision 1 :ot-body "")
+           local-body "" (current-buffer) #'ignore))
+        (goto-char (point-max))
+        (insert "B\n")
+        (let ((body-before-metadata (gdocs--buffer-body-as-plain)))
+          (funcall transport-callback
+                   '(:revision 2 :plan (:ot-start 1)) nil)
+          (should (equal (gdocs--buffer-body-as-plain) body-before-metadata)))
+        (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "2"))
+        (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                       committed-hash))
+        (should (equal gdocs--last-synced-hash committed-hash))
+        (should-not (equal (gdocs--current-body-hash) committed-hash))
+        (cl-letf (((symbol-function 'gdocs--fetch-edit-state-async)
+                   (lambda (_doc callback)
+                     (funcall callback '(:revision 2) nil)))
+                  ((symbol-function 'gdocs-push-remotely)
+                   (lambda (&rest _args) (cl-incf push-count))))
+          (gdocs--auto-sync-tick))
+        (should (= push-count 1))))))
+
+(ert-deftest gdocs-test-async-push-failure-does-not-set-baseline ()
+  "A failed push leaves synchronization metadata and baseline unchanged."
+  (let ((gdocs-push-backend 'plain))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 1\n"
+              ":GDOC_CONTENT_HASH: old-hash\n:END:\n\nA\n")
+      (org-mode)
+      (setq gdocs--last-synced-hash "old-baseline")
+      (cl-letf (((symbol-function 'gdocs--push-plan-for-diff)
+                 (lambda (&rest _args) '(:kind :incremental)))
+                ((symbol-function 'gdocs--push-preflight) #'ignore)
+                ((symbol-function 'gdocs--run-op-result-async)
+                 (lambda (_doc _state _intent callback)
+                   (funcall callback nil "transport failed"))))
+        (gdocs--apply-push-async
+         "synthetic-id" '(:revision 1 :ot-body "")
+         (gdocs--buffer-body-as-plain) "" (current-buffer) #'ignore))
+      (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "1"))
+      (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                     "old-hash"))
+      (should (equal gdocs--last-synced-hash "old-baseline")))))
+
 (ert-deftest gdocs-test-public-async-image-bearing-push-is-refused ()
   "The public async push entry point refuses images before /save.
 
@@ -3665,7 +3749,7 @@ that a removed preflight guard would be observed as an unexpected success."
     (should-not callback-error)))
 
 (ert-deftest gdocs-test-async-partial-success-reports-committed-revision ()
-  "A failed insertion reports the preceding committed delete revision."
+  "A partial push records its revision without establishing a baseline."
   (let* ((gdocs--rate-limit-retry-delay 0)
          (state (gdocs-test--push-state 1 "old\n"))
          (after-delete (gdocs-test--push-state 2 "\n"))
@@ -3676,24 +3760,33 @@ that a removed preflight guard would be observed as an unexpected success."
          (callback-count 0)
          (committed-revision nil)
          (callback-error nil))
-    (cl-letf (((symbol-function 'gdocs--save-request-async)
-               (lambda (_doc _state _commands callback)
-                 (cl-incf save-count)
-                 (if (= save-count 1)
-                     (funcall callback
-                              '((metadata . ((serverRevision . 2)))) nil)
-                   (funcall callback nil
-                            '(:http-code 500 :err-code 9)))))
-              ((symbol-function 'gdocs--fetch-edit-state-async)
-               (lambda (_doc callback)
-                 (cl-incf fetch-count)
-                 (funcall callback after-delete nil))))
-      (gdocs--apply-in-place-region-async
-       "synthetic" state "old\n" region nil
-       (lambda (revision err)
-         (cl-incf callback-count)
-         (setq committed-revision revision
-               callback-error err))))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_REVISION: 1\n"
+              ":GDOC_CONTENT_HASH: old-hash\n:END:\n\nnew\n")
+      (org-mode)
+      (setq gdocs--last-synced-hash "old-baseline")
+      (cl-letf (((symbol-function 'gdocs--save-request-async)
+                 (lambda (_doc _state _commands callback)
+                   (cl-incf save-count)
+                   (if (= save-count 1)
+                       (funcall callback
+                                '((metadata . ((serverRevision . 2)))) nil)
+                     (funcall callback nil
+                              '(:http-code 500 :err-code 9)))))
+                ((symbol-function 'gdocs--fetch-edit-state-async)
+                 (lambda (_doc callback)
+                   (cl-incf fetch-count)
+                   (funcall callback after-delete nil))))
+        (gdocs--apply-in-place-region-async
+         "synthetic" state "old\n" region (current-buffer)
+         (lambda (revision err)
+           (cl-incf callback-count)
+           (setq committed-revision revision
+                 callback-error err))))
+      (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "2"))
+      (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                     "old-hash"))
+      (should (equal gdocs--last-synced-hash "old-baseline")))
     (should (= callback-count 1))
     (should (= committed-revision 2))
     (should (string-match-p "http 500" callback-error))
