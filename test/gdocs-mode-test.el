@@ -1581,7 +1581,7 @@ END is the inclusive final OT position."
                     (plist-get fixture :org-body)
                     (plist-get fixture :ot-body)
                     anchor-map comments)))
-    (should (equal rendered "A *word*[fn:1]\n"))))
+    (should (equal rendered "A *word*[fn:gdocs-comment-1]\n"))))
 
 (ert-deftest gdocs-test-comment-inclusive-ei-does-not-split-words ()
   "An inclusive EI places refs after the final letter of a word."
@@ -1601,7 +1601,7 @@ END is the inclusive final OT position."
          ot-body ot-body
          (list (cons anchor (cons si ei)))
          (list (list 1 :text "synthetic" :anchor anchor)))
-        (concat word "[fn:1]\n"))))))
+        (concat word "[fn:gdocs-comment-1]\n"))))))
 
 (ert-deftest gdocs-test-comment-anchor-does-not-snap-to-word-boundary ()
   "An explicitly partial range remains partial rather than being expanded."
@@ -1618,7 +1618,7 @@ END is the inclusive final OT position."
        ot-body ot-body
        (list (cons anchor (cons si ei)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      (concat prefix partial "[fn:1]" (substring word -1) " suffix\n")))))
+      (concat prefix partial "[fn:gdocs-comment-1]" (substring word -1) " suffix\n")))))
 
 (ert-deftest gdocs-test-comment-inclusive-ei-preserves-punctuation ()
   "Punctuation included by EI remains before the inline ref."
@@ -1631,7 +1631,7 @@ END is the inclusive final OT position."
          (concat sentence "\n")
          (list (cons anchor (cons 1 (length sentence))))
          (list (list 1 :text "synthetic" :anchor anchor)))
-        (concat sentence "[fn:1]\n"))))))
+        (concat sentence "[fn:gdocs-comment-1]\n"))))))
 
 (ert-deftest gdocs-test-comment-inclusive-ei-places-ref-outside-emphasis ()
   "Inline refs after styled text stay outside Org emphasis markers."
@@ -1643,7 +1643,7 @@ END is the inclusive final OT position."
        "coverage\n"
        (list (cons anchor (cons 1 8)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "*coverage*[fn:1]\n"))))
+      "*coverage*[fn:gdocs-comment-1]\n"))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-after-labeled-link ()
   "A linked anchor gets its ref before the link's post-blank."
@@ -1655,7 +1655,7 @@ END is the inclusive final OT position."
        "coverage next\n"
        (list (cons anchor (cons 1 8)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "[[https://example.com][coverage]][fn:1] next\n"))))
+      "[[https://example.com][coverage]][fn:gdocs-comment-1] next\n"))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-preserves-link-post-blank ()
   "Link post-blank remains after the inserted reference."
@@ -1668,7 +1668,7 @@ END is the inclusive final OT position."
          (concat "coverage" suffix)
          (list (cons anchor (cons 1 8)))
          (list (list 1 :text "synthetic" :anchor anchor)))
-        (concat "[[https://example.com][coverage]][fn:1]" suffix))))))
+        (concat "[[https://example.com][coverage]][fn:gdocs-comment-1]" suffix))))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-after-link-with-no-post-blank ()
   "A link ending the body receives its reference at point-max."
@@ -1680,7 +1680,7 @@ END is the inclusive final OT position."
        "coverage"
        (list (cons anchor (cons 1 8)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "[[https://example.com][coverage]][fn:1]"))))
+      "[[https://example.com][coverage]][fn:gdocs-comment-1]"))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-after-styled-link ()
   "A styled linked anchor gets its ref after the complete link."
@@ -1692,7 +1692,7 @@ END is the inclusive final OT position."
        "coverage\n"
        (list (cons anchor (cons 1 8)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "[[https://example.com][*coverage*]][fn:1]\n"))))
+      "[[https://example.com][*coverage*]][fn:gdocs-comment-1]\n"))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-after-bare-link ()
   "A bare URL anchor gets its ref after the complete bare link."
@@ -1705,7 +1705,7 @@ END is the inclusive final OT position."
        (concat url "\n")
        (list (cons anchor (cons 1 (length url))))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      (concat "[[" url "]][fn:1]\n")))))
+      (concat "[[" url "]][fn:gdocs-comment-1]\n")))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-before-link-punctuation ()
   "A ref ending at a link stays before punctuation after that link."
@@ -1717,7 +1717,7 @@ END is the inclusive final OT position."
        "coverage,\n"
        (list (cons anchor (cons 1 8)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "[[https://example.com][coverage]][fn:1],\n"))))
+      "[[https://example.com][coverage]][fn:gdocs-comment-1],\n"))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-before-end-of-link-description ()
   "A partial anchor in a larger link description closes the whole link."
@@ -1729,7 +1729,7 @@ END is the inclusive final OT position."
        "coverage details\n"
        (list (cons anchor (cons 1 8)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "[[https://example.com][coverage details]][fn:1]\n"))))
+      "[[https://example.com][coverage details]][fn:gdocs-comment-1]\n"))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-does-not-scan-literal-link-close ()
   "Literal closing brackets outside an Org link do not move a ref."
@@ -1741,7 +1741,7 @@ END is the inclusive final OT position."
        "literal ]] trailing\n"
        (list (cons anchor (cons 1 7)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "literal[fn:1] ]] trailing\n"))))
+      "literal[fn:gdocs-comment-1] ]] trailing\n"))))
 
 (ert-deftest gdocs-test-comment-inline-ref-supports-footnote-navigation ()
   "A ref after a link remains a navigable Org footnote reference."
@@ -1752,17 +1752,17 @@ END is the inclusive final OT position."
       "coverage\n"
       (list (cons "kix.footnote-navigation" (cons 1 8)))
       '((1 :text "synthetic" :anchor "kix.footnote-navigation"))))
-    (insert "\n[fn:1] synthetic\n")
+    (insert "\n[fn:gdocs-comment-1] synthetic\n")
     (org-mode)
     (goto-char (point-min))
-    (search-forward "[fn:1]" nil t)
+    (search-forward "[fn:gdocs-comment-1]" nil t)
     (backward-char 1)
     (let ((reference (org-footnote-at-reference-p)))
-      (should (equal (car reference) "1"))
+      (should (equal (car reference) "gdocs-comment-1"))
       (org-footnote-goto-definition (car reference))
       (should (equal (buffer-substring-no-properties
                       (line-beginning-position) (line-end-position))
-                     "[fn:1] synthetic")))))
+                     "[fn:gdocs-comment-1] synthetic")))))
 
 (ert-deftest gdocs-test-comment-trailing-selected-space-is-not-anchor-end ()
   "Trailing selected horizontal whitespace is ignored for placement."
@@ -1774,7 +1774,7 @@ END is the inclusive final OT position."
        "coverage \n"
        (list (cons anchor (cons 1 9)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "coverage[fn:1] \n"))))
+      "coverage[fn:gdocs-comment-1] \n"))))
 
 (ert-deftest gdocs-test-comment-structural-codepoint-near-ei ()
   "Structural OT codepoints do not move an anchor one character early."
@@ -1788,7 +1788,7 @@ END is the inclusive final OT position."
        (concat "coverag" marker "e\n")
        (list (cons anchor (cons 1 9)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "coverage[fn:1]\n"))
+      "coverage[fn:gdocs-comment-1]\n"))
     ;; An anchor can also end on a structural position (for example, at a
     ;; table-cell boundary).  It still belongs after the preceding text.
     (should
@@ -1798,7 +1798,7 @@ END is the inclusive final OT position."
        (concat "coverage" marker "\n")
        (list (cons anchor (cons 1 9)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "coverage[fn:1]\n"))))
+      "coverage[fn:gdocs-comment-1]\n"))))
 
 (ert-deftest gdocs-test-comment-ambiguous-context-is-not-placed ()
   "Repeated context does not receive a misleading inline footnote."
@@ -1821,10 +1821,19 @@ END is the inclusive final OT position."
          (comments (gdocs--parse-docos-sync-response
                     (gdocs-test--comments-json fixture)))
          (section (gdocs--render-comments-section comments)))
-    (should (string-match-p "\\[fn:1\\] Root comment" section))
-    (should (string-match-p "\\[fn:2\\] A reply" section))
-    (should (string-match-p "\\[fn:3\\] Second comment" section))
+    (should (string-match-p "\\[fn:gdocs-comment-1\\] Root comment" section))
+    (should (string-match-p "\\[fn:gdocs-comment-2\\] A reply" section))
+    (should (string-match-p "\\[fn:gdocs-comment-3\\] Second comment" section))
     (should (equal (gdocs--normalize-comment-text "  a  \t b  ") "a b"))))
+
+(ert-deftest gdocs-test-comment-footnote-namespace-collision-is-visible ()
+  "Generated comments refuse documents already using the reserved namespace."
+  (should-error
+   (gdocs--inline-comment-refs
+    "Text[fn:gdocs-comment-user]\n" "Text\n"
+    '(("kix.collision" 1 . 4))
+    '((1 :text "Comment" :anchor "kix.collision")))
+   :type 'error))
 
 ;;; Pull/push helpers and preflight
 
@@ -2122,16 +2131,66 @@ END is the inclusive final OT position."
       (should-not (equal hash (gdocs--current-body-hash))))))
 
 (ert-deftest gdocs-test-local-comments-subtree-is-stripped-before-push ()
-  "The generated local comments projection and footnote refs are not pushed."
+  "Only generated comment refs and definitions are excluded from a push."
   (with-temp-buffer
     (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:END:\n"
             "#+title: Synthetic title\n\n"
-            "Visible text[fn:1]\n\n"
+            "Visible text[fn:1] and [fn:user-note][fn:gdocs-comment-1]\n\n"
+            "[fn:1] Numeric note\n"
+            "[fn:user-note] Named note\n\n"
             "* Comments\n"
             ":PROPERTIES:\n:GDOC_LOCAL: t\n:END:\n\n"
-            "[fn:1] A local comment\n")
+            "[fn:gdocs-comment-1] A local comment\n")
     (org-mode)
-    (should (equal (gdocs--buffer-body-as-plain) "Visible text\n\n"))))
+    (should
+     (equal (gdocs--buffer-body-as-plain)
+            (concat "Visible text[fn:1] and [fn:user-note]\n\n"
+                    "[fn:1] Numeric note\n"
+                    "[fn:user-note] Named note\n")))))
+
+(ert-deftest gdocs-test-non-comment-local-subtree-remains-pushable ()
+  "A local marker alone does not make an unrelated subtree generated content."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Title\n:END:\n"
+            "Body\n\n* Notes\n:PROPERTIES:\n:GDOC_LOCAL: t\n:END:\nLocal\n")
+    (org-mode)
+    (should (equal (gdocs--buffer-body-as-plain)
+                   "Body\n\n* Notes\n:PROPERTIES:\n:GDOC_LOCAL: t\n:END:\nLocal\n"))))
+
+(ert-deftest gdocs-test-pull-render-push-preserves-user-footnotes ()
+  "A pulled comment projection does not consume ordinary Org footnotes."
+  (let* ((comments '((1 :text "Root" :anchor "kix.comment")
+                     (2 :text "Reply" :anchor "kix.comment")))
+         (body "Text[fn:1] and named[fn:user-note]\n\n[fn:1] Numeric\n[fn:user-note] Named\n")
+         (with-ref (gdocs--inline-comment-refs
+                    body "Text and named\n"
+                    '(("kix.comment" 1 . 4)) comments))
+         (pulled (concat (string-trim-right with-ref) "\n\n"
+                         (gdocs--render-comments-section comments))))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Title\n:END:\nOld\n")
+      (org-mode)
+      (gdocs--apply-pull-into-buffer "synthetic-id" (current-buffer)
+                                     "Title" pulled)
+      (should (string-match-p "Text\\[fn:gdocs-comment-1\\]\\[fn:1\\]"
+                              (buffer-string)))
+      (should (string-match-p "\\[fn:gdocs-comment-2\\] Reply"
+                              (buffer-string)))
+      (should (equal (gdocs--buffer-body-as-plain) body)))))
+
+(ert-deftest gdocs-test-pull-replaces-legacy-numeric-comment-refs ()
+  "A pull naturally replaces old numeric generated refs with namespaced refs."
+  (let ((initial
+         (concat ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Title\n:END:\n"
+                 "Text[fn:1]\n\n* Comments\n:PROPERTIES:\n"
+                 ":GDOC_LOCAL: t\n:END:\n\n[fn:1] Old comment\n"))
+        (remote
+         (concat "Text[fn:gdocs-comment-1]\n\n* Comments\n:PROPERTIES:\n"
+                 ":GDOC_LOCAL: t\n:END:\n\n"
+                 "[fn:gdocs-comment-1] New comment\n")))
+    (let ((result (gdocs-test--apply-pull initial "Title" remote)))
+      (should-not (string-match-p "\\[fn:1\\]" result))
+      (should (string-match-p "\\[fn:gdocs-comment-1\\]" result)))))
 
 (ert-deftest gdocs-test-heading-drawers-and-anchor-shifting ()
   "Heading OT anchors are stripped for push and shifted after edits."

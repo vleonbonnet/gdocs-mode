@@ -21,11 +21,11 @@ images use `#+gdocs_inline_object:` and images embedded in prose use
 `@@gdocs-inline-object:image ENTITY WIDTHxHEIGHT content-id=CONTENT@@`; the
 image bytes are not downloaded.
 Comments are pulled into an editable local-only, ephemeral projection. Comments
-with unambiguous anchors get footnote references at those anchors, and all fetched
-comments are listed in a local `* Comments` subtree. You may edit that projection
-locally, but its footnote references and subtree are stripped before push, so those
-edits never reach Google; each pull regenerates the projection from the fetched
-remote comments.
+with unambiguous anchors get reserved `[fn:gdocs-comment-N]` references, and all
+fetched comments are listed in a local `* Comments` subtree. You may edit that
+projection locally, but only its reserved references and generated subtree are
+stripped before push; ordinary numeric and named Org footnotes remain content.
+Pull fails visibly if the remote body already uses the reserved namespace.
 - **Push** — converts the local Org buffer back to Google Docs format and
 writes it remotely. The configured `gdocs-push-backend` determines whether the
 push is a full replacement/re-encoding, a model-level incremental update, or a

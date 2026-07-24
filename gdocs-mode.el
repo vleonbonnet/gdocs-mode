@@ -346,8 +346,23 @@ a link's `:end'; subtract its `:post-blank' to find the closing delimiter."
         link-end)
     (error nil)))
 
+(defconst gdocs--comment-footnote-label-prefix "gdocs-comment-"
+  "Reserved Org footnote label prefix for generated Google comments.")
+
+(defun gdocs--comment-footnote-label (number)
+  "Return the generated Org footnote label for comment NUMBER."
+  (format "%s%d" gdocs--comment-footnote-label-prefix number))
+
+(defun gdocs--assert-comment-footnote-namespace-available (org-body)
+  "Signal an error when ORG-BODY already uses the reserved comment namespace."
+  (when (string-match-p
+         (concat "\\[fn:" (regexp-quote gdocs--comment-footnote-label-prefix))
+         org-body)
+    (error "GDocs comment footnote namespace `%s' is already used in the document"
+           gdocs--comment-footnote-label-prefix)))
+
 (defun gdocs--inline-comment-refs (org-body ot-body anchor-map comments)
-  "Insert `[fn:N]' refs into ORG-BODY at each comment's anchor position.
+  "Insert generated comment refs into ORG-BODY at each anchor position.
 ANCHOR-MAP is the alist (KIX-ID . (SI . EI)) returned by
 `gdocs--decode-doco-anchors'. COMMENTS is the list returned by
 `gdocs--parse-docos-sync-response'. Anchor positions are one-based OT
@@ -355,8 +370,9 @@ positions and `EI' is the inclusive final position of the anchored range.
 Only the first comment per anchor gets an inline ref — replies share the
 thread anchor and listing them all inline would clutter the prose. The ref
 lands at the end of the anchored span; a unique-match check skips placement
-when the context is ambiguous (an extra reply [fn:N+1] showing up inline is
-harmless but wrong)."
+when the context is ambiguous (an extra reply showing up inline is harmless
+but wrong)."
+  (gdocs--assert-comment-footnote-namespace-available org-body)
   (let* ((ot-body (or ot-body ""))
          (plain+map (gdocs--ot-plain-and-map ot-body))
          (plain (car plain+map))
@@ -475,13 +491,14 @@ harmless but wrong)."
                     (let ((link-end (gdocs--inline-ref-containing-link-end)))
                       (when link-end
                         (goto-char link-end)))
-                    ;; Walk past any trailing emphasis markers so the
-                    ;; `[fn:N]' lands outside `~text~' or `*text*' rather
+                    ;; Walk past trailing emphasis markers so the ref lands
+                    ;; outside `~text~' or `*text*' rather
                     ;; than inside (which would alter the styled span).
                     (while (and (< (point) (point-max))
                                 (memq (char-after) '(?* ?~ ?/ ?_ ?+ ?=)))
                       (forward-char 1))
-                    (insert (format "[fn:%d]" n))
+                    (insert (format "[fn:%s]"
+                                    (gdocs--comment-footnote-label n)))
                     (throw 'placed t)))))
             (gdocs-log
              'debug
@@ -537,11 +554,11 @@ ephemeral local projection that the next pull regenerates)."
    ":PROPERTIES:\n:GDOC_LOCAL: t\n:END:\n\n"
    (mapconcat
     (lambda (c)
-      ;; Org footnote definition. `C-c C-c' on the inline `[fn:N]'
+      ;; Org footnote definition. `C-c C-c' on the inline reference
       ;; ref jumps here; `C-c C-c' here jumps back. Idiomatic org —
       ;; no `<<target>>' clutter.
-      (format "[fn:%d] %s\n"
-              (car c)
+      (format "[fn:%s] %s\n"
+              (gdocs--comment-footnote-label (car c))
               (gdocs--normalize-comment-text
                (plist-get (cdr c) :text))))
     (sort comments :key #'car)
@@ -5072,7 +5089,11 @@ modelChunk we need for the op stream. Comments live in the cookie-auth
                          (let* ((comments (and raw
                                                (gdocs--parse-docos-sync-response
                                                 raw)))
-                                (body-with-refs
+                                 (_namespace-available
+                                  (and comments
+                                       (gdocs--assert-comment-footnote-namespace-available
+                                        body)))
+                                 (body-with-refs
                                  (if (and comments ot-body)
                                      (gdocs--inline-comment-refs
                                       body ot-body anchor-map comments)
@@ -5429,20 +5450,21 @@ Call inside `with-current-buffer' after every successful pull or push."
   "Dump the pushable body, excluding synchronization metadata.
 
 The top property drawer, legacy synthetic title, and generated date are
-excluded. A `#+title:' is retained when it belongs to the body. Also strips
-any trailing heading whose drawer carries `:GDOC_LOCAL: t'
-\(currently the auto-generated `* Comments' subtree, which is an
-editable, ephemeral local projection of Google's comments and must not be
-pushed)."
+excluded. A `#+title:' is retained when it belongs to the body. Generated
+`[fn:gdocs-comment-N]' references and the marked `* Comments' subtree are
+excluded. Numeric and user-named Org footnotes remain pushable content."
   (save-excursion
     (let* ((body-start (gdocs--body-start-pos))
            (end (gdocs--find-local-subtree-start body-start))
            (text (buffer-substring-no-properties body-start end))
-           (text (replace-regexp-in-string "\r\n" "\n" text))
-           ;; Strip inline footnote refs (`[fn:N]'). These are rendered
-           ;; from Google's comment anchors on pull and have no place in
-           ;; the pushed body — the canonical comments live on Google.
-           (text (replace-regexp-in-string "\\[fn:[0-9]+\\]" "" text)))
+            (text (replace-regexp-in-string "\r\n" "\n" text))
+            ;; The reserved namespace belongs only to Google's generated
+            ;; comment projection; ordinary Org footnotes are user content.
+            (text (replace-regexp-in-string
+                   (concat "\\[fn:"
+                           (regexp-quote gdocs--comment-footnote-label-prefix)
+                           "[0-9]+\\]")
+                   "" text)))
       text)))
 
 (defun gdocs--inline-object-capability-report (object &optional source)
@@ -6071,20 +6093,27 @@ All policy is delegated to `gdocs--push-preflight'."
    state (or local-body "") '(:kind :full-replace)))
 
 (defun gdocs--find-local-subtree-start (start)
-  "Return the buffer position where a `:GDOC_LOCAL: t'-marked top-level
-heading begins, or `point-max' if none. Search begins at START."
+  "Return the generated Comments subtree start, or `point-max'.
+Search begins at START.  Both the exact heading and its `:GDOC_LOCAL: t'
+marker are required so unrelated local-marked subtrees remain pushable."
   (save-excursion
     (goto-char start)
     (let ((found nil))
       (while (and (not found)
-                  (re-search-forward "^\\* " nil t))
+                   (re-search-forward "^\\* Comments[ \t]*$" nil t))
         (let ((head-bol (line-beginning-position)))
           (forward-line 1)
           (when (looking-at org-property-drawer-re)
             (let ((drawer (buffer-substring-no-properties
                            (match-beginning 0) (match-end 0))))
               (when (string-match-p "^:GDOC_LOCAL:[ \t]+t[ \t]*$" drawer)
-                (setq found head-bol))))))
+                (setq found
+                      (save-excursion
+                        (goto-char head-bol)
+                        (skip-chars-backward " \t\n" start)
+                        (if (= (point) start)
+                            start
+                          (min head-bol (1+ (line-end-position)))))))))))
       (or found (point-max)))))
 
 (defun gdocs--export-txt-length (doc-id)
