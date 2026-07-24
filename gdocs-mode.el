@@ -294,35 +294,43 @@ be placed."
       (concat "..." (substring text start)))))
 
 (defun gdocs--inline-ref-containing-link-end ()
-  "Return the end of the Org link containing point, or nil.
+  "Return the closing boundary of the Org link containing point, or nil.
 
 The point must be inside a link description.  Bare links are handled as a
 special case because their target is also their visible text.  Walk the
 element parents so styled runs inside a link are recognized without scanning
-for literal closing brackets."
+for literal closing brackets.  Org includes trailing horizontal whitespace in
+a link's `:end'; subtract its `:post-blank' to find the closing delimiter."
   (condition-case nil
       (let ((position (point))
             (element (org-element-context))
             link-end)
         (while (and element (not link-end))
           (when (eq (org-element-type element) 'link)
-            (let ((begin (org-element-property :begin element))
-                  (end (org-element-property :end element))
-                  (contents-begin (org-element-property
-                                   :contents-begin element))
-                  (contents-end (org-element-property :contents-end element)))
-              (when (and (integerp begin)
-                         (integerp end)
-                         (<= begin position)
-                         (< position end)
-                         (if (and (integerp contents-begin)
-                                  (integerp contents-end))
-                             (and (<= contents-begin position)
+             (let* ((begin (org-element-property :begin element))
+                    (end (org-element-property :end element))
+                    (post-blank (org-element-property :post-blank element))
+                    (closing-end
+                     (and (integerp end)
+                          (- end (if (and (integerp post-blank)
+                                          (> post-blank 0))
+                                     post-blank
+                                   0))))
+                   (contents-begin (org-element-property
+                                    :contents-begin element))
+                   (contents-end (org-element-property :contents-end element)))
+               (when (and (integerp begin)
+                          (integerp closing-end)
+                          (<= begin position)
+                          (< position closing-end)
+                          (if (and (integerp contents-begin)
+                                   (integerp contents-end))
+                              (and (<= contents-begin position)
                                   (<= position contents-end))
-                           ;; A bare link has no description; its target is
-                           ;; the visible text and must be kept whole.
-                           t))
-                (setq link-end end))))
+                            ;; A bare link has no description; its target is
+                            ;; the visible text and must be kept whole.
+                            t))
+                 (setq link-end closing-end))))
           (setq element (org-element-property :parent element)))
         link-end)
     (error nil)))

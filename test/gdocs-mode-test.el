@@ -1572,16 +1572,41 @@ END is the inclusive final OT position."
       "*coverage*[fn:1]\n"))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-after-labeled-link ()
-  "A linked anchor gets its ref after the complete labeled link."
+  "A linked anchor gets its ref before the link's post-blank."
   (let ((anchor "kix.linked-word"))
     (should
      (equal
       (gdocs--inline-comment-refs
-       "[[https://example.com][coverage]]\n"
-       "coverage\n"
+       "[[https://example.com][coverage]] next\n"
+       "coverage next\n"
        (list (cons anchor (cons 1 8)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "[[https://example.com][coverage]][fn:1]\n"))))
+      "[[https://example.com][coverage]][fn:1] next\n"))))
+
+(ert-deftest gdocs-test-comment-inline-anchor-preserves-link-post-blank ()
+  "Link post-blank remains after the inserted reference."
+  (let ((anchor "kix.link-post-blank"))
+    (dolist (suffix '("  next\n" "\nnext\n"))
+      (should
+       (equal
+        (gdocs--inline-comment-refs
+         (concat "[[https://example.com][coverage]]" suffix)
+         (concat "coverage" suffix)
+         (list (cons anchor (cons 1 8)))
+         (list (list 1 :text "synthetic" :anchor anchor)))
+        (concat "[[https://example.com][coverage]][fn:1]" suffix))))))
+
+(ert-deftest gdocs-test-comment-inline-anchor-after-link-with-no-post-blank ()
+  "A link ending the body receives its reference at point-max."
+  (let ((anchor "kix.link-no-post-blank"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "[[https://example.com][coverage]]"
+       "coverage"
+       (list (cons anchor (cons 1 8)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "[[https://example.com][coverage]][fn:1]"))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-after-styled-link ()
   "A styled linked anchor gets its ref after the complete link."
