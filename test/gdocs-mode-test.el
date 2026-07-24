@@ -2514,11 +2514,7 @@ END is the inclusive final OT position."
     (should-not transport-called)))
 
 (ert-deftest gdocs-test-image-bearing-async-push-is-refused-before-ot-ops ()
-  "The low-level async push refuses an image before save or callbacks.
-
-The guard currently signals synchronously, so the callback must not be
-called at all. Keeping the error and all invocation flags local to this test
-prevents a preceding synchronous refusal from making this assertion pass."
+  "The low-level async push reports an image refusal exactly once."
   (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
          (body (plist-get fixture :body))
          (state (list :revision 17 :ot-body body
@@ -2527,6 +2523,7 @@ prevents a preceding synchronous refusal from making this assertion pass."
          (save-called nil)
          (transport-called nil)
          (callback-count 0)
+         (callback-revision :unset)
          (success-callback nil)
          (gdocs-push-backend 'ot-encode))
     ;; Keep these resets explicit: this is the state whose values the async
@@ -2535,6 +2532,7 @@ prevents a preceding synchronous refusal from making this assertion pass."
           save-called nil
           transport-called nil
           callback-count 0
+          callback-revision :unset
           success-callback nil)
     (cl-letf (((symbol-function 'gdocs--save-request-async)
                (lambda (&rest _args) (setq save-called t)))
@@ -2542,24 +2540,100 @@ prevents a preceding synchronous refusal from making this assertion pass."
                (lambda (&rest _args) (setq transport-called t)))
               ((symbol-function 'gdocs--run-op-async)
                (lambda (&rest _args) (setq save-called t))))
-      (let ((signal
-             (should-error
-              (gdocs--apply-push-async
-               "synthetic-image-document" state "Before\nAfter\n"
-               "Before\nAfter\n" nil
-               (lambda (revision err)
-                 (cl-incf callback-count)
-                 (when (and revision (null err))
-                   (setq success-callback t))))
-              :type 'user-error)))
-        (setq error-message (error-message-string signal))))
+      (gdocs--apply-push-async
+       "synthetic-image-document" state "Before\nAfter\n"
+       "Before\nAfter\n" nil
+       (lambda (revision err)
+         (cl-incf callback-count)
+         (setq callback-revision revision
+               error-message err)
+         (when (and revision (null err))
+           (setq success-callback t)))))
     (should (string-match-p "refusing push" error-message))
     (should (string-match-p "inline image" error-message))
     (should (string-match-p "pull remains available" error-message))
     (should-not save-called)
     (should-not transport-called)
-    (should (= callback-count 0))
+    (should (= callback-count 1))
+    (should-not callback-revision)
     (should-not success-callback)))
+
+(ert-deftest gdocs-test-unsupported-format-async-push-completes-once ()
+  "An unsupported remote format is reported once without transport."
+  (let* ((body "Remote\n")
+         (state (list :revision 7 :ot-body body
+                      :ot-ops
+                      (list (gdocs-test--insert-op body)
+                            '((ty . "ae") (et . "equation")
+                              (id . "synthetic-object")))))
+         (callback-count 0)
+         (callback-revision :unset)
+         (callback-error nil)
+         (transport-count 0)
+         (gdocs-push-backend 'ot-encode))
+    (cl-letf (((symbol-function 'gdocs--save-request-async)
+               (lambda (&rest _args) (cl-incf transport-count)))
+              ((symbol-function 'gdocs--curl-async)
+               (lambda (&rest _args) (cl-incf transport-count))))
+      (gdocs--apply-push-async
+       "synthetic" state "Changed\n" body nil
+       (lambda (revision err)
+         (cl-incf callback-count)
+         (setq callback-revision revision
+               callback-error err))))
+    (should (= callback-count 1))
+    (should-not callback-revision)
+    (should (string-match-p "unknown entity" callback-error))
+    (should (zerop transport-count))))
+
+(ert-deftest gdocs-test-async-push-planning-failure-completes-once ()
+  "A planning failure completes once without transport or escape."
+  (let ((callback-count 0)
+        (callback-revision :unset)
+        (callback-error nil)
+        (transport-count 0))
+    (cl-letf (((symbol-function 'gdocs--push-plan-for-diff)
+               (lambda (&rest _args) (error "planning failed")))
+              ((symbol-function 'gdocs--save-request-async)
+               (lambda (&rest _args) (cl-incf transport-count)))
+              ((symbol-function 'gdocs--curl-async)
+               (lambda (&rest _args) (cl-incf transport-count)))
+              ((symbol-function 'gdocs--run-op-result-async)
+               (lambda (&rest _args) (cl-incf transport-count))))
+      (gdocs--apply-push-async
+       "synthetic" '(:revision 1 :ot-body "remote\n")
+       "local\n" "remote\n" nil
+       (lambda (revision err)
+         (cl-incf callback-count)
+         (setq callback-revision revision
+               callback-error err))))
+    (should (= callback-count 1))
+    (should-not callback-revision)
+    (should (equal callback-error "planning failed"))
+    (should (zerop transport-count))))
+
+(ert-deftest gdocs-test-async-push-transport-completes-once ()
+  "Transport success and failure each preserve exactly-once completion."
+  (dolist (outcome '(((:revision 2) nil 2 nil)
+                     (nil "transport failed" nil "transport failed")))
+    (let ((callback-count 0)
+          (callback-revision :unset)
+          (callback-error :unset))
+      (cl-letf (((symbol-function 'gdocs--push-preflight) #'ignore)
+                ((symbol-function 'gdocs--run-op-result-async)
+                 (lambda (_doc _state _intent callback)
+                   (funcall callback (nth 0 outcome) (nth 1 outcome))
+                   (funcall callback (nth 0 outcome) (nth 1 outcome)))))
+        (gdocs--apply-push-async
+         "synthetic" '(:revision 1 :ot-body "remote\n")
+         "new\nremote\n" "remote\n" nil
+         (lambda (revision err)
+           (cl-incf callback-count)
+           (setq callback-revision revision
+                 callback-error err))))
+      (should (= callback-count 1))
+      (should (equal callback-revision (nth 2 outcome)))
+      (should (equal callback-error (nth 3 outcome))))))
 
 (ert-deftest gdocs-test-public-async-image-bearing-push-is-refused ()
   "The public async push entry point refuses images before /save.

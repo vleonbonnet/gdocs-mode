@@ -7360,7 +7360,10 @@ so the insertion position is never copied from the delete plan."
 (defun gdocs--apply-push-async
     (doc-id state local-body remote-body buffer callback)
   "Async sibling of `gdocs--apply-push'.
-CALLBACK = `(funcall CB NEW-REV ERR)'. BUFFER is where property writes go."
+CALLBACK is called exactly once as `(funcall CALLBACK NEW-REV ERR)'.
+Planning and preflight refusals call it before any transport with NEW-REV nil
+and a sanitized error string.  Transport success and failure retain their
+reported revision semantics.  BUFFER is where property writes go."
   (let ((done nil))
     (cl-labels
         ((finish (rev err)
@@ -7378,20 +7381,35 @@ CALLBACK = `(funcall CB NEW-REV ERR)'. BUFFER is where property writes go."
              (gdocs-log 'info "Pushed %s (rev %s)%s"
                         doc-id rev (or extra "")))
            (finish rev err)))
-      (let* ((raw-plan (gdocs--push-plan-for-diff state local-body remote-body))
-             ;; Direct callers historically required an image guard even for
-             ;; a synthetic no-op. Keep that conservative contract.
-             (preflight-plan (if (eq (plist-get raw-plan :kind) :noop)
-                                 (list :kind :full-replace)
-                               raw-plan)))
-        (gdocs--push-preflight state local-body preflight-plan)
-        (let* ((local-stripped
-                (gdocs--push-comparison-body local-body))
-               (remote-mappable
-                (gdocs--push-comparison-body remote-body))
-               (ot-body (plist-get state :ot-body))
-               (prepended (gdocs--diff-prepend remote-mappable local-stripped))
-               (appended (gdocs--diff-append remote-mappable local-stripped)))
+      (let ((initial
+             (condition-case sig
+                 (let* ((raw-plan
+                         (gdocs--push-plan-for-diff
+                          state local-body remote-body))
+                        ;; Direct callers historically required an image guard
+                        ;; even for a synthetic no-op.
+                        (preflight-plan
+                         (if (eq (plist-get raw-plan :kind) :noop)
+                             (list :kind :full-replace)
+                           raw-plan))
+                        (local-stripped
+                         (gdocs--push-comparison-body local-body))
+                        (remote-mappable
+                         (gdocs--push-comparison-body remote-body)))
+                   (gdocs--push-preflight state local-body preflight-plan)
+                   (list local-stripped remote-mappable
+                         (plist-get state :ot-body)))
+               ((user-error error)
+                (finish nil (error-message-string sig))
+                nil))))
+        (when initial
+          (let* ((local-stripped (nth 0 initial))
+                 (remote-mappable (nth 1 initial))
+                 (ot-body (nth 2 initial))
+                 (prepended
+                  (gdocs--diff-prepend remote-mappable local-stripped))
+                 (appended
+                  (gdocs--diff-append remote-mappable local-stripped)))
           (cond
            ;; Full OT bundles use the same intent engine.  A throttle is only
            ;; retryable when the exact target body can be observed or the
@@ -7475,7 +7493,7 @@ CALLBACK = `(funcall CB NEW-REV ERR)'. BUFFER is where property writes go."
                  local-body)))))
            (t
             (finish nil
-                    "edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)"))))))))
+                    "edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)")))))))))
 
 (defun gdocs--diff-prepend (remote local)
   "If LOCAL = NEW + REMOTE for some NEW, return NEW; else nil.
