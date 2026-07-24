@@ -7442,7 +7442,7 @@ instead and receives the same `(NEW-REV ERR)' callback shape."
   "Write GDOC_REVISION / hash / synced-at on the current buffer.
 Caller must already be inside `with-current-buffer'."
   (let ((committed-hash (secure-hash 'sha256 local-body)))
-    (gdocs--put-top-property "GDOC_REVISION" (number-to-string new-rev))
+    (gdocs--put-top-property "GDOC_REVISION" (format "%s" new-rev))
     (gdocs--put-top-property "GDOC_CONTENT_HASH" committed-hash)
     (gdocs--put-top-property "GDOC_SYNCED_AT" (gdocs--now-iso))
     (gdocs--mark-synced committed-hash)))
@@ -7702,7 +7702,8 @@ reported revision semantics.  BUFFER is where property writes go."
                              doc-id state local-body backend))
                    (commands (gdocs--push-plan-commands initial)))
               (if (null commands)
-                  (finish nil nil)
+                  (finalize (plist-get state :revision) nil
+                            (format ", %s (0 ops)" backend))
                 (let ((intent
                        (gdocs--make-push-intent
                         state local-body remote-mappable
@@ -8588,10 +8589,6 @@ completion or error."
           ((null state) (funcall release "empty edit state"))
           ((not (and token ouid remote-rev))
            (funcall release "missing token/ouid/rev"))
-          ((not (string= local-rev (number-to-string remote-rev)))
-           (funcall release
-                    (format "refusing push: remote rev %s != local %s"
-                            remote-rev local-rev)))
           (t
            (condition-case sig
                (let* ((remote-body
@@ -8605,8 +8602,15 @@ completion or error."
                  (cond
                   ((string= (car (gdocs--strip-heading-drawers local-body))
                             remote-body)
+                   (when (buffer-live-p buf)
+                     (with-current-buffer buf
+                       (gdocs--finalize-push-props remote-rev local-body)))
                    (setq gdocs--sync-mutex nil)
                    (gdocs-log 'info "Push: no local changes for %s" doc-id))
+                  ((not (string= local-rev (format "%s" remote-rev)))
+                   (funcall release
+                            (format "refusing push: remote rev %s != local %s"
+                                    remote-rev local-rev)))
                   (t
                    (gdocs--apply-push-async
                     doc-id state local-body remote-body buf

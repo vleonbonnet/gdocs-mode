@@ -4813,6 +4813,107 @@ that a removed preflight guard would be observed as an unexpected success."
       (should (equal arguments '("local" "remote")))
       (should-not gdocs--sync-mutex))))
 
+(ert-deftest gdocs-test-push-equal-remote-establishes-fresh-baseline ()
+  "Verified equality refreshes metadata without sending a save request."
+  (let ((gdocs--sync-mutex t)
+        (save-count 0)
+        (apply-count 0))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 6\n:END:\n\n"
+              "same\n")
+      (org-mode)
+      (should (eq (gdocs--sync-state) 'unknown))
+      (let* ((local-body (gdocs--buffer-body-as-plain))
+             (expected-hash (secure-hash 'sha256 local-body)))
+        (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                   (lambda (_doc callback)
+                     (funcall callback
+                              '(:revision 7 :token "token" :ouid "ouid"
+                                :ot-body "same\n" :ot-ops nil)
+                              "synthetic-html" nil)))
+                  ((symbol-function 'gdocs--ot-remote-org-body)
+                   (lambda (&rest _args) "same\n"))
+                  ((symbol-function 'gdocs--save-request-async)
+                   (lambda (&rest _args) (cl-incf save-count)))
+                  ((symbol-function 'gdocs--apply-push-async)
+                   (lambda (&rest _args) (cl-incf apply-count))))
+          (gdocs--push-remotely-async-1
+           "synthetic-id" (current-buffer) "6" local-body))
+        (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "7"))
+        (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                       expected-hash))
+        (should (org-entry-get (point-min) "GDOC_SYNCED_AT" t))
+        (should (equal gdocs--last-synced-hash expected-hash))
+        (should (eq (gdocs--sync-state) 'clean))))
+    (should (zerop save-count))
+    (should (zerop apply-count))
+    (should-not gdocs--sync-mutex)))
+
+(ert-deftest gdocs-test-push-equality-edit-during-verification-remains-dirty ()
+  "A later edit is not absorbed by equality metadata from the captured body."
+  (let ((gdocs--sync-mutex nil)
+        fetch-callback
+        (save-count 0))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 6\n:END:\n\n"
+              "same\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                 (lambda (_doc callback) (setq fetch-callback callback)))
+                ((symbol-function 'gdocs--ot-remote-org-body)
+                 (lambda (&rest _args) "same\n"))
+                ((symbol-function 'gdocs--save-request-async)
+                 (lambda (&rest _args) (cl-incf save-count))))
+        (gdocs-push-remotely "synthetic-id")
+        (goto-char (point-max))
+        (insert "later\n")
+        (funcall fetch-callback
+                 '(:revision 7 :token "token" :ouid "ouid"
+                   :ot-body "same\n" :ot-ops nil)
+                 "synthetic-html" nil))
+      (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "7"))
+      (should (eq (gdocs--sync-state) 'dirty)))
+    (should (zerop save-count))
+    (should-not gdocs--sync-mutex)))
+
+(ert-deftest gdocs-test-canonical-incremental-no-command-finalizes-without-save ()
+  "A canonical incremental no-op establishes metadata without /save."
+  (let* ((gdocs-push-backend 'ot-incremental)
+         (old (gdocs-dm-make-doc
+               :paragraphs
+               (list (list :kind :para
+                           :runs (list (gdocs-dm-make-run "Before")))
+                     (list :kind :blank :runs nil)
+                     (list :kind :heading
+                           :runs (list (gdocs-dm-make-run "Heading")))
+                     (list :kind :blank :runs nil)
+                     (list :kind :para
+                           :runs (list (gdocs-dm-make-run "After"))))))
+         (local-body "Before\n\n* Heading\n\nAfter\n")
+         (ot-body "Before\nHeading\nAfter\n")
+         (state (list :revision 9 :ot-body ot-body
+                      :ot-ops (list (gdocs-test--insert-op ot-body))))
+         (save-count 0)
+         (callback-revision nil)
+         (callback-error :unset))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_REVISION: 8\n:END:\n\n" local-body)
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs-dm-from-ops)
+                 (lambda (&rest _args) old))
+                ((symbol-function 'gdocs--save-request-async)
+                 (lambda (&rest _args) (cl-incf save-count))))
+        (gdocs--apply-push-async
+         "synthetic" state local-body local-body (current-buffer)
+         (lambda (revision err)
+           (setq callback-revision revision
+                 callback-error err))))
+      (should (= callback-revision 9))
+      (should-not callback-error)
+      (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "9"))
+      (should (eq (gdocs--sync-state) 'clean)))
+    (should (zerop save-count))))
+
 (ert-deftest gdocs-test-fresh-ot-incremental-plan-retains-capability-ranges ()
   "Fresh OT command generation preserves its incremental preflight metadata."
   (let* ((body "styled\nplain\n")
