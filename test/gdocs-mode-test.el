@@ -1785,6 +1785,51 @@ END is the inclusive final OT position."
        (list (list 1 :text "synthetic" :anchor anchor)))
       (concat "[[" url "]][fn:gdocs-comment-1]\n")))))
 
+(ert-deftest gdocs-test-comment-visible-link-target-is-not-a-candidate ()
+  "A hidden target that repeats its label does not create ambiguity."
+  (let ((anchor "kix.target-and-label"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       "[[coverage][coverage]]\n" "coverage\n"
+       (list (cons anchor (cons 1 8)))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      "[[coverage][coverage]][fn:gdocs-comment-1]\n"))))
+
+(ert-deftest gdocs-test-comment-duplicate-visible-link-labels-are-ambiguous ()
+  "Equal visible descriptions retain unique-candidate protection."
+  (let ((body "[[one][coverage]] [[two][coverage]]\n")
+        (anchor "kix.duplicate-label"))
+    (should
+     (equal (gdocs--inline-comment-refs
+             body "coverage coverage\n"
+             (list (cons anchor (cons 1 8)))
+             (list (list 1 :text "synthetic" :anchor anchor)))
+            body))))
+
+(ert-deftest gdocs-test-comment-target-only-occurrence-is-not-visible ()
+  "Text occurring only in a hidden target cannot receive a ref."
+  (let ((body "[[coverage][different]]\n")
+        (anchor "kix.target-only"))
+    (should
+     (equal (gdocs--inline-comment-refs
+             body "coverage\n"
+             (list (cons anchor (cons 1 8)))
+             (list (list 1 :text "synthetic" :anchor anchor)))
+            body))))
+
+(ert-deftest gdocs-test-comment-visible-projection-excludes-structural-prefixes ()
+  "Heading and list syntax does not compete with visible anchor text."
+  (dolist (body '("* coverage\n" "- coverage\n" "1. coverage\n"))
+    (let ((anchor "kix.structural-prefix"))
+      (should
+       (equal (gdocs--inline-comment-refs
+               body "coverage\n"
+               (list (cons anchor (cons 1 8)))
+               (list (list 1 :text "synthetic" :anchor anchor)))
+              (concat (string-trim-right body)
+                      "[fn:gdocs-comment-1]\n"))))))
+
 (ert-deftest gdocs-test-comment-inline-anchor-before-link-punctuation ()
   "A ref ending at a link stays before punctuation after that link."
   (let ((anchor "kix.linked-punctuation"))

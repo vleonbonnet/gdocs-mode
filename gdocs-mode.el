@@ -346,6 +346,96 @@ a link's `:end'; subtract its `:post-blank' to find the closing delimiter."
         link-end)
     (error nil)))
 
+(defun gdocs--org-visible-and-map (org-body)
+  "Return visible Org text and a map back to positions in ORG-BODY.
+
+The result is (TEXT . MAP), where MAP[i] is the zero-based ORG-BODY index
+that supplied TEXT[i].  Link descriptions and bare link text are visible;
+link targets hidden behind descriptions, Org delimiters, heading and list
+prefixes, drawers, and title keyword prefixes are not."
+  (with-temp-buffer
+    (org-mode)
+    (insert org-body)
+    (let* ((size (buffer-size))
+           (visible (make-vector size t))
+           (tree (org-element-parse-buffer)))
+      (cl-labels
+          ((hide (begin end)
+             (when (and (integerp begin) (integerp end))
+               (let ((from (max 0 (1- begin)))
+                     (to (min size (1- end))))
+                 (while (< from to)
+                   (aset visible from nil)
+                   (cl-incf from)))))
+           (closing-end (element)
+             (- (org-element-property :end element)
+                (or (org-element-property :post-blank element) 0)))
+           (hide-inline-delimiters (element)
+             (let ((begin (org-element-property :begin element))
+                   (end (closing-end element)))
+               (hide begin (1+ begin))
+               (hide (1- end) end)))
+           (hide-line-around-value (element value)
+             (let* ((begin (org-element-property :begin element))
+                    (line-end (save-excursion
+                                (goto-char begin)
+                                (line-end-position)))
+                    (value-start
+                     (and (stringp value)
+                          (save-excursion
+                            (goto-char begin)
+                            (search-forward value line-end t)
+                            (match-beginning 0)))))
+               (when value-start
+                 (hide begin value-start)
+                 (hide (+ value-start (length value)) line-end)))))
+        (org-element-map tree '(property-drawer node-property planning)
+          (lambda (element)
+            (hide (org-element-property :begin element)
+                  (org-element-property :end element))))
+        (org-element-map tree 'headline
+          (lambda (element)
+            (hide-line-around-value element
+                                    (org-element-property :raw-value element))))
+        (org-element-map tree 'item
+          (lambda (element)
+            (hide (org-element-property :begin element)
+                  (org-element-property :contents-begin element))))
+        (org-element-map tree 'keyword
+          (lambda (element)
+            (when (member (downcase (org-element-property :key element))
+                          '("title" "subtitle"))
+              (hide-line-around-value element
+                                      (org-element-property :value element)))))
+        (org-element-map tree '(bold italic underline strike-through code verbatim)
+          #'hide-inline-delimiters)
+        (org-element-map tree 'link
+          (lambda (element)
+            (let* ((begin (org-element-property :begin element))
+                   (end (closing-end element))
+                   (contents-begin (org-element-property :contents-begin element))
+                   (contents-end (org-element-property :contents-end element)))
+              (cond
+               ((and (integerp contents-begin) (integerp contents-end))
+                (hide begin contents-begin)
+                (hide contents-end end))
+               ((and (<= (+ begin 4) end)
+                     (string= (buffer-substring-no-properties begin (1+ begin))
+                              "[[")
+                     (string= (buffer-substring-no-properties (- end 2) end)
+                              "]]"))
+                (hide begin (+ begin 2))
+                (hide (- end 2) end))))))
+        (let ((text (make-string size 0))
+              (map (make-vector size 0))
+              (out 0))
+          (dotimes (index size)
+            (when (aref visible index)
+              (aset text out (aref org-body index))
+              (aset map out index)
+              (cl-incf out)))
+          (cons (substring text 0 out) (seq-subseq map 0 out)))))))
+
 (defconst gdocs--comment-footnote-label-prefix "gdocs-comment-"
   "Reserved Org footnote label prefix for generated Google comments.")
 
@@ -452,82 +542,65 @@ but wrong)."
     (with-temp-buffer
       (org-mode)
       (insert org-body)
-      (dolist (pl placements)
-        (let* ((pe (plist-get pl :plain-end))
-               (n (plist-get pl :n))
-               (anchor (plist-get pl :anchor))
-               (si (plist-get pl :si))
-               (ei (plist-get pl :ei))
-               (full-context (substring plain 0 pe))
-               ;; Walk back through candidate context windows, shortest
-               ;; first, expanding until we get a unique match. Min 4 chars
-               ;; (otherwise a single word fragment matches everywhere);
-               ;; max 64 chars (longer doesn't help and risks spanning
-               ;; structural boundaries the org body re-renders differently).
-               (found nil)
-               (last-window 0)
-               (last-count 0)
-               (last-context nil))
-          (catch 'placed
-            (dolist (window-len '(8 12 16 24 32 48 64))
-              (when (and (not found)
-                         (>= (length full-context) (min 4 window-len)))
-                (let* ((wl (min window-len (length full-context)))
-                       (context (substring full-context (- (length full-context) wl)))
-                       (re (gdocs--inline-ref-context-re context))
-                       (last nil) (count 0))
-                  (setq last-window wl last-context context)
-                  (goto-char (point-min))
-                  (while (re-search-forward re nil t)
-                    (cl-incf count)
-                    (setq last (match-end 0)))
-                  (setq last-count count)
-                  (when (= count 1)
-                    (setq found t)
-                    (goto-char last)
-                    ;; A plain-text endpoint can fall inside a labeled link
-                    ;; (including a styled description). Keep the reference
-                    ;; outside the complete link, before any following blank.
-                    (let ((link-end (gdocs--inline-ref-containing-link-end)))
-                      (when link-end
-                        (goto-char link-end)))
-                    ;; Walk past trailing emphasis markers so the ref lands
-                    ;; outside `~text~' or `*text*' rather
-                    ;; than inside (which would alter the styled span).
-                    (while (and (< (point) (point-max))
-                                (memq (char-after) '(?* ?~ ?/ ?_ ?+ ?=)))
-                      (forward-char 1))
-                    (insert (format "[fn:%s]"
-                                    (gdocs--comment-footnote-label n)))
-                    (throw 'placed t)))))
-            (gdocs-log
-             'debug
-             "inline-ref fn:%d anchor=%S range=%S..%S plain-end=%d window=%d matches=%d context-suffix=%S — no unique match; skipped"
-             n anchor si ei pe last-window last-count
-             (gdocs--debug-context-suffix last-context)))))
-      (buffer-string))))
-
-(defun gdocs--inline-ref-context-re (context)
-  "Build a relaxed regex from CONTEXT (OT-plain substring) for matching
-inside the rendered org body. Allows:
-- Inline emphasis markers (`*~=/_+`) between any two plain chars (the
-  body wraps styled runs with these; OT plain does not).
-- Optional heading/list line prefixes after each `\\n' (paragraph
-  break).
-- Whitespace between consecutive whitespace chars."
-  (let* ((emph "[*~=/_+]*")
-         (line-prefix
-          (concat emph
-                  "\n"
-                  emph
-                  "\\(?:\\*+ \\|[ \t]*[-+*] \\|[ \t]*[0-9]+[.)] \\)?"
-                  emph))
-         (piece->re
-          (lambda (s)
-            (mapconcat (lambda (c) (regexp-quote (string c)))
-                       (string-to-list s)
-                       emph))))
-    (mapconcat piece->re (split-string context "\n") line-prefix)))
+      (let* ((visible+map (gdocs--org-visible-and-map org-body))
+             (visible-text (car visible+map))
+             (visible-map (cdr visible+map)))
+        (dolist (pl placements)
+          (let* ((pe (plist-get pl :plain-end))
+                 (n (plist-get pl :n))
+                 (anchor (plist-get pl :anchor))
+                 (si (plist-get pl :si))
+                 (ei (plist-get pl :ei))
+                 (full-context (substring plain 0 pe))
+                 ;; Walk back through candidate context windows, shortest
+                 ;; first, expanding until we get a unique match. Min 4 chars
+                 ;; (otherwise a single word fragment matches everywhere);
+                 ;; max 64 chars (longer doesn't help and risks spanning
+                 ;; structural boundaries the org body re-renders differently).
+                 (found nil)
+                 (last-window 0)
+                 (last-count 0)
+                 (last-context nil))
+            (catch 'placed
+              (dolist (window-len '(8 12 16 24 32 48 64))
+                (when (and (not found)
+                           (>= (length full-context) (min 4 window-len)))
+                  (let* ((wl (min window-len (length full-context)))
+                         (context (substring full-context (- (length full-context) wl)))
+                         (re (gdocs--relaxed-newlines-regexp context))
+                         (last nil) (count 0))
+                    (setq last-window wl last-context context)
+                    (let ((search-start 0))
+                      (while (string-match re visible-text search-start)
+                        (cl-incf count)
+                        (setq last (match-end 0)
+                              search-start (max (1+ (match-beginning 0))
+                                                (match-end 0)))))
+                    (setq last-count count)
+                    (when (= count 1)
+                      (setq found t)
+                      (goto-char (+ 2 (aref visible-map (1- last))))
+                      ;; A plain-text endpoint can fall inside a labeled link
+                      ;; (including a styled description). Keep the reference
+                      ;; outside the complete link, before any following blank.
+                      (let ((link-end (gdocs--inline-ref-containing-link-end)))
+                        (when link-end
+                          (goto-char link-end)))
+                      ;; Walk past trailing emphasis markers so the ref lands
+                      ;; outside `~text~' or `*text*' rather
+                      ;; than inside (which would alter the styled span).
+                      (while (and (< (point) (point-max))
+                                  (memq (char-after) '(?* ?~ ?/ ?_ ?+ ?=)))
+                        (forward-char 1))
+                      (insert (format "[fn:%s]"
+                                      (gdocs--comment-footnote-label n)))
+                      (throw 'placed t)))))
+              (gdocs-log
+               'debug
+               "inline-ref fn:%d anchor=%S range=%S..%S plain-end=%d window=%d matches=%d context-suffix=%S — no unique match; skipped"
+               n anchor si ei pe last-window last-count
+               (gdocs--debug-context-suffix last-context)))))
+        (buffer-string)))))
 
 (defun gdocs--normalize-comment-text (s)
   "Normalize a comment body for rendering: NBSPs become regular spaces,
