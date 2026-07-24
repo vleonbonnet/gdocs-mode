@@ -3250,6 +3250,123 @@ that a removed preflight guard would be observed as an unexpected success."
     (should (gdocs--push-preflight
              state "- Bullet\n1. Number\n" '(:kind :full-replace)))))
 
+(ert-deftest gdocs-test-capability-bound-list-requires-canonical-fields ()
+  "Missing glyph, indentation, or text style makes a bound level unsupported."
+  (dolist (case '((b_gs . "b_gs")
+                  (b_ifl . "b_ifl")
+                  (b_ts . "b_ts")))
+    (let* ((body "Bound\nPlain\n")
+           (definition
+            (copy-tree
+             (car (gdocs--emit-list-defs '(("list.incomplete" . :bullet))))))
+           (level (cdr (assq 'nl_0
+                             (alist-get 'le_nb (alist-get 'epm definition)))))
+           (binding (gdocs--emit-list-style-op
+                     "list.incomplete" 0 (gdocs-test--line-end-pos body 1))))
+      (setcdr (assq 'nl_0 (alist-get 'le_nb (alist-get 'epm definition)))
+              (assq-delete-all (car case) level))
+      (let* ((ops (list (gdocs-test--insert-op body) definition binding))
+             (state (list :revision 7 :ot-body body :ot-ops ops))
+             (reports (gdocs-dm-unsupported
+                       (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+             (report (cl-find (cdr case) reports
+                              :key (lambda (item)
+                                     (plist-get item :feature-type))
+                              :test #'equal)))
+        (should report)
+        (should (= (plist-get report :ot-start) 1))
+        (should (= (plist-get report :ot-end) 6))
+        (should-error
+         (gdocs--push-preflight state "- Bound\nChanged\n"
+                                '(:kind :full-replace))
+         :type 'user-error)
+        (should
+         (gdocs--push-preflight
+          state "- Bound\nChanged\n"
+          '(:kind :incremental
+                  :ranges ((:ot-start 7 :ot-end 12
+                                        :insert-at 7 :delete-count 6)))))))))
+
+(ert-deftest gdocs-test-capability-bound-list-requires-referenced-level ()
+  "Every level named by a list binding must exist in its definition."
+  (let* ((body "Nested\n")
+         (definition
+          (copy-tree
+           (car (gdocs--emit-list-defs '(("list.missing-level" . :bullet))))))
+         (epm (alist-get 'epm definition))
+         (levels-entry (assq 'le_nb epm))
+         (binding (gdocs--emit-list-style-op
+                   "list.missing-level" 1 (gdocs-test--line-end-pos body 1))))
+    (setcdr levels-entry (assq-delete-all 'nl_1 (cdr levels-entry)))
+    (let* ((ops (list (gdocs-test--insert-op body) definition binding))
+           (reports (gdocs-dm-unsupported
+                     (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+           (report (cl-find "nl_1" reports
+                            :key (lambda (item)
+                                   (plist-get item :feature-type))
+                            :test #'equal)))
+      (should report)
+      (should (= (plist-get report :ot-start) 1))
+      (should (= (plist-get report :ot-end) 7)))))
+
+(ert-deftest gdocs-test-capability-list-explicitness-does-not-replace-semantics ()
+  "Explicitness metadata cannot satisfy a missing list text-style value."
+  (let* ((body "Bound\n")
+         (definition
+          (copy-tree
+           (car (gdocs--emit-list-defs '(("list.explicitness" . :bullet))))))
+         (level (cdr (assq 'nl_0
+                           (alist-get 'le_nb (alist-get 'epm definition)))))
+         (style-entry (assq 'b_ts level))
+         (binding (gdocs--emit-list-style-op
+                   "list.explicitness" 0 (gdocs-test--line-end-pos body 1))))
+    (setcdr style-entry (assq-delete-all 'ts_bd (cdr style-entry)))
+    (let* ((ops (list (gdocs-test--insert-op body) definition binding))
+           (reports (gdocs-dm-unsupported
+                     (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+           (report (cl-find "b_ts.ts_bd" reports
+                            :key (lambda (item)
+                                   (plist-get item :feature-type))
+                            :test #'equal)))
+      (should report)
+      (should (= (plist-get report :ot-start) 1))
+      (should (= (plist-get report :ot-end) 6)))))
+
+(ert-deftest gdocs-test-capability-validates-each-referenced-list-level ()
+  "Multiple bound levels are validated against their own paragraph ranges."
+  (let* ((body "Top\nDeep\n")
+         (definition
+          (copy-tree
+           (car (gdocs--emit-list-defs '(("list.multilevel" . :bullet))))))
+         (levels (alist-get 'le_nb (alist-get 'epm definition)))
+         (level-0 (cdr (assq 'nl_0 levels)))
+         (level-2 (cdr (assq 'nl_2 levels)))
+         (bindings
+          (list (gdocs--emit-list-style-op
+                 "list.multilevel" 0 (gdocs-test--line-end-pos body 1))
+                (gdocs--emit-list-style-op
+                 "list.multilevel" 2 (gdocs-test--line-end-pos body 2)))))
+    (setcdr (assq 'nl_0 levels) (assq-delete-all 'b_gs level-0))
+    (setcdr (assq 'nl_2 levels) (assq-delete-all 'b_il level-2))
+    (let* ((ops (append (list (gdocs-test--insert-op body) definition)
+                        bindings))
+           (reports (gdocs-dm-unsupported
+                     (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+           (glyph (cl-find "b_gs" reports
+                           :key (lambda (item)
+                                  (plist-get item :feature-type))
+                           :test #'equal))
+           (indent (cl-find "b_il" reports
+                            :key (lambda (item)
+                                   (plist-get item :feature-type))
+                            :test #'equal)))
+      (should (equal (list (plist-get glyph :ot-start)
+                           (plist-get glyph :ot-end))
+                     '(1 4)))
+      (should (equal (list (plist-get indent :ot-start)
+                           (plist-get indent :ot-end))
+                     '(5 9))))))
+
 (ert-deftest gdocs-test-capability-reports-every-custom-list-value ()
   "Custom list glyph, layout, numbering, and nested styles are reported."
   (let* ((body "Custom\nPlain\n")
@@ -3297,10 +3414,13 @@ that a removed preflight guard would be observed as an unexpected success."
                                                     :delete-count 1)))))
       (dolist (feature '("b_gt" "b_gs" "b_gf" "b_ifl" "b_il" "b_a"
                          "b_sn" "b_ts.ts_bd" "b_ts.ts_fgc2" "b_ts.ts_ff"
-                         "b_ts.ts_fs" "ls_ts.ts_bd" "ls_ts.ts_it"
+                         "b_ts.ts_fs" "b_ts.ts_un" "b_ts.ts_sc"
+                         "b_ts.ts_bgc2" "b_ts.ts_it" "b_ts.ts_va"
+                         "b_ts.ts_st" "b_ts.ts_tw"
+                         "ls_ts.ts_bd" "ls_ts.ts_it"
                          "ls_ts.ts_fgc2" "ls_ts.ts_ff" "ls_ts.ts_fs"))
         (should (member feature features)))
-      (should (= (length reports) 16))
+      (should (= (length reports) 23))
       (dolist (report reports)
         (should (= (plist-get report :ot-start) 1))
         (should (= (plist-get report :ot-end) 7))
@@ -3315,8 +3435,8 @@ that a removed preflight guard would be observed as an unexpected success."
        (gdocs--push-preflight state "- CXstom\nPlain\n" unsafe-plan)
        :type 'user-error))))
 
-(ert-deftest gdocs-test-capability-unbound-custom-list-refuses-incremental-push ()
-  "A custom list entity without a paragraph binding has no preservation proof."
+(ert-deftest gdocs-test-capability-unbound-incomplete-list-is-safely-unused ()
+  "An unbound list definition can be dropped because it has no document effect."
   (let* ((body "Plain\n")
          (definition
           (copy-tree
@@ -3325,20 +3445,11 @@ that a removed preflight guard would be observed as an unexpected success."
                            (alist-get 'le_nb (alist-get 'epm definition))))))
     (setcdr (assq 'b_gs level) "◆")
     (let* ((ops (list (gdocs-test--insert-op body) definition))
-           (state (list :revision 7 :ot-body body :ot-ops ops))
-           (report (car (gdocs-dm-unsupported
-                         (gdocs-dm-from-ops
-                          7 "synthetic" nil body ops)))))
-      (should (equal (plist-get report :feature-type) "b_gs"))
-      (should-not (plist-get report :ot-start))
-      (should (plist-get report :refuse-push))
-      (should-error
-       (gdocs--push-preflight
-        state "Changed\n"
-        '(:kind :incremental
-                :ranges ((:ot-start 1 :ot-end 5
-                                      :insert-at 1 :delete-count 5))))
-       :type 'user-error))))
+           (state (list :revision 7 :ot-body body :ot-ops ops)))
+      (should-not (gdocs-dm-unsupported
+                   (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+      (should (gdocs--push-preflight state "Changed\n"
+                                     '(:kind :full-replace))))))
 
 (ert-deftest gdocs-test-capability-reports-unsupported-text-style-values ()
   "Non-default text dimensions are reported with ranges, not payloads."
