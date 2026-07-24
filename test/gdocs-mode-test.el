@@ -6,9 +6,9 @@
 
 ;; These tests deliberately exercise the conversion boundaries with synthetic
 ;; OT streams.  No test in this file calls Google, resolves browser cookies,
-;; or writes a user's buffer or file.  The small request shim below is only
-;; used when the optional `request' package is not installed in a clean batch
-;; Emacs; synchronization tests stub the network-facing functions themselves.
+;; or writes a user's buffer or file.  The request shim is installed before
+;; the production source is loaded; synchronization tests stub the
+;; network-facing functions themselves.
 
 ;;; Code:
 
@@ -18,67 +18,98 @@
 (require 'seq)
 (require 'time-date)
 
-;; Never let a stale compiled production file hide the current source while
-;; this suite is loading the package.
-(setq load-prefer-newer t)
-
-;; `gdocs-mode.el' declares request as a package dependency.  Keep the
-;; offline suite runnable with `emacs -Q' even when that optional dependency
-;; is not present in the batch environment.
-(unless (require 'request nil t)
-  (defmacro request (&rest args)
-    ;; Reference the dynamically scoped knobs used by the production call
-    ;; site so byte compilation with this shim has the same signal/noise as
-    ;; compilation with the real request.el macro.
-    `(progn
-       (ignore ,@args request-message-level request-log-level)
-       (error "The request package is unavailable in an offline test")))
-  (defun request-response-status-code (_response) nil)
-  (defun request-response-data (_response) nil)
-  (provide 'request))
-
 (defconst gdocs-test--directory
   (file-name-directory (or load-file-name buffer-file-name)))
 
-(add-to-list 'load-path (expand-file-name ".." gdocs-test--directory))
-(require 'gdocs-mode)
+(defconst gdocs-test--request-shim-file
+  (expand-file-name "gdocs-mode-test-request.el" gdocs-test--directory))
 
-(ert-deftest gdocs-test-load-prefers-newer-source-after-compilation ()
-  "A source edit after compilation must win over the stale byte code."
-  (let* ((directory (make-temp-file "gdocs-load-prefer-newer-" t))
-         (source (expand-file-name "probe.el" directory))
-         (compiled (expand-file-name "probe.elc" directory))
-         (feature 'gdocs-test-load-prefer-newer-probe)
-         (value 'unset))
+(defconst gdocs-test--source-file
+  (expand-file-name "../gdocs-mode.el" gdocs-test--directory))
+
+(load gdocs-test--request-shim-file nil nil t)
+
+(when (featurep 'gdocs-mode)
+  (error "gdocs-mode was loaded before the test bootstrap"))
+
+(defvar gdocs-test--production-load-count 0)
+
+(let ((after-load-functions
+       (cons (lambda (file)
+               (when (equal (file-truename file)
+                            (file-truename gdocs-test--source-file))
+                 (cl-incf gdocs-test--production-load-count)))
+             after-load-functions)))
+  (load gdocs-test--source-file nil nil t))
+
+(unless (= gdocs-test--production-load-count 1)
+  (error "Expected one production source load, got %d"
+         gdocs-test--production-load-count))
+
+(ert-deftest gdocs-test-production-loaded-once-from-explicit-source ()
+  "The suite loads exactly the checked-out production source once."
+  (should (= gdocs-test--production-load-count 1))
+  (should (equal (file-truename (symbol-file 'gdocs-mode 'defun))
+                 (file-truename gdocs-test--source-file))))
+
+(ert-deftest gdocs-test-explicit-source-beats-equal-and-future-bytecode ()
+  "An explicit source filename wins regardless of adjacent byte-code times."
+  (let* ((directory (make-temp-file "gdocs bytecode regression " t))
+         (source (expand-file-name "gdocs-mode.el" directory))
+         (compiled (byte-compile-dest-file source))
+         (emacs (expand-file-name invocation-name invocation-directory))
+         (source-text
+          (with-temp-buffer
+            (insert-file-contents gdocs-test--source-file)
+            (buffer-string))))
     (unwind-protect
         (progn
           (with-temp-file source
-            (insert ";;; probe.el --- load-prefer-newer probe -*- lexical-binding: t; -*-\n"
-                    "(defvar gdocs-test-load-prefer-newer-value nil)\n"
-                    "(setq gdocs-test-load-prefer-newer-value 'compiled)\n"
-                    "(provide 'gdocs-test-load-prefer-newer-probe)\n"))
-          (require 'bytecomp)
+            (insert source-text
+                    "\n(defun gdocs-test-bytecode-marker () 'compiled)\n"))
           (let ((byte-compile-dest-file-function
                  (lambda (_filename) compiled)))
             (should (byte-compile-file source)))
           (with-temp-file source
-            (insert ";;; probe.el --- load-prefer-newer probe -*- lexical-binding: t; -*-\n"
-                    "(defvar gdocs-test-load-prefer-newer-value nil)\n"
-                    "(setq gdocs-test-load-prefer-newer-value 'source)\n"
-                    "(provide 'gdocs-test-load-prefer-newer-probe)\n"))
-          ;; Make the ordering unambiguous even on filesystems with coarse
-          ;; timestamp resolution.
-          (set-file-times source
-                          (time-add (current-time) (seconds-to-time 1)))
-          (let ((load-prefer-newer t)
-                (load-path (cons directory load-path)))
-            (load "probe" nil t))
-          (setq value (bound-and-true-p gdocs-test-load-prefer-newer-value))
-          (should (eq value 'source)))
-      (when (featurep feature)
-        (unload-feature feature t))
-      (when (boundp 'gdocs-test-load-prefer-newer-value)
-        (makunbound 'gdocs-test-load-prefer-newer-value))
+            (insert source-text
+                    "\n(defun gdocs-test-bytecode-marker () 'source)\n"))
+          (dolist (timing '(equal future))
+            (let* ((base-time (current-time))
+                   (compiled-time
+                    (if (eq timing 'future)
+                        (time-add base-time (seconds-to-time 60))
+                      base-time))
+                   (form
+                    `(let ((source ,source)
+                           (load-count 0))
+                       (let ((after-load-functions
+                              (cons
+                               (lambda (file)
+                                 (when (equal (file-truename file)
+                                              (file-truename source))
+                                   (setq load-count (1+ load-count))))
+                               after-load-functions)))
+                         (load source nil nil t))
+                       (unless (= load-count 1)
+                         (error "Production loaded %d times" load-count))
+                       (unless (eq (gdocs-test-bytecode-marker) 'source)
+                         (error "Adjacent bytecode won for %s" ',timing))
+                       (unless (equal (file-truename
+                                       (symbol-file 'gdocs-mode 'defun))
+                                      (file-truename source))
+                         (error "gdocs-mode did not come from source")))))
+              (set-file-times source base-time)
+              (set-file-times compiled compiled-time)
+              (with-temp-buffer
+                (let ((status
+                       (call-process
+                        emacs nil t nil "-Q" "--batch"
+                        "-l" gdocs-test--request-shim-file
+                        "--eval" (prin1-to-string form))))
+                  (unless (equal status 0)
+                    (ert-fail
+                     (format "Child Emacs failed for %s bytecode:\n%s"
+                             timing (buffer-string)))))))))
       (delete-directory directory t))))
 
 (defconst gdocs-test--integration-variable "GDOCS_MODE_RUN_INTEGRATION"
