@@ -6356,6 +6356,8 @@ return raw length and let the caller decide whether to subtract."
 ;; observed across all 550 responses; other values would indicate a
 ;; different rejection class.
 (define-error 'gdocs-save-rejected "gdocs /save returned an error")
+(define-error 'gdocs-save-post-dispatch-failed
+  "gdocs /save failed after dispatch")
 
 (defun gdocs--parse-save-error-body (body)
   "Extract (ERR-CODE . DI) from a /save error response BODY, or (nil . nil).
@@ -6407,14 +6409,20 @@ that causes intermittent code-13 rejections from /save."
                 (with-temp-buffer
                   (let ((exit (apply #'call-process "curl" nil t nil args)))
                     (unless (zerop exit)
-                      (error "gdocs: %s" (gdocs--curl-exit-error exit))))
+                      (signal 'gdocs-save-post-dispatch-failed
+                              (list (gdocs--curl-exit-error exit)))))
                   (buffer-string)))
                (http-code (string-to-number status-string))
-               (response (with-temp-buffer
-                           (set-buffer-multibyte nil)
-                           (insert-file-contents-literally resp-file)
-                           (decode-coding-region (point-min) (point-max) 'utf-8)
-                           (buffer-string))))
+               (response
+                (condition-case sig
+                    (with-temp-buffer
+                      (set-buffer-multibyte nil)
+                      (insert-file-contents-literally resp-file)
+                      (decode-coding-region (point-min) (point-max) 'utf-8)
+                      (buffer-string))
+                  (error
+                   (signal 'gdocs-save-post-dispatch-failed
+                           (list (error-message-string sig)))))))
           (unless (and (>= http-code 200) (< http-code 300))
             (let* ((parsed (gdocs--parse-save-error-body response))
                    (err-code (car parsed))
@@ -6525,8 +6533,10 @@ of OT ops (alists). Returns parsed JSON response (XSSI-stripped)."
               (json-object-type 'alist))
           (json-read-from-string stripped))
       (error
-       (error "gdocs /save: unparseable response: %s"
-              (substring stripped 0 (min 300 (length stripped))))))))
+       (signal 'gdocs-save-post-dispatch-failed
+               (list (format "unparseable response: %s"
+                             (substring stripped 0
+                                        (min 300 (length stripped))))))))))
 
 (defun gdocs--ot-remote-org-body (doc-id html state)
   "Render the remote doc as the org view we diff pushes against.
@@ -6598,25 +6608,26 @@ how to interpret HTTP-CODE (e.g. 550 is a /save throttle, not a hard error)."
                (setq finished t)
                (let ((exit-code (process-exit-status proc))
                      (http-code nil) (response nil) (err nil))
-                 (unwind-protect
-                     (cond
-                      ((not (zerop exit-code))
-                       (setq err (gdocs--curl-exit-error exit-code)))
-                      (t
-                       (when (buffer-live-p stdout-buf)
-                         (with-current-buffer stdout-buf
-                           (let ((s (string-trim (buffer-string))))
-                             (setq http-code
-                                   (and (string-match-p "^[0-9]+$" s)
-                                        (string-to-number s))))))
-                       (when (file-exists-p resp-file)
-                         (with-temp-buffer
-                           ;; Reading with the coding system produces a real
-                           ;; multibyte string instead of raw-byte characters.
-                           (let ((coding-system-for-read 'utf-8))
-                             (insert-file-contents resp-file))
-                           (setq response (buffer-string))))))
-                   (funcall cleanup))
+                 (condition-case response-sig
+                     (unwind-protect
+                         (cond
+                          ((not (zerop exit-code))
+                           (setq err (gdocs--curl-exit-error exit-code)))
+                          (t
+                           (when (buffer-live-p stdout-buf)
+                             (with-current-buffer stdout-buf
+                               (let ((s (string-trim (buffer-string))))
+                                 (setq http-code
+                                       (and (string-match-p "^[0-9]+$" s)
+                                            (string-to-number s))))))
+                           (when (file-exists-p resp-file)
+                             (with-temp-buffer
+                               (let ((coding-system-for-read 'utf-8))
+                                 (insert-file-contents resp-file))
+                               (setq response (buffer-string))))))
+                       (funcall cleanup))
+                   (error
+                    (setq err (error-message-string response-sig))))
                  (condition-case callback-sig
                      (funcall callback response http-code err)
                    (error
@@ -7316,17 +7327,32 @@ unrelated change, and `:unknown' when the state cannot be decoded."
         :unknown)
        (t :conflict)))))
 
-(defun gdocs--push-throttle-outcome-error (outcome attempt)
-  "Signal a safe error for a failed throttle outcome."
+(defun gdocs--push-save-outcome-error (outcome failure retryable attempt)
+  "Signal a safe error for a reconciled failed save.
+
+OUTCOME is from `gdocs--push-classify-refetched-state'.  FAILURE describes
+the original transport or response failure.  RETRYABLE is non-nil only for
+an explicit retry policy such as the bounded throttle retry."
   (pcase outcome
     (:conflict
-     (user-error "gdocs: conflict while verifying throttled save; remote content changed"))
+     (user-error
+      "gdocs: ambiguous save outcome after %s; conflict with remote content or revision"
+      failure))
     (:unknown
-     (user-error "gdocs: ambiguous throttled save outcome; refusing to replay"))
+     (user-error "gdocs: ambiguous save outcome after %s; refusing to replay"
+                 failure))
     (:retry
-     (user-error "gdocs: /save remained throttled after %d attempts; no operation was confirmed" attempt))
+     (if retryable
+         (user-error
+          "gdocs: /save remained throttled after %d attempts; no operation was committed"
+          attempt)
+       (user-error "gdocs: save was not committed: %s" failure)))
     (_
-     (user-error "gdocs: unable to establish the throttled save outcome"))))
+     (user-error "gdocs: unable to establish save outcome after %s" failure))))
+
+(defun gdocs--push-throttle-outcome-error (outcome attempt)
+  "Compatibility wrapper for a failed throttle outcome."
+  (gdocs--push-save-outcome-error outcome "throttle rejection" t attempt))
 
 (defun gdocs--push-verify-state (doc-id state expected-body expected-revision)
   "Verify that STATE is exactly the expected post-operation snapshot."
@@ -7367,48 +7393,65 @@ unrelated change, and `:unknown' when the state cannot be decoded."
        (= (or (plist-get err :err-code) 0) 13)
        (plist-get err :di)))
 
-(defun gdocs--run-op-result-async-verify-throttle
-    (doc-id plan callback)
-  "Refetch after a throttle and callback with `(OUTCOME STATE ERR)'."
-  (run-with-timer
-   gdocs--rate-limit-retry-delay nil
-   (lambda ()
-     (gdocs--fetch-edit-state-async
-      doc-id
-      (lambda (fresh-state state-err)
-        (if state-err
-            (funcall callback nil nil
-                     (format "state refetch failed: %s" state-err))
-          (condition-case sig
-              (funcall callback
-                       (gdocs--push-classify-refetched-state
-                        doc-id fresh-state plan)
-                       fresh-state nil)
-            (error
-             (funcall callback nil nil (error-message-string sig))))))))))
+(defun gdocs--run-op-result-async-verify-save
+    (doc-id plan delay callback)
+  "Refetch after a failed save and callback with `(OUTCOME STATE ERR)'."
+  (let ((verify
+         (lambda ()
+           (gdocs--fetch-edit-state-async
+            doc-id
+            (lambda (fresh-state state-err)
+              (if state-err
+                  (funcall callback nil nil
+                           (format "state refetch failed: %s" state-err))
+                (condition-case sig
+                    (funcall callback
+                             (gdocs--push-classify-refetched-state
+                              doc-id fresh-state plan)
+                             fresh-state nil)
+                  (error
+                   (funcall callback nil nil
+                            (error-message-string sig))))))))))
+    (if (> delay 0)
+        (run-with-timer delay nil verify)
+      (funcall verify))))
 
-(defun gdocs--run-op-result-async-handle-throttle
-    (doc-id intent plan callback attempt outcome fresh-state verify-err)
-  "Handle a classified async throttle result."
+(defun gdocs--run-op-result-async-handle-failure
+    (doc-id intent plan callback attempt failure retryable
+            outcome fresh-state verify-err)
+  "Handle a classified post-dispatch async save failure."
   (cond
    (verify-err
-    (funcall callback nil verify-err))
+    (funcall callback nil
+             (format "gdocs: ambiguous save outcome after %s; %s"
+                     failure verify-err)))
    ((eq outcome :committed)
     (funcall callback
              (list :revision (plist-get fresh-state :revision)
                    :state fresh-state
                    :plan plan)
              nil))
-   ((and (eq outcome :retry) (< attempt 2))
+   ((and retryable (eq outcome :retry) (< attempt 2))
     ;; The replanner sees FRESH-STATE; PLAN and its positional operation are
     ;; never replayed.
     (gdocs--run-op-result-async-step
      doc-id fresh-state intent callback (1+ attempt)))
    (t
     (condition-case sig
-        (gdocs--push-throttle-outcome-error outcome attempt)
+        (gdocs--push-save-outcome-error
+         outcome failure retryable attempt)
       (error
        (funcall callback nil (error-message-string sig)))))))
+
+(defun gdocs--run-op-result-async-reconcile
+    (doc-id intent plan callback attempt failure retryable)
+  "Reconcile a post-dispatch FAILURE against a fresh remote snapshot."
+  (gdocs--run-op-result-async-verify-save
+   doc-id plan (if retryable gdocs--rate-limit-retry-delay 0)
+   (lambda (outcome fresh-state verify-err)
+     (gdocs--run-op-result-async-handle-failure
+      doc-id intent plan callback attempt failure retryable
+      outcome fresh-state verify-err))))
 
 (defun gdocs--run-op-result-async-save-callback
     (doc-id state intent plan callback attempt response err)
@@ -7416,28 +7459,32 @@ unrelated change, and `:unknown' when the state cannot be decoded."
   (condition-case sig
       (cond
        ((null err)
-        (funcall
-         callback
-         (list :revision (gdocs--save-response-revision response state)
-               :state state
-               :plan plan)
-         nil))
-       ((gdocs--async-throttle-error-p err)
-        (gdocs-log
-         'warn
-         "/save rejected (err 13, di %s) attempt %d, verifying in %ds"
-         (plist-get err :di) attempt gdocs--rate-limit-retry-delay)
-        (gdocs--run-op-result-async-verify-throttle
-         doc-id plan
-         (lambda (outcome fresh-state verify-err)
-           (gdocs--run-op-result-async-handle-throttle
-            doc-id intent plan callback attempt outcome fresh-state verify-err))))
-       ((listp err)
-        (funcall callback nil
-                 (format "/save rejected (http %s err %s)"
-                         (plist-get err :http-code)
-                         (plist-get err :err-code))))
-       (t (funcall callback nil (format "%s" err))))
+        (condition-case revision-sig
+            (funcall
+             callback
+             (list :revision (gdocs--save-response-revision response state)
+                   :state state
+                   :plan plan)
+             nil)
+          (error
+           (gdocs--run-op-result-async-reconcile
+            doc-id intent plan callback attempt
+            (error-message-string revision-sig) nil))))
+       (t
+        (let* ((retryable (gdocs--async-throttle-error-p err))
+               (failure
+                (if (listp err)
+                    (format "/save rejected (http %s err %s)"
+                            (plist-get err :http-code)
+                            (plist-get err :err-code))
+                  (format "%s" err))))
+          (when retryable
+            (gdocs-log
+             'warn
+             "/save rejected (err 13, di %s) attempt %d, verifying in %ds"
+             (plist-get err :di) attempt gdocs--rate-limit-retry-delay))
+          (gdocs--run-op-result-async-reconcile
+           doc-id intent plan callback attempt failure retryable))))
     (error
      (funcall callback nil (error-message-string sig)))))
 
@@ -8079,38 +8126,53 @@ operation."
         (unless (eq (plist-get plan :kind) :raw)
           ;; This runs for every planned attempt, including a retry.
           (gdocs--push-preflight-plan intent current-state plan))
-        (condition-case err
-            (let ((response (gdocs--save-request doc-id current-state commands)))
-              (setq result
-                    (list :revision
-                          (gdocs--save-response-revision response current-state)
-                          :state current-state
-                          :plan plan)))
-          (gdocs-save-rejected
-           (if (gdocs--throttle-error-p err)
-               (progn
+        (cl-labels
+            ((reconcile (failure retryable)
+               (when retryable
                  (gdocs-log
                   'warn
                   "/save rejected (err 13, di %s) attempt %d, verifying in %ds"
-                  (plist-get (cdr err) :di) attempt
+                  (plist-get (cdr failure) :di) attempt
                   gdocs--rate-limit-retry-delay)
-                 (sleep-for gdocs--rate-limit-retry-delay)
-                 (let ((fresh-state (gdocs--fetch-edit-state doc-id)))
-                   (pcase (gdocs--push-classify-refetched-state
-                           doc-id fresh-state plan)
-                     (:committed
-                      (setq result
-                            (list :revision (plist-get fresh-state :revision)
-                                  :state fresh-state
-                                  :plan plan)))
-                     (:retry
-                      (if (< attempt 2)
-                          ;; The next loop invokes the high-level replanner.
-                          (setq current-state fresh-state)
-                        (gdocs--push-throttle-outcome-error :retry attempt)))
-                     (outcome
-                      (gdocs--push-throttle-outcome-error outcome attempt)))))
-             (signal (car err) (cdr err)))))))
+                 (sleep-for gdocs--rate-limit-retry-delay))
+               (let ((fresh-state
+                      (condition-case fetch-sig
+                          (gdocs--fetch-edit-state doc-id)
+                        (error
+                         (user-error
+                          "gdocs: ambiguous save outcome after %s; state refetch failed: %s"
+                          (error-message-string failure)
+                          (error-message-string fetch-sig))))))
+                 (pcase (gdocs--push-classify-refetched-state
+                         doc-id fresh-state plan)
+                   (:committed
+                    (setq result
+                          (list :revision (plist-get fresh-state :revision)
+                                :state fresh-state
+                                :plan plan)))
+                   (:retry
+                    (if (and retryable (< attempt 2))
+                        (setq current-state fresh-state)
+                      (gdocs--push-save-outcome-error
+                       :retry (error-message-string failure)
+                       retryable attempt)))
+                   (outcome
+                    (gdocs--push-save-outcome-error
+                     outcome (error-message-string failure)
+                     retryable attempt))))))
+          (condition-case err
+              (let ((response
+                     (gdocs--save-request doc-id current-state commands)))
+                (condition-case revision-sig
+                    (setq result
+                          (list :revision
+                                (gdocs--save-response-revision
+                                 response current-state)
+                                :state current-state
+                                :plan plan))
+                  (error (reconcile revision-sig nil))))
+            ((gdocs-save-rejected gdocs-save-post-dispatch-failed)
+             (reconcile err (gdocs--throttle-error-p err)))))))
     result))
 
 (defun gdocs--run-op (doc-id state op-or-intent)

@@ -4813,6 +4813,157 @@ that a removed preflight guard would be observed as an unexpected success."
     (should (= callback-revision 2))
     (should-not callback-error)))
 
+(ert-deftest gdocs-test-post-dispatch-lost-response-after-commit-confirms ()
+  "A lost response is confirmed from fresh state without replaying the save."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         (committed (gdocs-test--push-state 2 "A!"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         (save-count 0)
+         (fetch-count 0)
+         result error)
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (_delay _repeat function &rest args)
+                 (apply function args)))
+              ((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (cl-incf save-count)
+                 (funcall callback nil "curl: response lost")))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback)
+                 (cl-incf fetch-count)
+                 (funcall callback committed nil))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (value err) (setq result value error err))))
+    (should (= (plist-get result :revision) 2))
+    (should-not error)
+    (should (= save-count 1))
+    (should (= fetch-count 1))))
+
+(ert-deftest gdocs-test-post-dispatch-lost-response-before-commit-does-not-retry ()
+  "An unchanged fresh pre-state proves an ordinary failed save uncommitted."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         (save-count 0)
+         error)
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (_delay _repeat function &rest args)
+                 (apply function args)))
+              ((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (cl-incf save-count)
+                 (funcall callback nil "curl: response lost")))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback) (funcall callback state nil))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (_value err) (setq error err))))
+    (should (string-match-p "not committed" error))
+    (should (= save-count 1))))
+
+(ert-deftest gdocs-test-post-dispatch-malformed-response-after-commit-confirms ()
+  "Malformed success data is reconciled like any other post-dispatch failure."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         (committed (gdocs-test--push-state 2 "A!"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         result error)
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (_delay _repeat function &rest args)
+                 (apply function args)))
+              ((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (funcall callback nil "json-read: malformed success")))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback) (funcall callback committed nil))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (value err) (setq result value error err))))
+    (should (= (plist-get result :revision) 2))
+    (should-not error)))
+
+(ert-deftest gdocs-test-post-dispatch-missing-revision-after-commit-confirms ()
+  "A parsed success without a revision is confirmed from remote state."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         (committed (gdocs-test--push-state 2 "A!"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         result error)
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (_delay _repeat function &rest args)
+                 (apply function args)))
+              ((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (funcall callback '((ok . t)) nil)))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback) (funcall callback committed nil))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (value err) (setq result value error err))))
+    (should (= (plist-get result :revision) 2))
+    (should-not error)))
+
+(ert-deftest gdocs-test-post-dispatch-concurrent-change-is-ambiguous ()
+  "A failed save followed by unrelated remote state reports ambiguity."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         (changed (gdocs-test--push-state 2 "AX"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         error)
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (_delay _repeat function &rest args)
+                 (apply function args)))
+              ((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (funcall callback nil '(:http-code 500 :err-code 9))))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback) (funcall callback changed nil))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (_value err) (setq error err))))
+    (should (string-match-p "ambiguous save outcome" error))))
+
+(ert-deftest gdocs-test-pre-dispatch-save-failure-does-not-refetch ()
+  "A synchronous setup failure is reported directly without reconciliation."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         (fetch-count 0)
+         (callback-count 0)
+         error)
+    (cl-letf (((symbol-function 'gdocs--save-request-async)
+               (lambda (&rest _args) (error "request setup failed")))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (&rest _args) (cl-incf fetch-count))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (_value err)
+         (cl-incf callback-count)
+         (setq error err))))
+    (should (equal error "request setup failed"))
+    (should (zerop fetch-count))
+    (should (= callback-count 1))))
+
 (ert-deftest gdocs-test-async-partial-success-reports-committed-revision ()
   "A partial push records its revision without establishing a baseline."
   (let* ((gdocs--rate-limit-retry-delay 0)
@@ -4855,9 +5006,9 @@ that a removed preflight guard would be observed as an unexpected success."
     (should (= callback-count 1))
     (should (= committed-revision 2))
     (should (string-match-p "http 500" callback-error))
-    ;; The delete verification fetch happened; the insertion failed and was
-    ;; not treated as a successful final baseline.
-    (should (= fetch-count 1))))
+    ;; The delete verification and failed-insert reconciliation both fetched;
+    ;; the confirmed delete revision was not promoted to a final baseline.
+    (should (= fetch-count 2))))
 
 (ert-deftest gdocs-test-multi-regions-accepts-own-prior-change-and-replans ()
   "Each multi-region boundary accepts the prior change and rebuilds ranges."
