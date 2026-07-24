@@ -276,7 +276,9 @@ make test
 ```
 
 Run byte-compilation validation with `make byte-compile`, or run both checks
-with `make check`. The optional `make integration` target only selects the
+with `make check`. Run `make space-path-check` to repeat all three commands
+through a temporary symlink whose path contains a space. The optional
+`make integration` target only selects the
 `integration` ERT tag after explicitly setting `GDOCS_MODE_RUN_INTEGRATION=1`;
 no live credentials or live integration tests are required by this repository.
 Byte-compilation writes `gdocs-mode.elc` and `gdocs-mode-test.elc` to a fresh
