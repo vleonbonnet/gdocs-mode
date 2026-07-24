@@ -1908,6 +1908,126 @@ END is the inclusive final OT position."
                    '("ds" "is")))
     (should (= (alist-get 'si (car commands)) 1))))
 
+(ert-deftest gdocs-test-table-equality-covers-visible-cell-content-and-shape ()
+  "Table equality compares canonical shape, rich runs, and inline objects."
+  (let* ((object '(:kind :inline-object :entity-id "kix.table-image"
+                         :object-kind :image
+                         :content-id "s-blob-v1-IMAGE-table"
+                         :width 10.0 :height 20.0 :ot-position 4))
+         (table
+          (lambda (id &optional first-run object-value)
+            (list :kind :table :table-id id :cols 2
+                  :rows
+                  (list
+                   (list (list (list (or first-run
+                                         (gdocs-dm-make-run "one"))))
+                         (list (list (gdocs-dm-make-run
+                                     "two" '(:bold)
+                                     "https://example.test"))))
+                   (list (list (list (gdocs-dm-make-run "three")))
+                         (list (list (list :inline-object
+                                           (or object-value object)))))))))
+         (remote (funcall table "kix.remote"))
+         (same-object (plist-put (copy-sequence object) :ot-position 99))
+         (local (funcall table "kix.local" nil same-object)))
+    (should (gdocs--paragraph-equal-p remote local))
+    (dolist (run (list (gdocs-dm-make-run "changed")
+                       (gdocs-dm-make-run "one" nil "https://changed.test")
+                       (gdocs-dm-make-run "one" '(:italic))))
+      (should-not (gdocs--paragraph-equal-p
+                   remote (funcall table "kix.local" run same-object))))
+    (let ((changed-object (plist-put (copy-sequence same-object)
+                                     :content-id "changed-content")))
+      (should-not (gdocs--paragraph-equal-p
+                   remote (funcall table "kix.local" nil changed-object))))
+    (let ((added-row (copy-tree local))
+          (removed-row (copy-tree local))
+          (added-cell (copy-tree local))
+          (removed-cell (copy-tree local)))
+      (setq added-row
+            (plist-put added-row :rows
+                       (append (plist-get added-row :rows)
+                               (list (list (list nil) (list nil))))))
+      (setq removed-row
+            (plist-put removed-row :rows
+                       (butlast (plist-get removed-row :rows))))
+      (setq added-cell (plist-put added-cell :cols 3))
+      (setf (car (plist-get added-cell :rows))
+            (append (car (plist-get added-cell :rows)) (list (list nil))))
+      (setf (cadr (plist-get added-cell :rows))
+            (append (cadr (plist-get added-cell :rows)) (list (list nil))))
+      (setq removed-cell (plist-put removed-cell :cols 1))
+      (setf (car (plist-get removed-cell :rows))
+            (butlast (car (plist-get removed-cell :rows))))
+      (setf (cadr (plist-get removed-cell :rows))
+            (butlast (cadr (plist-get removed-cell :rows))))
+      (dolist (changed (list added-row removed-row added-cell removed-cell))
+        (should-not (gdocs--paragraph-equal-p remote changed))))))
+
+(ert-deftest gdocs-test-malformed-tables-never-compare-equal ()
+  "Structurally inconsistent table models are unequal, even to themselves."
+  (dolist (table
+           (list
+            '(:kind :table :cols 2 :rows (((( :text "one")))))
+            '(:kind :table :cols 2
+                    :rows (((((:text "one"))) (((:text "two"))))
+                           ((((:text "three"))))))
+            '(:kind :table :cols 1 :rows ((not-a-cell)))
+            '(:kind :table :cols 1 :rows (((((:text 42))))))))
+    (should-not (gdocs--paragraph-equal-p table table))))
+
+(ert-deftest gdocs-test-unchanged-table-allows-unrelated-incremental-edit ()
+  "An unchanged table remains in the common prefix of an incremental diff."
+  (let* ((cell (lambda (text) (list (list (gdocs-dm-make-run text)))))
+         (table (lambda (id)
+                  (list :kind :table :table-id id :cols 2
+                        :rows (list (list (funcall cell "one")
+                                          (funcall cell "two"))))))
+         (paragraph (lambda (text)
+                      (list :kind :para
+                            :runs (list (gdocs-dm-make-run text)))))
+         (old (gdocs-dm-make-doc
+               :paragraphs (list (funcall table "kix.remote")
+                                 (funcall paragraph "old"))))
+         (new (gdocs-dm-make-doc
+               :paragraphs (list (funcall table "kix.local")
+                                 (funcall paragraph "new"))))
+         (commands (gdocs-dm-to-incremental-save-commands old new)))
+    (should (equal (mapcar (lambda (op) (alist-get 'ty op))
+                           (seq-take commands 2))
+                   '("ds" "is")))
+    (should (> (alist-get 'si (car commands)) 1))
+    (should (equal (alist-get 's (cadr commands)) "new\n"))))
+
+(ert-deftest gdocs-test-changed-table-incremental-save-is-never-no-op ()
+  "A changed table produces the existing full-replacement command bundle."
+  (let* ((table (lambda (text)
+                  (list :kind :table :table-id "kix.table" :cols 1
+                        :rows (list (list
+                                     (list (list
+                                            (gdocs-dm-make-run text))))))))
+         (old (gdocs-dm-make-doc :paragraphs (list (funcall table "old"))))
+         (new (gdocs-dm-make-doc :paragraphs (list (funcall table "new"))))
+         (commands (gdocs-dm-to-incremental-save-commands old new)))
+    (should commands)
+    (should (equal (mapcar (lambda (op) (alist-get 'ty op))
+                           (seq-take commands 2))
+                   '("ds" "is")))
+    (should (= (alist-get 'si (car commands)) 1)))
+  (let* ((object '(:kind :inline-object :entity-id "kix.table-image"
+                         :object-kind :image :content-id "original"
+                         :width 10.0 :height 20.0))
+         (changed (plist-put (copy-sequence object) :content-id "changed"))
+         (table (lambda (value)
+                  (list :kind :table :cols 1
+                        :rows (list
+                               (list
+                                (list (list :inline-object value)))))))
+         (old (gdocs-dm-make-doc :paragraphs (list (funcall table object))))
+         (new (gdocs-dm-make-doc :paragraphs (list (funcall table changed)))))
+    (should-error (gdocs-dm-to-incremental-save-commands old new)
+                  :type 'user-error)))
+
 (ert-deftest gdocs-test-unchanged-inline-object-allows-safe-incremental-text-edits ()
   "Text edits around an unchanged image stay incremental and preflighted."
   (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))

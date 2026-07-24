@@ -3907,6 +3907,10 @@ BODY at position 1)."
                     (nreverse para-ops))))))
 
 (defun gdocs--run-text-equal-p (r1 r2)
+  "Return non-nil when runs R1 and R2 have equal visible content.
+
+Text, styles, links, and stable inline-object identity participate in the
+comparison; decoder-only inline-object metadata does not."
   (let ((o1 (plist-get r1 :inline-object))
         (o2 (plist-get r2 :inline-object)))
     (if (or o1 o2)
@@ -3914,9 +3918,98 @@ BODY at position 1)."
               (identity2 (and o2 (gdocs--inline-object-identity o2))))
           (and identity1 identity2 (equal identity1 identity2)))
       (and (equal (plist-get r1 :text) (plist-get r2 :text))
-           (equal (sort (plist-get r1 :styles) :lessp #'string<)
-                  (sort (plist-get r2 :styles) :lessp #'string<))
-           (equal (plist-get r1 :link) (plist-get r2 :link))))))
+            (equal (sort (copy-sequence (plist-get r1 :styles))
+                         :lessp #'string<)
+                   (sort (copy-sequence (plist-get r2 :styles))
+                         :lessp #'string<))
+            (equal (plist-get r1 :link) (plist-get r2 :link))))))
+
+(defun gdocs--table-run-valid-for-equality-p (run)
+  "Return non-nil when RUN has a well-formed equality representation."
+  (and (proper-list-p run)
+       (let ((object (plist-get run :inline-object))
+             (text-present (plist-member run :text))
+             (styles (plist-get run :styles))
+             (link (plist-get run :link)))
+         (if object
+             (and (proper-list-p object)
+                  (not text-present)
+                  (null styles)
+                  (null link)
+                  (eq (plist-get object :kind) :inline-object)
+                  (stringp (plist-get object :entity-id))
+                  (symbolp (plist-get object :object-kind))
+                  (stringp (plist-get object :content-id))
+                  (numberp (plist-get object :width))
+                  (numberp (plist-get object :height)))
+           (and text-present
+                (stringp (plist-get run :text))
+                (or (null styles)
+                    (and (proper-list-p styles)
+                         (cl-every #'symbolp styles)))
+                (or (null link) (stringp link)))))))
+
+(defun gdocs--table-cell-runs-for-equality (cell)
+  "Return CELL's canonical run list, or `:invalid-table-cell'.
+
+Both the current one-element wrapper and the legacy direct run-list shape are
+accepted.  Other shapes are rejected rather than flattened ambiguously."
+  (cond
+   ((null cell) nil)
+   ((not (proper-list-p cell)) :invalid-table-cell)
+   ((and (= (length cell) 1)
+         (proper-list-p (car cell))
+         (cl-every #'gdocs--table-run-valid-for-equality-p (car cell)))
+    (car cell))
+   ((cl-every #'gdocs--table-run-valid-for-equality-p cell) cell)
+   (t :invalid-table-cell)))
+
+(defun gdocs--table-for-equality (table)
+  "Return TABLE's canonical visible shape, or nil if it is inconsistent.
+
+The result contains rows, cells, and ordered runs only.  Transient table IDs
+and decoder metadata are excluded.  Rows must agree on their cell count, and
+an explicit `:cols' value must agree with that shape."
+  (let ((rows (plist-get table :rows))
+        (declared-cols (plist-get table :cols))
+        canonical expected-cols valid)
+    (setq valid (and (proper-list-p rows) rows))
+    (dolist (row rows)
+      (if (not (and valid (proper-list-p row) row))
+          (setq valid nil)
+        (let ((cols (length row))
+              canonical-row)
+          (if (and expected-cols (/= expected-cols cols))
+              (setq valid nil)
+            (setq expected-cols cols)
+            (dolist (cell row)
+              (let ((runs (gdocs--table-cell-runs-for-equality cell)))
+                (if (eq runs :invalid-table-cell)
+                    (setq valid nil)
+                  (push runs canonical-row))))
+            (push (nreverse canonical-row) canonical)))))
+    (when (and valid
+               (or (null declared-cols)
+                   (and (integerp declared-cols)
+                        (> declared-cols 0)
+                        (= declared-cols expected-cols))))
+      (nreverse canonical))))
+
+(defun gdocs--table-equal-p (table1 table2)
+  "Return non-nil when TABLE1 and TABLE2 have equal canonical table content."
+  (let ((canonical1 (gdocs--table-for-equality table1))
+        (canonical2 (gdocs--table-for-equality table2)))
+    (and canonical1 canonical2
+         (= (length canonical1) (length canonical2))
+         (cl-every
+          (lambda (row1 row2)
+            (and (= (length row1) (length row2))
+                 (cl-every
+                  (lambda (cell1 cell2)
+                    (and (= (length cell1) (length cell2))
+                         (cl-every #'gdocs--run-text-equal-p cell1 cell2)))
+                  row1 row2)))
+          canonical1 canonical2))))
 
 (defun gdocs--paragraph-inline-object-for-equality (paragraph)
   "Return the standalone inline object represented by PARAGRAPH.
@@ -3942,7 +4035,7 @@ instead of allowing one representation to hide changed metadata."
        (t :invalid-inline-object)))))
 
 (defun gdocs--paragraph-runs-for-equality (paragraph)
-  "Return PARAGRAPH runs in the canonical shape used for equality."
+  "Return non-table PARAGRAPH runs in the canonical shape used for equality."
   (if (eq (plist-get paragraph :kind) :inline-object)
       (list (list :inline-object
                   (gdocs--paragraph-inline-object-for-equality paragraph)))
@@ -3950,9 +4043,10 @@ instead of allowing one representation to hide changed metadata."
 
 (defun gdocs--paragraph-equal-p (p1 p2)
   "Return non-nil if P1 and P2 are equivalent at the user-visible level.
-Compares kind, runs, heading level, list nest/glyph, and canonical inline
-object identity, but NOT list-id — list ids differ between live-decoded and
-freshly-rendered docs."
+Compares kind, runs, heading level, list nest/glyph, canonical inline-object
+identity, and canonical table structure and cell runs.  Transient table and
+list IDs are ignored because they differ between live-decoded and freshly
+rendered docs.  Malformed tables are never equal."
   (let* ((kind (plist-get p1 :kind))
          (object1 (and (eq kind :inline-object)
                        (gdocs--paragraph-inline-object-for-equality p1)))
@@ -3971,10 +4065,12 @@ freshly-rendered docs."
                   (plist-get p2 :level)))
          (equal (plist-get p1 :nest) (plist-get p2 :nest))
          (equal (plist-get p1 :glyph) (plist-get p2 :glyph))
-         (let ((r1 (gdocs--paragraph-runs-for-equality p1))
-               (r2 (gdocs--paragraph-runs-for-equality p2)))
-           (and (= (length r1) (length r2))
-                (cl-every #'gdocs--run-text-equal-p r1 r2))))))
+          (if (eq kind :table)
+              (gdocs--table-equal-p p1 p2)
+            (let ((r1 (gdocs--paragraph-runs-for-equality p1))
+                  (r2 (gdocs--paragraph-runs-for-equality p2)))
+              (and (= (length r1) (length r2))
+                   (cl-every #'gdocs--run-text-equal-p r1 r2)))))))
 
 (defun gdocs--paragraphs-common-prefix (a b)
   (let ((n 0))
