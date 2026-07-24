@@ -112,6 +112,43 @@ Default `warn' keeps *Messages* quiet during normal pull/push; set to
   :type 'string
   :group 'gdocs-mode)
 
+(defun gdocs--validate-curl-timeout (value)
+  "Return VALUE when it is a positive number, otherwise signal an error."
+  (unless (and (numberp value) (> value 0))
+    (user-error "gdocs: curl timeouts must be positive numbers"))
+  value)
+
+(defun gdocs--set-curl-timeout (symbol value)
+  "Set SYMBOL to validated curl timeout VALUE."
+  (set-default symbol (gdocs--validate-curl-timeout value)))
+
+(defcustom gdocs-curl-connect-timeout 10
+  "Maximum seconds curl may spend establishing a connection."
+  :type 'number
+  :set #'gdocs--set-curl-timeout
+  :group 'gdocs-mode)
+
+(defcustom gdocs-curl-total-timeout 60
+  "Maximum seconds allowed for an entire curl operation."
+  :type 'number
+  :set #'gdocs--set-curl-timeout
+  :group 'gdocs-mode)
+
+(defun gdocs--curl-timeout-args ()
+  "Return validated command-line timeout arguments for curl."
+  (list "--connect-timeout"
+        (number-to-string
+         (gdocs--validate-curl-timeout gdocs-curl-connect-timeout))
+        "--max-time"
+        (number-to-string
+         (gdocs--validate-curl-timeout gdocs-curl-total-timeout))))
+
+(defun gdocs--curl-exit-error (exit-code)
+  "Return a diagnostic for curl EXIT-CODE."
+  (if (equal exit-code 28)
+      "curl timeout (exit 28)"
+    (format "curl exit %s" exit-code)))
+
 (defconst gdocs--export-base "https://docs.google.com/document/d/")
 
 (defvar-local gdocs--sync-timer nil
@@ -6352,7 +6389,9 @@ stale Google session cookies on top of our explicit Cookie header and
 that causes intermittent code-13 rejections from /save."
   (let* ((body-file (make-temp-file "gdocs-req-" nil ".bin"))
          (resp-file (make-temp-file "gdocs-resp-" nil ".bin"))
-         (args (append (list "--silent" "--compressed"
+         (args (append (list "--silent" "--compressed")
+                       (gdocs--curl-timeout-args)
+                       (list
                              "-X" "POST"
                              "-o" resp-file
                              "-w" "%{http_code}"
@@ -6368,7 +6407,7 @@ that causes intermittent code-13 rejections from /save."
                 (with-temp-buffer
                   (let ((exit (apply #'call-process "curl" nil t nil args)))
                     (unless (zerop exit)
-                      (error "gdocs: curl exit %d for %s" exit url)))
+                      (error "gdocs: %s" (gdocs--curl-exit-error exit))))
                   (buffer-string)))
                (http-code (string-to-number status-string))
                (response (with-temp-buffer
@@ -6525,7 +6564,9 @@ how to interpret HTTP-CODE (e.g. 550 is a /save throttle, not a hard error)."
   (let* ((body-file (and body (make-temp-file "gdocs-req-" nil ".bin")))
          (resp-file (make-temp-file "gdocs-resp-" nil ".bin"))
          (stdout-buf (generate-new-buffer " *gdocs-curl-out*"))
-         (args (append (list "--silent" "--compressed"
+         (args (append (list "--silent" "--compressed")
+                       (gdocs--curl-timeout-args)
+                       (list
                              "-X" method
                              "-o" resp-file
                              "-w" "%{http_code}")
@@ -6533,50 +6574,57 @@ how to interpret HTTP-CODE (e.g. 550 is a /save throttle, not a hard error)."
                        (mapcan (lambda (h)
                                  (list "-H" (format "%s: %s" (car h) (cdr h))))
                                headers)
-                       (list url))))
-    (when body
-      (let ((coding-system-for-write 'utf-8))
-        (with-temp-file body-file (insert body))))
-    (make-process
-     :name "gdocs-curl"
-     :noquery t
-     :command (cons "curl" args)
-     :buffer stdout-buf
-     :sentinel
-     (lambda (proc _event)
-       (when (memq (process-status proc) '(exit signal))
-         (let ((exit-code (process-exit-status proc))
-               (http-code nil) (response nil) (err nil))
-           (unwind-protect
-               (cond
-                ((not (zerop exit-code))
-                 (setq err (format "curl exit %d" exit-code)))
-                (t
-                 (when (buffer-live-p stdout-buf)
-                   (with-current-buffer stdout-buf
-                     (let ((s (string-trim (buffer-string))))
-                       (setq http-code (and (string-match-p "^[0-9]+$" s)
-                                            (string-to-number s))))))
-                 (when (file-exists-p resp-file)
-                   (with-temp-buffer
-                     ;; `insert-file-contents' + `coding-system-for-read'
-                     ;; produces a proper multibyte string. The earlier
-                     ;; `set-buffer-multibyte nil' + `decode-coding-region'
-                     ;; left the buffer unibyte, so `(buffer-string)' returned
-                     ;; raw-byte chars (codepoints #x3FFF80+byte) for any
-                     ;; multibyte sequence — em-dashes etc. would survive as
-                     ;; three pseudo-chars instead of one U+2014.
-                     (let ((coding-system-for-read 'utf-8))
-                       (insert-file-contents resp-file))
-                     (setq response (buffer-string))))))
-             (when body-file (ignore-errors (delete-file body-file)))
-             (ignore-errors (delete-file resp-file))
-             (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf)))
-           (condition-case sig
-               (funcall callback response http-code err)
-             (error
-              (gdocs-log 'error "async callback failed: %s"
-                         (error-message-string sig))))))))))
+                       (list url)))
+         (finished nil)
+         (cleanup
+          (lambda ()
+            (when body-file (ignore-errors (delete-file body-file)))
+            (ignore-errors (delete-file resp-file))
+            (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf)))))
+    (condition-case sig
+        (progn
+          (when body
+            (let ((coding-system-for-write 'utf-8))
+              (with-temp-file body-file (insert body))))
+          (make-process
+           :name "gdocs-curl"
+           :noquery t
+           :command (cons "curl" args)
+           :buffer stdout-buf
+           :sentinel
+           (lambda (proc _event)
+             (when (and (not finished)
+                        (memq (process-status proc) '(exit signal)))
+               (setq finished t)
+               (let ((exit-code (process-exit-status proc))
+                     (http-code nil) (response nil) (err nil))
+                 (unwind-protect
+                     (cond
+                      ((not (zerop exit-code))
+                       (setq err (gdocs--curl-exit-error exit-code)))
+                      (t
+                       (when (buffer-live-p stdout-buf)
+                         (with-current-buffer stdout-buf
+                           (let ((s (string-trim (buffer-string))))
+                             (setq http-code
+                                   (and (string-match-p "^[0-9]+$" s)
+                                        (string-to-number s))))))
+                       (when (file-exists-p resp-file)
+                         (with-temp-buffer
+                           ;; Reading with the coding system produces a real
+                           ;; multibyte string instead of raw-byte characters.
+                           (let ((coding-system-for-read 'utf-8))
+                             (insert-file-contents resp-file))
+                           (setq response (buffer-string))))))
+                   (funcall cleanup))
+                 (condition-case callback-sig
+                     (funcall callback response http-code err)
+                   (error
+                    (gdocs-log 'error "async callback failed: %s"
+                               (error-message-string callback-sig)))))))))
+      (error
+       (funcall cleanup)
+       (signal (car sig) (cdr sig))))))
 
 (defun gdocs--make-request-async (url method data parser callback)
   "Async sibling of `gdocs--make-request'. CALLBACK = `(funcall CB RESULT ERR)'.

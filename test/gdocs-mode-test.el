@@ -54,6 +54,9 @@
 (defconst gdocs-test--production-curl-async
   (symbol-function 'gdocs--curl-async))
 
+(defconst gdocs-test--production-curl-post
+  (symbol-function 'gdocs--curl-post))
+
 (ert-deftest gdocs-test-production-loaded-once-from-explicit-source ()
   "The suite loads exactly the checked-out production source once."
   (should (= gdocs-test--production-load-count 1))
@@ -142,6 +145,148 @@
   (let ((gdocs-auth-function (lambda () '(("Cookie" . "synthetic")))))
     (should-error (gdocs--make-request "https://example.invalid" "GET")
                   :type 'error)))
+
+(ert-deftest gdocs-test-curl-timeout-custom-values-and-validation ()
+  "Curl timeout options accept positive custom values and reject invalid ones."
+  (should (custom-variable-p 'gdocs-curl-connect-timeout))
+  (should (custom-variable-p 'gdocs-curl-total-timeout))
+  (let ((gdocs-curl-connect-timeout 2.5)
+        (gdocs-curl-total-timeout 45))
+    (should (equal (gdocs--curl-timeout-args)
+                   '("--connect-timeout" "2.5" "--max-time" "45"))))
+  (dolist (value '(0 -1 "10" nil))
+    (let ((gdocs-curl-connect-timeout value))
+      (should-error (gdocs--curl-timeout-args) :type 'user-error))
+    (let ((gdocs-curl-total-timeout value))
+      (should-error (gdocs--curl-timeout-args) :type 'user-error))))
+
+(ert-deftest gdocs-test-sync-curl-timeout-args-and-sanitized-diagnostic ()
+  "The synchronous curl transport applies both limits without exposing BODY."
+  (let ((gdocs-curl-connect-timeout 3)
+        (gdocs-curl-total-timeout 12)
+        command-args)
+    (cl-letf (((symbol-function 'call-process)
+               (lambda (_program _infile _destination _display &rest args)
+                 (setq command-args args)
+                 28))
+              ((symbol-function 'gdocs--curl-post)
+               gdocs-test--production-curl-post))
+      (let ((err (should-error
+                  (gdocs--curl-post "https://example.invalid/save" nil
+                                    "secret-request-body"))))
+        (should (string-match-p "timeout" (error-message-string err)))
+        (should-not (string-match-p "secret-request-body"
+                                    (error-message-string err)))))
+    (should (equal (seq-take command-args 6)
+                   '("--silent" "--compressed" "--connect-timeout" "3"
+                     "--max-time" "12")))))
+
+(ert-deftest gdocs-test-async-curl-timeout-cleans-up-and-calls-once ()
+  "Curl exit 28 follows one sanitized callback after transport cleanup."
+  (let ((gdocs-curl-connect-timeout 4)
+        (gdocs-curl-total-timeout 20)
+        process-args sentinel stdout-buffer body-file response-file
+        (callback-count 0)
+        callback-error)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq process-args args
+                       sentinel (plist-get args :sentinel)
+                       stdout-buffer (plist-get args :buffer))
+                 'synthetic-process))
+              ((symbol-function 'gdocs--curl-async)
+               gdocs-test--production-curl-async)
+              ((symbol-function 'process-status) (lambda (_proc) 'exit))
+              ((symbol-function 'process-exit-status) (lambda (_proc) 28)))
+      (gdocs--curl-async
+       "https://example.invalid/state" "POST" nil "secret-request-body"
+       (lambda (_response _code err)
+         (cl-incf callback-count)
+         (setq callback-error err)))
+      (let* ((command (plist-get process-args :command))
+             (data-index (seq-position command "--data-binary" #'equal))
+             (output-index (seq-position command "-o" #'equal)))
+        (setq body-file (substring (nth (1+ data-index) command) 1)
+              response-file (nth (1+ output-index) command))
+        (should (equal (seq-take (cdr command) 6)
+                       '("--silent" "--compressed" "--connect-timeout" "4"
+                         "--max-time" "20"))))
+      (funcall sentinel 'synthetic-process "finished")
+      (funcall sentinel 'synthetic-process "finished again"))
+    (should (= callback-count 1))
+    (should (string-match-p "timeout" callback-error))
+    (should-not (string-match-p "secret-request-body" callback-error))
+    (should-not (file-exists-p body-file))
+    (should-not (file-exists-p response-file))
+    (should-not (buffer-live-p stdout-buffer))))
+
+(ert-deftest gdocs-test-pull-timeout-releases-owner-without-metadata-update ()
+  "A pull timeout completes once, releases its owner, and preserves metadata."
+  (let ((gdocs--sync-mutex nil)
+        (gdocs-auth-function (lambda () '(("Cookie" . "synthetic"))))
+        sentinel
+        (callback-count 0)
+        callback-error)
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 7\n"
+              ":GDOC_CONTENT_HASH: old-hash\n:END:\n\nLocal body\n")
+      (org-mode)
+      (setq gdocs--last-synced-hash "old-baseline")
+      (let ((before (buffer-string)))
+        (cl-letf (((symbol-function 'gdocs--curl-async)
+                   gdocs-test--production-curl-async)
+                  ((symbol-function 'make-process)
+                   (lambda (&rest args)
+                     (setq sentinel (plist-get args :sentinel))
+                     'synthetic-process))
+                  ((symbol-function 'process-status) (lambda (_proc) 'exit))
+                  ((symbol-function 'process-exit-status) (lambda (_proc) 28)))
+          (gdocs-pull-locally
+           "synthetic-id"
+           (lambda (_body err)
+             (cl-incf callback-count)
+             (setq callback-error err)))
+          (should gdocs--sync-mutex)
+          (funcall sentinel 'synthetic-process "finished")
+          (funcall sentinel 'synthetic-process "finished again"))
+        (should (= callback-count 1))
+        (should (string-match-p "timeout" callback-error))
+        (should-not gdocs--sync-mutex)
+        (should (equal (buffer-string) before))
+        (should (equal (gdocs--top-property-value "GDOC_REVISION") "7"))
+        (should (equal (gdocs--top-property-value "GDOC_CONTENT_HASH")
+                       "old-hash"))
+        (should (equal gdocs--last-synced-hash "old-baseline"))))))
+
+(ert-deftest gdocs-test-probe-timeout-clears-in-flight-without-metadata-update ()
+  "An edit-state timeout clears the probe token and changes no metadata."
+  (let ((gdocs-mode t)
+        (gdocs--sync-mutex nil)
+        (gdocs-auth-function (lambda () '(("Cookie" . "synthetic"))))
+        sentinel)
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 7\n:END:\n\nBody\n")
+      (org-mode)
+      (gdocs--mark-synced)
+      (let ((before (buffer-string))
+            (baseline gdocs--last-synced-hash))
+        (cl-letf (((symbol-function 'gdocs--curl-async)
+                   gdocs-test--production-curl-async)
+                  ((symbol-function 'make-process)
+                   (lambda (&rest args)
+                     (setq sentinel (plist-get args :sentinel))
+                     'synthetic-process))
+                  ((symbol-function 'process-status) (lambda (_proc) 'exit))
+                  ((symbol-function 'process-exit-status) (lambda (_proc) 28)))
+          (gdocs--auto-sync-tick)
+          (should gdocs--auto-sync-in-flight)
+          (funcall sentinel 'synthetic-process "finished")
+          (funcall sentinel 'synthetic-process "finished again"))
+        (should-not gdocs--auto-sync-in-flight)
+        (should-not gdocs--sync-mutex)
+        (should (equal (buffer-string) before))
+        (should (equal (gdocs--top-property-value "GDOC_REVISION") "7"))
+        (should (equal gdocs--last-synced-hash baseline))))))
 
 (ert-deftest gdocs-test-session-state-is-temporary ()
   "Session persistence stays beneath the suite root and is removable."
