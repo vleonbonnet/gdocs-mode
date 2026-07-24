@@ -530,8 +530,8 @@ that looks like a stray double space in Emacs."
 COMMENTS is the list returned by `gdocs--parse-docos-sync-response':
 each entry is (N :text TEXT :anchor KIX-ID). The heading carries
 `:GDOC_LOCAL: t' so `gdocs--buffer-body-as-plain' can strip it before
-push (Google holds the canonical comments; the section is a read-only
-projection)."
+push (Google holds the canonical comments; the section is an editable,
+ephemeral local projection that the next pull regenerates)."
   (concat
    "\n* Comments\n"
    ":PROPERTIES:\n:GDOC_LOCAL: t\n:END:\n\n"
@@ -5431,8 +5431,9 @@ Call inside `with-current-buffer' after every successful pull or push."
 The top property drawer, legacy synthetic title, and generated date are
 excluded. A `#+title:' is retained when it belongs to the body. Also strips
 any trailing heading whose drawer carries `:GDOC_LOCAL: t'
-\(currently the auto-generated `* Comments' subtree, which is a
-read-only projection of Google's comments and must not be pushed)."
+\(currently the auto-generated `* Comments' subtree, which is an
+editable, ephemeral local projection of Google's comments and must not be
+pushed)."
   (save-excursion
     (let* ((body-start (gdocs--body-start-pos))
            (end (gdocs--find-local-subtree-start body-start))

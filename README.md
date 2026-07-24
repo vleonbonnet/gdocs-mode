@@ -20,10 +20,12 @@ Remote images are represented by explicit remote-object placeholders: standalone
 images use `#+gdocs_inline_object:` and images embedded in prose use
 `@@gdocs-inline-object:image ENTITY WIDTHxHEIGHT content-id=CONTENT@@`; the
 image bytes are not downloaded.
-Comments are pulled into a read-only local projection. Comments with unambiguous
-anchors get footnote references at those anchors, and all fetched comments are
-listed in a local `* Comments` subtree. The projection is stripped before push;
-editing or pushing comments is unsupported.
+Comments are pulled into an editable local-only, ephemeral projection. Comments
+with unambiguous anchors get footnote references at those anchors, and all fetched
+comments are listed in a local `* Comments` subtree. You may edit that projection
+locally, but its footnote references and subtree are stripped before push, so those
+edits never reach Google; each pull regenerates the projection from the fetched
+remote comments.
 - **Push** — converts the local Org buffer back to Google Docs format and
 writes it remotely. The configured `gdocs-push-backend` determines whether the
 push is a full replacement/re-encoding, a model-level incremental update, or a
@@ -41,9 +43,15 @@ every `gdocs-auto-sync-interval` seconds. Its decision table is:
 | Either revision unavailable, or state fetch fails | Either | Report a diagnostic; take no action |
 
 Local dirty state is determined from a hash baseline refreshed after successful
-syncs, not from `buffer-modified-p`. A manual `gdocs-push-remotely` also refuses
-to push when the fetched remote revision differs from the buffer's
-`GDOC_REVISION`.
+syncs, not from `buffer-modified-p`. The baseline is persisted in
+`GDOC_CONTENT_HASH` and restored when the mode is enabled; a missing or malformed
+baseline is `unknown`, so auto-sync reports it and does not even start a remote
+probe. At most one edit-state probe is in flight per buffer, and disabling or
+re-enabling the mode invalidates callbacks from an earlier lifecycle. A pull also
+captures the body hash and `GDOC_REVISION` at dispatch and refuses to overwrite the
+buffer if either changes before the asynchronous response is applied. A manual
+`gdocs-push-remotely` likewise refuses to push when the freshly fetched remote
+revision differs from the buffer's `GDOC_REVISION`.
 
 - **Org link interception** — opening a `docs.google.com/document/d/...` link
 in Org opens it through `gdocs-mode` instead of the browser.
@@ -54,16 +62,16 @@ in Org opens it through `gdocs-mode` instead of the browser.
 
 | Backend | Behavior |
 |---------|----------|
-| `ot-encode` | Default. Rebuilds the document model from the local Org buffer and emits a full replacement/re-encoding, including supported styles and structure. |
-| `ot-incremental` | Decodes the live OT body into a document model and computes a paragraph-level model diff. Safe changes use incremental operations; changes involving lists, tables, or changed inline-object paragraphs fall back to a full replacement/re-encoding. |
-| `plain` | Legacy/experimental plain-text diff. Emits only `is`/`ds` text operations and no style information; it is lossy and not recommended. |
+| `ot-encode` | Default. Rebuilds the document model from the local Org buffer, deletes the existing OT body, and inserts a complete re-encoding with supported styles and structure. |
+| `ot-incremental` | Decodes the live OT body into a document model and computes a paragraph-level model diff. Safe changed regions use incremental operations. If the changed region contains a list, table, standalone inline object, or inline object embedded in prose, it falls back to the same full replacement/re-encoding as `ot-encode`; unchanged image paragraphs outside the changed region can remain incremental. |
+| `plain` | Legacy/experimental incremental plain-text diff. Emits only `is`/`ds` text operations and no style information; it is lossy and not recommended. |
 
-Full replacements and incremental operations both go through capability
-preflight. Unsupported remote content is handled fail-closed: a full
-replacement is refused, while an incremental edit is allowed only when every
-unsupported capability has a known range, untouched preservation is explicitly
-proven, and no edited range intersects it. If that proof is unavailable, the
-push is refused.
+Every push plan is checked against capability data decoded again from the freshly
+fetched remote OT state. A full replacement is refused when it would discard a
+destructive unsupported capability. An incremental edit is allowed only when
+every unsupported capability can be preserved untouched, has a known range, and
+no edited or insertion boundary intersects that range. If that proof is
+unavailable, the push is refused.
 
 ### Spacing canonicalization
 
@@ -106,10 +114,15 @@ entity-to-placeholder associations remain refused.
 
 ## Requirements
 
-- Emacs **29.1+** (uses the built-in `sqlite-*` API for the cookie backend).
+- Emacs **29.1+**.
 - [`request`](https://github.com/tkf/emacs-request) **0.3.2+**.
-- `curl` available on `PATH` at runtime. Asynchronous networking invokes
-external `curl` subprocesses.
+- `curl` available on `PATH` at runtime. Pull, push, auto-sync, and comments
+networking invoke external `curl` subprocesses.
+
+The core package does not use SQLite. Emacs built with SQLite support is required
+only for the optional Firefox-cookie example below, which calls `sqlite-open` and
+`sqlite-select`. Other `gdocs-auth-function` implementations do not inherit that
+requirement.
 
 ## Installation
 
@@ -203,8 +216,10 @@ over `.google.com`, mirroring the host priority the browser uses so that
 `SAPISID`/`SID` resolution matches what Firefox sends.
 
 For anything beyond local experimentation, write your own
-`gdocs-auth-function` that pulls credentials from a password manager, the macOS
-Keychain, or an OAuth refresh-token flow.
+`gdocs-auth-function` that obtains browser-session cookies from an appropriate
+credential store such as a password manager or the macOS Keychain. An OAuth
+refresh-token flow is suitable only for pull/read requests until push is moved to
+a documented OAuth-capable API.
 
 ## Usage
 
@@ -215,6 +230,10 @@ Keychain, or an OAuth refresh-token flow.
 | `gdocs-push-remotely` | Push local Org changes back to the remote document.            |
 | `gdocs-out-of-date`   | Check whether the remote document has advanced.                |
 | `gdocs-mode`          | The Org minor mode that ties pull/push/auto-sync together.     |
+| `gdocs-session-reset` | Delete the persisted `/save` SID/request-id session and create a new one on the next push. |
+| `gdocs-recon-dump` | Write a read-only OT reconstruction dump under `/tmp` for diagnostics. |
+| `gdocs-debug-comments-fetch` | Fetch comments into `*gdocs-comments-debug*` for diagnostics; does not push. |
+| `gdocs-debug-push-state` | Write a read-only push-planning dump to `/tmp/gdocs-push-debug.txt` by default. |
 
 Open a document with `M-x gdocs-open` and paste the URL or document ID. The
 mode opens (or reuses) a local `.org` buffer named after the document title and
@@ -241,7 +260,10 @@ These properties are maintained on the top-level node of every synced buffer:
 | `gdocs-push-backend`      | `ot-encode` | Push strategy; see [Push backends](#push-backends).      |
 | `gdocs-auto-sync-interval`| `5`         | Seconds between periodic background sync checks.         |
 | `gdocs-log-level`         | `warn`      | One of `debug`, `info`, `warn`, `error`.                |
-| `gdocs-session-file`      | XDG cache   | Where the persistent `/save` SID + request id are kept. |
+| `gdocs-session-file`      | `$XDG_CACHE_HOME/gdocs-mode/session.eld`, or `~/.cache/gdocs-mode/session.eld` | Where the persistent `/save` SID + request id are kept. |
+| `gdocs-default-user-agent` | Firefox 138 on macOS | User-Agent sent with requests. |
+| `gdocs-pull-flash-duration` | `0.8` | Seconds for the pull-change highlight fade. |
+| `gdocs-pull-flash-steps` | `12` | Number of pull-change highlight fade steps. |
 
 ## Offline development tests
 
@@ -265,15 +287,17 @@ and compilation prerequisites even when invoked with `make -j check`.
 
 ## Caveats
 
-- **Cookie-only push.** The write path matches a real browser request and
-depends on a live Firefox/OAuth session; there is no hardened credential
-story yet.
+- **Cookie-only push.** The `/save` write path matches a real browser request
+and requires browser-session cookie authentication. OAuth bearer tokens can be
+used for reads but do not support `/save`; there is no hardened credential story
+yet.
 - **Format fidelity is best-effort.** Headings, paragraphs, inline emphasis,
 lists, tables, and code blocks round-trip. Inline images are pull-only
 placeholders; downloading, uploading, moving, replacing, and deleting them
 through push are unsupported except for safe incremental text edits that prove
-the image was left untouched. Comments are pulled as a read-only footnote and
-`* Comments` projection, stripped before push, and cannot be edited or pushed.
+the image was left untouched. Comments are pulled as an editable local-only footnote and `* Comments`
+projection. It is stripped before push, local edits are never sent to Google, and
+the next pull regenerates it from remote comments.
 Suggestions and column layouts remain out of scope.
 - **Rate limiting.** Google's `/save` endpoint rejects malformed or
 excessively bursty requests; the mode persists a session SID to look like a
