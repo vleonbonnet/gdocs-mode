@@ -1076,7 +1076,76 @@ END is the inclusive final OT position."
     (should (equal ot-body "Linked title\nAn italic subtitle with code\n"))
     (should (string-prefix-p
              "#+title: [[https://title.example][*Linked title*]]"
-             rendered))))
+              rendered))))
+
+(ert-deftest gdocs-test-title-and-subtitle-preserve-unsupported-inline-leaves ()
+  "Visible unsupported inline constructs remain in body keywords."
+  (let* ((value (concat "Greek \\alpha{} math $x^2$ at <2026-07-23 Thu> "
+                        "src_emacs-lisp{(+ 1 2)} \\copy [fn:note] "
+                        "<<anchor>> {{{macro(arg)}}} @@html:<mark>@@ "
+                        "@@gdocs-inline-object:broken@@"))
+         (source (format "#+title: %s\n#+subtitle: %s\n" value value))
+         (doc (gdocs-dm-from-org source))
+         (paragraphs (gdocs-dm-paragraphs doc)))
+    (should (equal (mapcar (lambda (paragraph)
+                             (gdocs-dm-runs-text
+                              (plist-get paragraph :runs)))
+                           paragraphs)
+                   (list value value)))
+    (should (equal (mapcar (lambda (paragraph)
+                             (plist-get paragraph :kind))
+                           paragraphs)
+                   '(:title :subtitle)))))
+
+(ert-deftest gdocs-test-rich-keywords-preserve-unsupported-leaves-in-context ()
+  "Unsupported leaves inherit styles and links without duplicating text."
+  (let* ((source
+          (concat
+           "#+title: Before *bold <2026-07-23 Thu> and $x^2$* "
+           "[[https://example.test][linked \\alpha{} and [fn:note]]] after\n"
+           "#+subtitle: /subtitle src_emacs-lisp{(+ 1 2)} text/\n"))
+         (doc (gdocs-dm-from-org source))
+         (title-runs (plist-get (car (gdocs-dm-paragraphs doc)) :runs))
+         (subtitle-runs (plist-get (cadr (gdocs-dm-paragraphs doc)) :runs))
+         (title-text (gdocs-dm-runs-text title-runs))
+         (subtitle-text (gdocs-dm-runs-text subtitle-runs)))
+    (should (equal title-text
+                   (concat "Before bold <2026-07-23 Thu> and $x^2$ "
+                           "linked \\alpha{} and [fn:note] after")))
+    (should (equal subtitle-text
+                   "subtitle src_emacs-lisp{(+ 1 2)} text"))
+    (should (cl-some
+             (lambda (run)
+               (and (string-match-p "<2026-07-23 Thu>"
+                                    (or (plist-get run :text) ""))
+                    (memq :bold (plist-get run :styles))))
+             title-runs))
+    (should (cl-some
+             (lambda (run)
+               (and (string-match-p "\\\\alpha{}"
+                                    (or (plist-get run :text) ""))
+                    (equal (plist-get run :link)
+                           "https://example.test")))
+             title-runs))
+    (should (cl-every
+             (lambda (run) (memq :italic (plist-get run :styles)))
+             subtitle-runs))))
+
+(ert-deftest gdocs-test-unsupported-rich-keywords-render-parse-stably ()
+  "Degraded visible text remains stable across model and Org rendering."
+  (let* ((source
+          (concat
+           "#+title: \\alpha{} $x^2$ <2026-07-23 Thu> "
+           "src_emacs-lisp{(+ 1 2)} [fn:note]\n"
+           "#+subtitle: *Styled \\copy* [[https://example.test][/$y$/]]\n"))
+         (original (gdocs-dm-from-org source))
+         (rendered (gdocs-dm-to-org original))
+         (round-tripped (gdocs-dm-from-org rendered)))
+    (should (equal (gdocs-test--model-view original)
+                   (gdocs-test--model-view round-tripped)))
+    (should (equal (gdocs-test--normalize-org rendered)
+                   (gdocs-test--normalize-org
+                    (gdocs-dm-to-org round-tripped))))))
 
 (ert-deftest gdocs-test-malformed-org-title-preserves-visible-text ()
   "Malformed inline markup does not turn a Title paragraph into nothing."

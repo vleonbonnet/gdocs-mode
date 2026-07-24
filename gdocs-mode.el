@@ -2963,11 +2963,27 @@ a different document-model value."
     (replace-regexp-in-string
      (regexp-quote "\\linebreak{}") "\n" text t t)))
 
+(defun gdocs--org-element-visible-text (el inherited-link table-cell)
+  "Return the source-visible text of inline leaf element EL, or nil."
+  (let* ((begin (org-element-property :begin el))
+         (end (org-element-property :end el))
+         (source (and (integerp begin)
+                      (integerp end)
+                      (<= (point-min) begin end (point-max))
+                      (buffer-substring-no-properties begin end)))
+         (source (or source
+                     (condition-case nil
+                         (org-element-interpret-data el)
+                       (error nil)))))
+    (when (and (stringp source) (not (string-empty-p source)))
+      (gdocs--unescape-org-inline source inherited-link table-cell))))
+
 (defun gdocs--element-runs
-    (el &optional inherited-styles inherited-link table-cell)
+    (el &optional inherited-styles inherited-link table-cell visible-fallback)
   "Walk inline ORG-ELEMENT EL and return a flat list of runs.
 INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers.
-TABLE-CELL enables the table-only escapes for embedded newlines."
+TABLE-CELL enables the table-only escapes for embedded newlines.
+VISIBLE-FALLBACK preserves unsupported leaf source as plain text."
   (cond
    ((stringp el)
     (if (string-empty-p el)
@@ -2983,14 +2999,21 @@ TABLE-CELL enables the table-only escapes for embedded newlines."
            (contents (cddr el))
            (style (cdr (assq type gdocs--org-element-styles))))
       (cond
-       ((and (eq type 'export-snippet)
-             (string= (downcase (format "%s"
-                                        (or (plist-get props :backend)
-                                            (plist-get props :back-end))))
-                      "gdocs-inline-object"))
-        (let ((object (gdocs--parse-inline-object-spec
-                       (plist-get props :value))))
-          (when object (list (list :inline-object object)))))
+        ((and (eq type 'export-snippet)
+              (string= (downcase (format "%s"
+                                         (or (plist-get props :backend)
+                                             (plist-get props :back-end))))
+                       "gdocs-inline-object"))
+         (let ((object (gdocs--parse-inline-object-spec
+                        (plist-get props :value))))
+           (cond
+            (object (list (list :inline-object object)))
+            (visible-fallback
+             (let ((text (gdocs--org-element-visible-text
+                          el inherited-link table-cell)))
+               (when text
+                 (list (gdocs-dm-make-run
+                        text inherited-styles inherited-link))))))))
        ((eq type 'link)
         (let* ((path (plist-get props :path))
                (kind (plist-get props :type))
@@ -3004,7 +3027,7 @@ TABLE-CELL enables the table-only escapes for embedded newlines."
                          (cl-mapcan
                           (lambda (c)
                             (gdocs--element-runs c inherited-styles url
-                                                 table-cell))
+                                                 table-cell visible-fallback))
                           contents)
                        ;; Bare link with no description.
                        (list (gdocs-dm-make-run (or url path)
@@ -3025,31 +3048,42 @@ TABLE-CELL enables the table-only escapes for embedded newlines."
                  (gdocs--unescape-org-inline
                   props (and inherited-link t) table-cell)
                  inherited-styles inherited-link))))
-       ((eq type 'entity)
-        (let* ((value (or (plist-get props :utf-8)
-                          (plist-get props :ascii)))
-               (runs (when (and table-cell (stringp value))
+        ((eq type 'entity)
+         (let* ((value (and table-cell
+                            (or (plist-get props :utf-8)
+                                (plist-get props :ascii))))
+                (text (or value
+                          (and visible-fallback
+                               (gdocs--org-element-visible-text
+                                el inherited-link table-cell))))
+                (runs (when (stringp text)
+                        (list (gdocs-dm-make-run
+                               text inherited-styles inherited-link))))
+                (post-blank (org-element-property :post-blank el)))
+           (if (and table-cell runs
+                    (integerp post-blank) (> post-blank 0))
+               (append runs
                        (list (gdocs-dm-make-run
-                              value inherited-styles inherited-link))))
-               (post-blank (org-element-property :post-blank el)))
-          (if (and runs (integerp post-blank) (> post-blank 0))
-              (append runs
-                      (list (gdocs-dm-make-run
-                             (make-string post-blank ?\s)
+                              (make-string post-blank ?\s)
                              inherited-styles inherited-link)))
             runs)))
-       ((eq type 'latex-fragment)
-        (let* ((value (plist-get props :value))
-               (runs (when (and table-cell (stringp value))
+        ((eq type 'latex-fragment)
+         (let* ((value (and table-cell (plist-get props :value)))
+                (text (or value
+                          (and visible-fallback
+                               (gdocs--org-element-visible-text
+                                el inherited-link table-cell))))
+                (runs (when (stringp text)
+                        (list (gdocs-dm-make-run
+                               (if (string= text "\\linebreak{}")
+                                   "\n" text)
+                               inherited-styles inherited-link))))
+                (post-blank (org-element-property :post-blank el)))
+           (if (and table-cell runs
+                    (integerp post-blank) (> post-blank 0))
+               (append runs
                        (list (gdocs-dm-make-run
-                              (if (string= value "\\linebreak{}")
-                                  "\n" value)
-                              inherited-styles inherited-link))))
-               (post-blank (org-element-property :post-blank el)))
-          (if (and runs (integerp post-blank) (> post-blank 0))
-              (append runs
-                      (list (gdocs-dm-make-run
-                             (make-string post-blank ?\s)
+                              (make-string post-blank ?\s)
                              inherited-styles inherited-link)))
             runs)))
        (style
@@ -3067,7 +3101,8 @@ TABLE-CELL enables the table-only escapes for embedded newlines."
                            styles inherited-link))
                   (cl-mapcan
                    (lambda (c)
-                     (gdocs--element-runs c styles inherited-link table-cell))
+                     (gdocs--element-runs c styles inherited-link table-cell
+                                          visible-fallback))
                    contents)))
                ;; Org-element consumes the post-character whitespace
                ;; after the closing marker into the emphasis element
@@ -3081,18 +3116,28 @@ TABLE-CELL enables the table-only escapes for embedded newlines."
                              (make-string post-blank ?\s)
                              inherited-styles inherited-link)))
             runs)))
-       (t
-        (cl-mapcan
-         (lambda (c)
-           (gdocs--element-runs c inherited-styles inherited-link table-cell))
-         contents)))))))
+        (t
+         (if contents
+             (cl-mapcan
+              (lambda (c)
+                (gdocs--element-runs c inherited-styles inherited-link
+                                     table-cell visible-fallback))
+              contents)
+           (let ((text (and visible-fallback
+                            (gdocs--org-element-visible-text
+                             el inherited-link table-cell))))
+             (when text
+               (list (gdocs-dm-make-run
+                      text inherited-styles inherited-link)))))))))))
 
-(defun gdocs--paragraph-content-runs (par)
+(defun gdocs--paragraph-content-runs (par &optional visible-fallback)
   "Return the runs of an org `paragraph' element PAR, trimming the
-trailing newline that org-element keeps at the end of each paragraph."
+trailing newline that org-element keeps at the end of each paragraph.
+VISIBLE-FALLBACK is passed to `gdocs--element-runs'."
   (let ((runs (cl-mapcan
-               (lambda (c) (gdocs--element-runs c nil nil))
-               (cddr par))))
+                (lambda (c)
+                  (gdocs--element-runs c nil nil nil visible-fallback))
+                (cddr par))))
     ;; Strip a single trailing newline from the last run if present.
     (when runs
       (let* ((tail (last runs))
@@ -3118,14 +3163,16 @@ trailing newline that org-element keeps at the end of each paragraph."
                        (string-empty-p (or (plist-get r :text) ""))))
                 runs)))
 
-(defun gdocs--org-inline-content-runs (text)
+(defun gdocs--org-inline-content-runs (text &optional visible-fallback)
   "Parse TEXT as inline Org content and return its doc-model runs.
 
 TEXT is placed in a temporary paragraph before being parsed, so keyword
 prefixes are never included in the returned runs.  A zero-width prefix keeps
 TEXT that happens to start with Org block syntax (for example `* heading') in
-that paragraph.  If Org cannot produce a paragraph, or parsing fails, return
-TEXT as one unstyled run instead of silently dropping visible content."
+that paragraph.  If VISIBLE-FALLBACK is non-nil, unsupported leaf elements
+retain their source-visible text.  If Org cannot produce a paragraph, or
+parsing fails, return TEXT as one unstyled run instead of silently dropping
+visible content."
   (when (and (stringp text) (not (string-empty-p text)))
     (let ((fallback
            (list (gdocs-dm-make-run (substring-no-properties text))))
@@ -3151,8 +3198,9 @@ TEXT as one unstyled run instead of silently dropping visible content."
                             (and (consp element)
                                  (eq (car element) 'paragraph)))
                           (cddr section))))
-                   (runs (and paragraph
-                              (gdocs--paragraph-content-runs paragraph)))
+                    (runs (and paragraph
+                               (gdocs--paragraph-content-runs
+                                paragraph visible-fallback)))
                    (first (car runs))
                    (first-text (and first (plist-get first :text))))
               (if (and (stringp first-text)
@@ -3501,7 +3549,7 @@ caller can distinguish meaningful blank lines from heading padding."
        (cond
         ((member key '("title" "subtitle"))
          (let ((para (list :kind (if (equal key "title") :title :subtitle)
-                           :runs (gdocs--org-inline-content-runs val))))
+                            :runs (gdocs--org-inline-content-runs val t))))
            (list (if source-spans
                      (gdocs--org-annotate-paragraph
                       para (gdocs--org-element-line-number el)
