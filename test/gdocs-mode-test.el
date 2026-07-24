@@ -2703,6 +2703,77 @@ that a removed preflight guard would be observed as an unexpected success."
     (should (string-match-p "intersects" message))
     (should (string-match-p "1 inline image" message))))
 
+(ert-deftest gdocs-test-capability-range-insertion-boundaries ()
+  "Insertion ranges use before-position semantics at inclusive boundaries."
+  (let ((report '(:ot-start 3 :ot-end 5)))
+    (dolist (case '((3 nil) (4 t) (5 t) (6 nil)))
+      (let* ((at (car case))
+             (range (car (gdocs--push-plan-ranges
+                          '(:ot-body "abcdef") "abcdef"
+                          (concat (substring "abcdef" 0 (1- at))
+                                  "X"
+                                  (substring "abcdef" (1- at)))))))
+        (should (= (plist-get range :insert-at) at))
+        (should (eq (not (null (gdocs--capability-range-touched-p
+                                report (list range))))
+                    (cadr case)))))
+    (should (gdocs--capability-range-touched-p
+             report
+             '((:ot-start 7 :ot-end 7 :insert-at 5 :delete-count 1))))
+    (should (gdocs--capability-range-touched-p
+             report
+             '((:ot-start 5 :ot-end 5 :insert-at 6 :delete-count 1))))
+    (should-not (gdocs--capability-range-touched-p
+                 report
+                 '((:ot-start 6 :ot-end 6 :insert-at 6 :delete-count 1)))))
+  (let ((one-character '(:ot-start 3 :ot-end 3)))
+    (should-not (gdocs--capability-range-touched-p
+                 one-character
+                 '((:ot-start 3 :ot-end 3 :insert-at 3 :delete-count 0))))
+    (should-not (gdocs--capability-range-touched-p
+                 one-character
+                 '((:ot-start 4 :ot-end 4 :insert-at 4 :delete-count 0))))))
+
+(ert-deftest gdocs-test-capability-insertion-protects-style-and-comment-ranges ()
+  "Style and comment ranges reject only insertions that enter their span."
+  (let* ((body "abcdef")
+         (insert-op (gdocs-test--insert-op body)))
+    (dolist (attribute
+             '(((ty . "as") (st . "text") (si . 3) (ei . 5)
+                (sm . ((ts_fs . 12.0))))
+               ((ty . "as") (st . "doco_anchor") (si . 3) (ei . 5)
+                (sm . ((doco_a . "synthetic-comment"))))))
+      (let ((state (list :revision 7 :ot-body body
+                         :ot-ops (list insert-op attribute))))
+        (should (gdocs--push-preflight-insertion state 3 "X"))
+        (should-error (gdocs--push-preflight-insertion state 4 "X")
+                      :type 'user-error)
+        (should-error (gdocs--push-preflight-insertion state 5 "X")
+                      :type 'user-error)
+        (should (gdocs--push-preflight-insertion state 6 "X"))))))
+
+(ert-deftest gdocs-test-capability-insertion-around-inline-object-is-safe ()
+  "A one-position inline object permits insertion immediately before or after."
+  (let* ((state (gdocs-test--inline-state "one-image-between-paragraphs"))
+         (report (seq-find
+                  (lambda (entry)
+                    (eq (plist-get entry :kind) :inline-image))
+                  (plist-get (gdocs--remote-capability-analysis state)
+                             :unsupported)))
+         (start (plist-get report :ot-start))
+         (end (plist-get report :ot-end)))
+    (should report)
+    (should (= start end))
+    (should (gdocs--push-preflight-insertion state start "X"))
+    (should (gdocs--push-preflight-insertion state (1+ end) "X"))
+    (should-error
+     (gdocs--push-preflight
+      state "X"
+      (list :kind :incremental :inline-object-scope :partial
+            :ranges (list (list :ot-start start :ot-end end
+                                :insert-at start :delete-count 1))))
+     :type 'user-error)))
+
 (ert-deftest gdocs-test-capability-preflight-redecodes-fresh-remote-state ()
   "Raw capabilities from a fresh remote state override stale local summaries."
   (let ((gdocs--sync-mutex t)

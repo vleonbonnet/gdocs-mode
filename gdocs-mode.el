@@ -5447,9 +5447,10 @@ one-to-one proof must use `gdocs--capability-object-matching-errors'."
   "Return non-nil when an edit in RANGES touches REPORT.
 
 Each range is a plist with `:ot-start' and `:ot-end' inclusive for deleted
-content, `:delete-count', and optional `:insert-at'. Insertions strictly
-inside a capability range touch it; insertions at a boundary do not. Any
-deletion that overlaps the range touches it."
+content, `:delete-count', and optional `:insert-at'. An insertion at N occurs
+before OT position N, so it touches inclusive range [START, END] exactly when
+START < N <= END. Thus neither adjacent insertion touches a one-position
+range. Any deletion that overlaps the range touches it."
   (let ((cap-range (gdocs--capability-report-range report)))
     (and cap-range
          (cl-some
@@ -5462,10 +5463,9 @@ deletion that overlaps the range touches it."
                    (or (and (> delete-count 0)
                             (<= (car cap-range) end)
                             (<= start (cdr cap-range)))
-                       (and (= delete-count 0)
-                            (integerp insert-at)
-                            (> insert-at (car cap-range))
-                            (< insert-at (cdr cap-range)))))))
+                        (and (integerp insert-at)
+                             (> insert-at (car cap-range))
+                             (<= insert-at (cdr cap-range)))))))
           ranges))))
 
 (defun gdocs--inline-markers-as-ot-placeholders (text)
