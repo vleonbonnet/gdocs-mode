@@ -956,6 +956,77 @@ END is the inclusive final OT position."
                       (cdr built)))
     (should (equal org (gdocs-dm-to-org org-round-trip)))))
 
+(ert-deftest gdocs-test-org-table-cells-preserve-unsupported-inline-text ()
+  "Unsupported table objects remain visible without flattening rich runs."
+  (let* ((source
+          (concat
+           "| <2026-07-23 Thu> | [fn:note] | $x^2$ | "
+           "src_emacs-lisp{(+ 1 2)} | \\alpha{} |\n"
+           "| before *bold <2026-07-24 Fri> and $y$* "
+           "[[https://example.test][linked $z$]] after | | | | |\n"))
+         (doc (gdocs-dm-from-org source))
+         (rows (plist-get (car (gdocs-dm-paragraphs doc)) :rows))
+         (first (mapcar #'gdocs-test--cell-view (car rows)))
+         (mixed (gdocs-test--cell-view (car (cadr rows)))))
+    (should (equal (mapcar (lambda (cell)
+                            (mapconcat #'car cell ""))
+                          first)
+                   '("<2026-07-23 Thu>"
+                     "[fn:note]"
+                     "$x^2$"
+                     "src_emacs-lisp{(+ 1 2)}"
+                     "\\alpha{}")))
+    (should (equal (mapconcat #'car mixed "")
+                   (concat "before bold <2026-07-24 Fri> and $y$ "
+                           "linked $z$ after")))
+    (should (cl-some
+             (lambda (run)
+               (and (string-match-p "<2026-07-24 Fri>"
+                                    (or (car run) ""))
+                    (memq :bold (cadr run))))
+             mixed))
+    (should (cl-some
+             (lambda (run)
+               (and (string-match-p (regexp-quote "$z$") (or (car run) ""))
+                    (equal (nth 2 run) "https://example.test")))
+             mixed))
+    (should-not (gdocs-test--cell-view (cadr (cadr rows))))))
+
+(ert-deftest gdocs-test-unsupported-table-text-round-trips-to-org-and-ot ()
+  "Degraded cell text remains visible through Org and OT conversions."
+  (let* ((source
+          (concat "| <2026-07-23 Thu> [fn:note] $x^2$ "
+                  "src_emacs-lisp{(+ 1 2)} \\alpha{} | |\n"))
+         (original (gdocs-dm-from-org source))
+         (rendered (gdocs-dm-to-org original))
+         (round-tripped (gdocs-dm-from-org rendered))
+         (original-table (car (gdocs-dm-paragraphs original)))
+         (round-trip-table (car (gdocs-dm-paragraphs round-tripped)))
+         (original-cells (car (plist-get original-table :rows)))
+         (round-trip-cells (car (plist-get round-trip-table :rows)))
+         (built (gdocs-dm-to-ot original))
+         (visible (mapconcat #'car
+                             (gdocs-test--cell-view (car original-cells)) "")))
+    (should (equal (mapcar #'gdocs-test--cell-view original-cells)
+                   (mapcar #'gdocs-test--cell-view round-trip-cells)))
+    (should-not (gdocs-test--cell-view (cadr round-trip-cells)))
+    (should (string-match-p (regexp-quote visible) (car built)))))
+
+(ert-deftest gdocs-test-remote-looking-inline-source-stays-plain-in-table ()
+  "Remote plain text is not promoted to executable inline behavior."
+  (let* ((text "src_emacs-lisp{(error \"must not run\")}")
+         (doc (gdocs-dm-make-doc
+               :paragraphs
+               (list (list :kind :table :cols 1
+                           :rows (list (list
+                                        (list (list
+                                               (gdocs-dm-make-run text)))))))))
+         (round-tripped (gdocs-dm-from-org (gdocs-dm-to-org doc)))
+         (cell (caar (plist-get (car (gdocs-dm-paragraphs round-tripped))
+                                  :rows)))
+         (runs (gdocs-test--cell-view cell)))
+    (should (equal runs (list (list text nil nil))))))
+
 (ert-deftest gdocs-test-table-safe-literal-pipes-and-newlines ()
   "Literal cell pipes and newlines use valid, reversible Org escapes."
   (let* ((table

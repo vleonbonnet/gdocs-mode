@@ -2964,7 +2964,7 @@ a different document-model value."
      (regexp-quote "\\linebreak{}") "\n" text t t)))
 
 (defun gdocs--org-element-visible-text (el inherited-link table-cell)
-  "Return the source-visible text of inline leaf element EL, or nil."
+  "Return the source-visible text of inline element EL, or nil."
   (let* ((begin (org-element-property :begin el))
          (end (org-element-property :end el))
          (source (and (integerp begin)
@@ -2978,12 +2978,24 @@ a different document-model value."
     (when (and (stringp source) (not (string-empty-p source)))
       (gdocs--unescape-org-inline source inherited-link table-cell))))
 
+(defun gdocs--org-table-escape-value (el)
+  "Return the literal value of a renderer-generated table escape EL."
+  (let ((end (org-element-property :end el)))
+    (when (and (integerp end)
+               (< end (point-max))
+               (= (char-after end) #x200b))
+      (pcase (car el)
+        ('entity
+         (and (string= (plist-get (cadr el) :name) "vert") "|"))
+        ('latex-fragment
+         (and (string= (plist-get (cadr el) :value) "\\linebreak{}") "\n"))))))
+
 (defun gdocs--element-runs
     (el &optional inherited-styles inherited-link table-cell visible-fallback)
   "Walk inline ORG-ELEMENT EL and return a flat list of runs.
 INHERITED-STYLES and INHERITED-LINK are inherited from outer wrappers.
 TABLE-CELL enables the table-only escapes for embedded newlines.
-VISIBLE-FALLBACK preserves unsupported leaf source as plain text."
+VISIBLE-FALLBACK preserves unsupported source as plain text."
   (cond
    ((stringp el)
     (if (string-empty-p el)
@@ -3049,38 +3061,39 @@ VISIBLE-FALLBACK preserves unsupported leaf source as plain text."
                   props (and inherited-link t) table-cell)
                  inherited-styles inherited-link))))
         ((eq type 'entity)
-         (let* ((value (and table-cell
-                            (or (plist-get props :utf-8)
-                                (plist-get props :ascii))))
-                (text (or value
-                          (and visible-fallback
-                               (gdocs--org-element-visible-text
-                                el inherited-link table-cell))))
+          (let* ((text (or (and table-cell
+                                (gdocs--org-table-escape-value el))
+                           (and visible-fallback
+                                (gdocs--org-element-visible-text
+                                 el inherited-link table-cell))
+                           (and table-cell
+                                (or (plist-get props :utf-8)
+                                    (plist-get props :ascii)))))
                 (runs (when (stringp text)
                         (list (gdocs-dm-make-run
                                text inherited-styles inherited-link))))
                 (post-blank (org-element-property :post-blank el)))
-           (if (and table-cell runs
-                    (integerp post-blank) (> post-blank 0))
+            (if (and table-cell runs (not visible-fallback)
+                     (integerp post-blank) (> post-blank 0))
                (append runs
                        (list (gdocs-dm-make-run
                               (make-string post-blank ?\s)
                              inherited-styles inherited-link)))
             runs)))
         ((eq type 'latex-fragment)
-         (let* ((value (and table-cell (plist-get props :value)))
-                (text (or value
-                          (and visible-fallback
-                               (gdocs--org-element-visible-text
-                                el inherited-link table-cell))))
-                (runs (when (stringp text)
-                        (list (gdocs-dm-make-run
-                               (if (string= text "\\linebreak{}")
-                                   "\n" text)
-                               inherited-styles inherited-link))))
+          (let* ((text (or (and table-cell
+                                (gdocs--org-table-escape-value el))
+                           (and visible-fallback
+                                (gdocs--org-element-visible-text
+                                 el inherited-link table-cell))
+                           (and table-cell (plist-get props :value))))
+                 (runs (when (stringp text)
+                         (list (gdocs-dm-make-run
+                                text
+                                inherited-styles inherited-link))))
                 (post-blank (org-element-property :post-blank el)))
-           (if (and table-cell runs
-                    (integerp post-blank) (> post-blank 0))
+            (if (and table-cell runs (not visible-fallback)
+                     (integerp post-blank) (> post-blank 0))
                (append runs
                        (list (gdocs-dm-make-run
                               (make-string post-blank ?\s)
@@ -3117,8 +3130,8 @@ VISIBLE-FALLBACK preserves unsupported leaf source as plain text."
                              inherited-styles inherited-link)))
             runs)))
         (t
-         (if contents
-             (cl-mapcan
+          (if (and contents (not (and table-cell visible-fallback)))
+              (cl-mapcan
               (lambda (c)
                 (gdocs--element-runs c inherited-styles inherited-link
                                      table-cell visible-fallback))
@@ -3431,8 +3444,8 @@ Each cell becomes (RUNS) — one element holding a list of runs."
                        (gdocs--trim-table-cell-runs
                         (cl-mapcan
                          (lambda (content)
-                           (gdocs--element-runs content nil nil t))
-                         (cddr sub)))))
+                            (gdocs--element-runs content nil nil t t))
+                          (cddr sub)))))
                   (push (list runs) cells))))
             (let ((row (nreverse cells)))
               (setq max-cols (max max-cols (length row)))
