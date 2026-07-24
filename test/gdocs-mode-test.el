@@ -6,8 +6,8 @@
 
 ;; These tests deliberately exercise the conversion boundaries with synthetic
 ;; OT streams.  No test in this file calls Google, resolves browser cookies,
-;; or writes a user's buffer or file.  The request shim is installed before
-;; the production source is loaded; synchronization tests stub the
+;; or writes a user's buffer or file.  Ordinary tests install the request shim
+;; before the production source is loaded; synchronization tests stub the
 ;; network-facing functions themselves.
 
 ;;; Code:
@@ -27,7 +27,12 @@
 (defconst gdocs-test--source-file
   (expand-file-name "../gdocs-mode.el" gdocs-test--directory))
 
-(load gdocs-test--request-shim-file nil nil t)
+(defconst gdocs-test--integration-variable "GDOCS_MODE_RUN_INTEGRATION"
+  "Environment variable that explicitly opts into integration tests.")
+
+(if (equal (getenv gdocs-test--integration-variable) "1")
+    (require 'request)
+  (load gdocs-test--request-shim-file nil nil t))
 
 (when (featurep 'gdocs-mode)
   (error "gdocs-mode was loaded before the test bootstrap"))
@@ -112,10 +117,48 @@
                              timing (buffer-string)))))))))
       (delete-directory directory t))))
 
-(defconst gdocs-test--integration-variable "GDOCS_MODE_RUN_INTEGRATION"
-  "Environment variable that explicitly opts into integration tests.")
-
 ;;; Fixture and synthetic OT helpers
+
+(defvar gdocs-test--suite-temp-directory nil
+  "Temporary root dynamically bound by the ordinary offline runner.")
+
+(defun gdocs-test--delete-suite-directory (directory)
+  "Delete the isolated test DIRECTORY and all files beneath it."
+  (when (file-exists-p directory)
+    (delete-directory directory t)))
+
+(ert-deftest gdocs-test-offline-production-boundaries-fail-closed ()
+  "Ordinary tests reject unstubbed request, curl, and auth access."
+  (should gdocs-test--suite-temp-directory)
+  (should-error (gdocs--curl-post "https://example.invalid" nil "body")
+                :type 'error)
+  (should-error (gdocs--curl-async "https://example.invalid" "GET" nil nil
+                                   #'ignore)
+                :type 'error)
+  (should-error (gdocs--auth-headers) :type 'error)
+  (let ((gdocs-auth-function (lambda () '(("Cookie" . "synthetic")))))
+    (should-error (gdocs--make-request "https://example.invalid" "GET")
+                  :type 'error)))
+
+(ert-deftest gdocs-test-session-state-is-temporary ()
+  "Session persistence stays beneath the suite root and is removable."
+  (should gdocs-test--suite-temp-directory)
+  (should (file-in-directory-p gdocs-session-file
+                               gdocs-test--suite-temp-directory))
+  (let ((gdocs--session-sid nil)
+        (gdocs--session-req-id nil))
+    (should (= (gdocs--session-next-reqid) 1))
+    (should (file-exists-p gdocs-session-file))))
+
+(ert-deftest gdocs-test-suite-directory-cleanup-removes-persistent-state ()
+  "The suite cleanup removes temporary persistent outputs recursively."
+  (let* ((directory (make-temp-file "gdocs-mode-cleanup-test-" t))
+         (state (expand-file-name "state/session.eld" directory)))
+    (make-directory (file-name-directory state) t)
+    (with-temp-file state
+      (insert "synthetic state"))
+    (gdocs-test--delete-suite-directory directory)
+    (should-not (file-exists-p directory))))
 
 (defun gdocs-test--fixture (name)
   "Read the single sanitized fixture named NAME from `fixtures/'."

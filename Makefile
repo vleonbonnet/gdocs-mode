@@ -4,13 +4,14 @@ REQUEST_DIR ?=
 EMACS_BATCH = $(EMACS) -Q --batch -L "$(ROOT_DIR)" -L "$(ROOT_DIR)/test"
 SOURCE_FILE = $(ROOT_DIR)/gdocs-mode.el
 TEST_FILE = $(ROOT_DIR)/test/gdocs-mode-test.el
+TEST_RUNNER = $(ROOT_DIR)/test/gdocs-mode-test-runner.el
 TEST_REQUEST_SHIM = $(ROOT_DIR)/test/gdocs-mode-test-request.el
 COMPILE_DRIVER = $(ROOT_DIR)/test/gdocs-mode-compile.el
 
 .PHONY: test byte-compile request-compile-check check integration space-path-check
 .NOTPARALLEL: check
 
-test: ; $(EMACS_BATCH) -l "$(TEST_FILE)" --eval '(ert-run-tests-batch-and-exit (quote (not (tag integration))))'
+test: ; $(EMACS_BATCH) -l "$(TEST_RUNNER)"
 
 byte-compile:
 	@set -e; \
@@ -71,4 +72,6 @@ space-path-check:
 # This target only exercises the explicit ERT integration selector.  The
 # repository ships no live credential tests; future local tests must opt in
 # with the same variable and remain responsible for their own credentials.
-integration: ; GDOCS_MODE_RUN_INTEGRATION=1 $(EMACS_BATCH) -l "$(TEST_FILE)" --eval '(ert-run-tests-batch-and-exit (quote (tag integration)))'
+integration:
+	@test -n "$(REQUEST_DIR)" || { printf '%s\n' 'REQUEST_DIR is required for the opt-in integration target' >&2; exit 1; }
+	GDOCS_MODE_RUN_INTEGRATION=1 $(EMACS_BATCH) -L "$(REQUEST_DIR)" -l "$(TEST_FILE)" --eval '(ert-run-tests-batch-and-exit (quote (tag integration)))'
