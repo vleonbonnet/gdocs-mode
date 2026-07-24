@@ -117,6 +117,12 @@ Default `warn' keeps *Messages* quiet during normal pull/push; set to
 (defvar-local gdocs--sync-timer nil
   "Idle timer for auto-sync in this buffer.")
 
+(defvar-local gdocs--auto-sync-in-flight nil
+  "Identity token for the edit-state probe currently in flight.")
+
+(defvar-local gdocs--auto-sync-generation 0
+  "Generation of the current auto-sync lifecycle.")
+
 (defvar gdocs--sync-mutex nil
   "Global mutex for sync operations.")
 
@@ -8581,78 +8587,101 @@ transient network blip doesn't disable auto-sync."
           (gdocs-log 'warn
                      "Auto-sync skipped for %s: synchronization baseline unavailable; run `gdocs-pull-locally' or `gdocs-push-remotely' manually"
                      doc-id)
-        (let ((buf (current-buffer)))
-          (gdocs--fetch-edit-state-async
-           doc-id
-           (lambda (state err)
-             (cond
-              (err
-               (gdocs-log 'warn "Auto-sync state fetch failed for %s: %s"
-                          doc-id err))
-              ((null state)
-               (gdocs-log 'warn
-                          "Auto-sync skipped for %s: remote revision unavailable"
-                          doc-id))
-               ((buffer-live-p buf)
-                (with-current-buffer buf
-                  (let* ((remote-rev (plist-get state :revision))
-                         (local-rev
-                          (org-entry-get (point-min) "GDOC_REVISION" t))
-                         (remote-rev-number
-                          (cond
-                           ((integerp remote-rev) remote-rev)
-                           ((and (stringp remote-rev)
-                                 (string-match-p "\\`[0-9]+\\'" remote-rev))
-                            (string-to-number remote-rev))))
-                         (local-rev-number
-                          (and (stringp local-rev)
-                               (string-match-p "\\`[0-9]+\\'" local-rev)
-                               (string-to-number local-rev)))
-                         (have-revs (and (numberp remote-rev-number)
-                                         (numberp local-rev-number)))
-                         (stale (and have-revs
-                                     (/= remote-rev-number local-rev-number)))
-                         (sync-state (gdocs--sync-state))
-                         (dirty (eq sync-state 'dirty)))
-                    (cond
-                     ((eq sync-state 'unknown)
-                      (gdocs-log 'warn
-                                 "Auto-sync skipped for %s: synchronization baseline unavailable; run `gdocs-pull-locally' or `gdocs-push-remotely' manually"
-                                 doc-id))
-                     ((not have-revs)
-                      (gdocs-log 'warn
-                                 "Auto-sync skipped for %s: revision unavailable (remote=%S local=%S)"
-                                 doc-id remote-rev local-rev))
-                     ((and stale dirty)
-                      (unless (equal gdocs--auto-sync-conflict-revision
-                                     remote-rev-number)
-                        (setq gdocs--auto-sync-conflict-revision
-                              remote-rev-number)
-                        (gdocs-log
-                         'warn
-                         "Auto-sync conflict for %s at remote revision %s: local and remote changed; neither pull nor push was performed. Resolve the changes, then run `gdocs-pull-locally' or `gdocs-push-remotely'."
-                         doc-id remote-rev-number)))
-                     (t
-                      ;; A valid non-conflicting state means an earlier conflict
-                      ;; no longer applies, even if the subsequent sync fails.
-                      (setq gdocs--auto-sync-conflict-revision nil)
-                      (cond
-                       (stale
-                        (gdocs-pull-locally
-                         doc-id
-                         (lambda (_body p-err)
-                           (when (and (not p-err) (buffer-live-p buf))
-                             (with-current-buffer buf
-                               (gdocs-log 'info "Auto-pulled %s to rev %S"
-                                          doc-id remote-rev-number))))))
-                       (dirty
-                        (gdocs-log 'info "Auto-pushing %s (local edits)"
-                                   doc-id)
-                        (gdocs-push-remotely doc-id))))))))))))))))
+        (let ((buf (current-buffer))
+              (generation gdocs--auto-sync-generation)
+              (token (list nil)))
+          (unless gdocs--auto-sync-in-flight
+            (setq gdocs--auto-sync-in-flight token)
+            (condition-case fetch-error
+                (gdocs--fetch-edit-state-async
+                 doc-id
+                 (lambda (state err)
+                   (when (buffer-live-p buf)
+                     (with-current-buffer buf
+                       (when (and (bound-and-true-p gdocs-mode)
+                                  (= generation gdocs--auto-sync-generation)
+                                  (eq token gdocs--auto-sync-in-flight))
+                         (setq gdocs--auto-sync-in-flight nil)
+                         (cond
+                          (err
+                           (gdocs-log 'warn
+                                      "Auto-sync state fetch failed for %s: %s"
+                                      doc-id err))
+                          ((null state)
+                           (gdocs-log 'warn
+                                      "Auto-sync skipped for %s: remote revision unavailable"
+                                      doc-id))
+                          (t
+                           (let* ((remote-rev (plist-get state :revision))
+                                  (local-rev
+                                   (org-entry-get (point-min) "GDOC_REVISION" t))
+                                  (remote-rev-number
+                                   (cond
+                                    ((integerp remote-rev) remote-rev)
+                                    ((and (stringp remote-rev)
+                                          (string-match-p "\\`[0-9]+\\'" remote-rev))
+                                     (string-to-number remote-rev))))
+                                  (local-rev-number
+                                   (and (stringp local-rev)
+                                        (string-match-p "\\`[0-9]+\\'" local-rev)
+                                        (string-to-number local-rev)))
+                                  (have-revs (and (numberp remote-rev-number)
+                                                  (numberp local-rev-number)))
+                                  (stale (and have-revs
+                                              (/= remote-rev-number local-rev-number)))
+                                  (sync-state (gdocs--sync-state))
+                                  (dirty (eq sync-state 'dirty)))
+                             (cond
+                              ((eq sync-state 'unknown)
+                               (gdocs-log 'warn
+                                          "Auto-sync skipped for %s: synchronization baseline unavailable; run `gdocs-pull-locally' or `gdocs-push-remotely' manually"
+                                          doc-id))
+                              ((not have-revs)
+                               (gdocs-log 'warn
+                                          "Auto-sync skipped for %s: revision unavailable (remote=%S local=%S)"
+                                          doc-id remote-rev local-rev))
+                              ((and stale dirty)
+                               (unless (equal gdocs--auto-sync-conflict-revision
+                                              remote-rev-number)
+                                 (setq gdocs--auto-sync-conflict-revision
+                                       remote-rev-number)
+                                 (gdocs-log
+                                  'warn
+                                  "Auto-sync conflict for %s at remote revision %s: local and remote changed; neither pull nor push was performed. Resolve the changes, then run `gdocs-pull-locally' or `gdocs-push-remotely'."
+                                  doc-id remote-rev-number)))
+                              (t
+                               ;; A valid non-conflicting state means an earlier conflict
+                               ;; no longer applies, even if the subsequent sync fails.
+                               (setq gdocs--auto-sync-conflict-revision nil)
+                               (cond
+                                (stale
+                                 (gdocs-pull-locally
+                                  doc-id
+                                  (lambda (_body p-err)
+                                    (when (and (not p-err) (buffer-live-p buf))
+                                      (with-current-buffer buf
+                                        (gdocs-log 'info "Auto-pulled %s to rev %S"
+                                                   doc-id remote-rev-number))))))
+                                (dirty
+                                 (gdocs-log 'info "Auto-pushing %s (local edits)"
+                                            doc-id)
+                                 (gdocs-push-remotely doc-id)))))))))))))
+            (error
+             (when (and (= generation gdocs--auto-sync-generation)
+                        (eq token gdocs--auto-sync-in-flight))
+               (setq gdocs--auto-sync-in-flight nil))
+             (gdocs-log 'warn "Auto-sync state fetch failed for %s: %s"
+                        doc-id (error-message-string fetch-error))))))))))
 
 (defun gdocs--enable ()
   (gdocs--restore-sync-baseline)
+  (when gdocs--sync-timer
+    (cancel-timer gdocs--sync-timer)
+    (setq gdocs--sync-timer nil))
+  (cl-incf gdocs--auto-sync-generation)
+  (setq gdocs--auto-sync-in-flight nil)
   (let* ((buf (current-buffer))
+         (generation gdocs--auto-sync-generation)
          (timer nil))
     (setq timer
           (run-with-timer
@@ -8661,16 +8690,23 @@ transient network blip doesn't disable auto-sync."
            (lambda ()
              (if (buffer-live-p buf)
                  (with-current-buffer buf
-                   (gdocs--auto-sync-tick))
+                   (if (and (bound-and-true-p gdocs-mode)
+                            (= generation gdocs--auto-sync-generation)
+                            (eq timer gdocs--sync-timer))
+                       (gdocs--auto-sync-tick)
+                     (when timer (cancel-timer timer))))
                (when timer (cancel-timer timer))))))
     (setq gdocs--sync-timer timer)
     (add-hook 'kill-buffer-hook #'gdocs--disable nil t))
   (gdocs-log 'info "gdocs-mode enabled"))
 
 (defun gdocs--disable ()
+  (cl-incf gdocs--auto-sync-generation)
+  (setq gdocs--auto-sync-in-flight nil)
   (when gdocs--sync-timer
     (cancel-timer gdocs--sync-timer)
     (setq gdocs--sync-timer nil))
+  (remove-hook 'kill-buffer-hook #'gdocs--disable t)
   (gdocs-log 'info "gdocs-mode disabled"))
 
 (defun gdocs--mode-line-indicator ()
