@@ -1044,6 +1044,62 @@ END is the inclusive final OT position."
                    (gdocs-test--model-view round-trip)))
     (should (equal org (gdocs-dm-to-org round-trip)))))
 
+(ert-deftest gdocs-test-table-unsentinelled-escape-forms-stay-literal ()
+  "User-written escape-shaped text is not decoded as table structure."
+  (let* ((text "literal \\linebreak{} and \\vert{}")
+         (doc (gdocs-dm-from-org (format "| %s |\n" text)))
+         (cell (caar (plist-get (car (gdocs-dm-paragraphs doc)) :rows))))
+    (should (equal (gdocs-test--cell-view cell)
+                   (list (list text nil nil))))))
+
+(ert-deftest gdocs-test-table-escape-encoding-preserves-literal-content ()
+  "Literal syntax, sentinels, pipes, and newlines round-trip together."
+  (let* ((sentinel gdocs--org-table-escape-sentinel)
+         (text (concat "slashes \\\\ braces {x}; literal \\linebreak{} and "
+                       "\\vert{}; sentinel " sentinel "; sentinel-like "
+                       sentinel "p/" sentinel "n; collisions \\vert{}"
+                       sentinel "p and \\linebreak{}" sentinel
+                       "n; generated | and\nnewline"))
+         (doc (gdocs-dm-make-doc
+               :paragraphs
+               (list (list :kind :table :cols 1
+                           :rows (list (list
+                                        (list (list
+                                               (gdocs-dm-make-run text)))))))))
+         (org (gdocs-dm-to-org doc))
+         (round-tripped (gdocs-dm-from-org org)))
+    (should (string-match-p
+             (regexp-quote (concat "\\vert{}"
+                                   gdocs--org-table-pipe-qualifier))
+             org))
+    (should (string-match-p
+             (regexp-quote (concat "\\linebreak{}"
+                                   gdocs--org-table-newline-qualifier))
+             org))
+    (should (string-match-p (regexp-quote (concat sentinel sentinel)) org))
+    (should (equal (gdocs-test--model-view doc)
+                   (gdocs-test--model-view round-tripped)))))
+
+(ert-deftest gdocs-test-table-escape-encoding-is-cycle-stable ()
+  "Repeated model-to-Org-to-model cycles preserve mixed escape content."
+  (let* ((sentinel gdocs--org-table-escape-sentinel)
+         (text (concat "\\linebreak{}|" sentinel "p\n\\vert{}" sentinel))
+         (model (gdocs-dm-make-doc
+                 :paragraphs
+                 (list (list :kind :table :cols 1
+                             :rows (list (list
+                                          (list (list
+                                                 (gdocs-dm-make-run text)))))))))
+         (expected (gdocs-test--model-view model))
+         first-org)
+    (dotimes (_ 4)
+      (let ((org (gdocs-dm-to-org model)))
+        (if first-org
+            (should (equal org first-org))
+          (setq first-org org))
+        (setq model (gdocs-dm-from-org org))))
+    (should (equal expected (gdocs-test--model-view model)))))
+
 (ert-deftest gdocs-test-table-inline-object-is-safe-and-not-emitted ()
   "An inline object in a cell remains marked and cannot be pushed as text."
   (let* ((object '(:kind :inline-object

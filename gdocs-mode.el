@@ -2439,6 +2439,18 @@ Order here matters only for emit-stability of nested wrappers.")
 (defconst gdocs--org-link-description-sentinel (string #x200b)
   "Invisible separator used to keep Org subscript/LaTeX syntax literal.")
 
+(defconst gdocs--org-table-escape-sentinel (string #x2063)
+  "Renderer-only sentinel for reversible Org table cell escapes.
+
+The table encoding is `\\vert{} Sp' for a pipe, `\\linebreak{} Sn' for a
+newline, and `SS' for a literal sentinel, where S is this character.")
+
+(defconst gdocs--org-table-pipe-qualifier
+  (concat gdocs--org-table-escape-sentinel "p"))
+
+(defconst gdocs--org-table-newline-qualifier
+  (concat gdocs--org-table-escape-sentinel "n"))
+
 (defun gdocs--escape-org-inline (text &optional escape-special)
   "Normalize TEXT for safe inline Org emission.
 
@@ -2615,18 +2627,21 @@ than per-run pairs."
   "Escape table delimiters in rendered cell TEXT.
 
 Org table rows are line-oriented, so a literal pipe or newline cannot be
-emitted verbatim inside a cell.  `\\vert{}' and `\\linebreak{}' are valid
-Org inline constructs; the table parser turns them back into their literal
-characters.  This is deliberately applied after inline rendering so pipes in
-link descriptions and style runs are protected without changing run
-boundaries."
+emitted verbatim inside a cell.  Sentinel-qualified `\\vert{}' and
+`\\linebreak{}' constructs survive Org parsing and distinguish renderer
+escapes from identical literal text.  This is deliberately applied after
+inline rendering so pipes in link descriptions and style runs are protected
+without changing run boundaries."
   (mapconcat
    (lambda (char)
      (cond
-      ((= char 124) (concat "\\vert{}" gdocs--org-link-description-sentinel))
-      ((or (= char 10) (= char 13))
-       (concat "\\linebreak{}" gdocs--org-link-description-sentinel))
-      (t (string char))))
+       ((= char (string-to-char gdocs--org-table-escape-sentinel))
+        (concat gdocs--org-table-escape-sentinel
+                gdocs--org-table-escape-sentinel))
+       ((= char 124) (concat "\\vert{}" gdocs--org-table-pipe-qualifier))
+       ((or (= char 10) (= char 13))
+        (concat "\\linebreak{}" gdocs--org-table-newline-qualifier))
+       (t (string char))))
    (string-to-list (or text "")) ""))
 
 (defun gdocs--render-table-cell (cell)
@@ -2928,23 +2943,27 @@ The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT'."
   "Remove the literal-text escapes emitted by `gdocs--escape-org-inline'.
 
 Only the characters that the renderer escapes are unescaped.  For link
-descriptions and table cells, the invisible separator used around
-subscript/LaTeX-sensitive characters is removed too.  Other backslashes
-remain ordinary user content,
+descriptions, the invisible separator used around subscript/LaTeX-sensitive
+characters is removed too.  Table-cell encoding is decoded separately.
+Other backslashes remain ordinary user content,
 which avoids turning unrelated Org syntax (for example a LaTeX command) into
 a different document-model value."
-  (let ((i 0)
-        (n (length text))
-        (out nil))
+  (let* ((text (if table-cell
+                   (gdocs--unescape-org-table-markup text)
+                 text))
+         (i 0)
+         (n (length text))
+         (out nil))
     (while (< i n)
       (let ((char (aref text i)))
         (cond
-         ((and (or link-description table-cell)
-               (= char #x200b))
+         ((and link-description
+                (= char #x200b))
           (cl-incf i))
-         ((and (= char ?\\)
-               (< (1+ i) n)
-               (memq (aref text (1+ i)) gdocs--org-inline-escape-chars))
+         ((and (or (not table-cell) link-description)
+                (= char ?\\)
+                (< (1+ i) n)
+                (memq (aref text (1+ i)) gdocs--org-inline-escape-chars))
           (push (aref text (1+ i)) out)
           (setq i (+ i 2)))
          (t
@@ -2953,15 +2972,46 @@ a different document-model value."
     (apply #'string (nreverse out))))
 
 (defun gdocs--unescape-org-table-markup (text)
-  "Decode table-safe inline escapes in a link destination TEXT."
-  (let* ((text (or text ""))
-         (text (replace-regexp-in-string
-                (regexp-quote gdocs--org-link-description-sentinel)
-                "" text t t))
-         (text (replace-regexp-in-string
-                (regexp-quote "\\vert{}") "|" text t t)))
-    (replace-regexp-in-string
-     (regexp-quote "\\linebreak{}") "\n" text t t)))
+  "Decode renderer-qualified table escapes in TEXT."
+  (let ((i 0)
+        (n (length (or text "")))
+        (out nil)
+        (text (or text ""))
+        (pipe (concat "\\vert{}" gdocs--org-table-pipe-qualifier))
+        (newline (concat "\\linebreak{}"
+                         gdocs--org-table-newline-qualifier)))
+    (while (< i n)
+      (cond
+       ((and (<= (+ i (length pipe)) n)
+             (string= pipe (substring text i (+ i (length pipe)))))
+        (push "|" out)
+        (setq i (+ i (length pipe))))
+       ((and (<= (+ i (length newline)) n)
+             (string= newline (substring text i (+ i (length newline)))))
+        (push "\n" out)
+        (setq i (+ i (length newline))))
+       ((and (< (1+ i) n)
+             (= (aref text i)
+                (string-to-char gdocs--org-table-escape-sentinel))
+             (= (aref text (1+ i))
+                (string-to-char gdocs--org-table-escape-sentinel)))
+        (push gdocs--org-table-escape-sentinel out)
+        (setq i (+ i 2)))
+       ((or (and (<= (+ i (length gdocs--org-table-pipe-qualifier)) n)
+                 (string= gdocs--org-table-pipe-qualifier
+                          (substring text i
+                                     (+ i (length
+                                           gdocs--org-table-pipe-qualifier)))))
+            (and (<= (+ i (length gdocs--org-table-newline-qualifier)) n)
+                 (string= gdocs--org-table-newline-qualifier
+                          (substring text i
+                                     (+ i (length
+                                           gdocs--org-table-newline-qualifier))))))
+        (setq i (+ i 2)))
+       (t
+        (push (string (aref text i)) out)
+        (cl-incf i))))
+    (apply #'concat (nreverse out))))
 
 (defun gdocs--org-element-visible-text (el inherited-link table-cell)
   "Return the source-visible text of inline element EL, or nil."
@@ -2981,14 +3031,25 @@ a different document-model value."
 (defun gdocs--org-table-escape-value (el)
   "Return the literal value of a renderer-generated table escape EL."
   (let ((end (org-element-property :end el)))
-    (when (and (integerp end)
-               (< end (point-max))
-               (= (char-after end) #x200b))
-      (pcase (car el)
-        ('entity
-         (and (string= (plist-get (cadr el) :name) "vert") "|"))
-        ('latex-fragment
-         (and (string= (plist-get (cadr el) :value) "\\linebreak{}") "\n"))))))
+    (pcase (car el)
+      ('entity
+       (and (string= (plist-get (cadr el) :name) "vert")
+            (integerp end)
+            (<= (+ end (length gdocs--org-table-pipe-qualifier))
+                (point-max))
+            (string= (buffer-substring-no-properties
+                      end (+ end (length gdocs--org-table-pipe-qualifier)))
+                     gdocs--org-table-pipe-qualifier)
+            "|"))
+      ('latex-fragment
+       (and (string= (plist-get (cadr el) :value) "\\linebreak{}")
+            (integerp end)
+            (<= (+ end (length gdocs--org-table-newline-qualifier))
+                (point-max))
+            (string= (buffer-substring-no-properties
+                      end (+ end (length gdocs--org-table-newline-qualifier)))
+                     gdocs--org-table-newline-qualifier)
+            "\n")))))
 
 (defun gdocs--element-runs
     (el &optional inherited-styles inherited-link table-cell visible-fallback)
