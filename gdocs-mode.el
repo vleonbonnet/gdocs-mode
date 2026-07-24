@@ -8668,23 +8668,30 @@ hash are written back to buffer metadata."
     new-rev))
 
 (defun gdocs-push-remotely (&optional doc-id)
-  "Push buffer to remote via the cookie-authenticated /save endpoint.
+  "Push the current buffer asynchronously through the /save endpoint.
 
-Supported diff shapes:
-  - Pure prepend (`is ibi=1').
-  - Pure append (`is ibi=ot-len+1').
-  - Single-region replace within plain-paragraph content. The text
-    position of the change is mapped to an OT position via the
-    `gdocs--ot-plain-and-map' table, then `ds' and `is' are pushed as
-    two sequential single-op POSTs.
+`gdocs-push-backend' selects the operation model.  `ot-encode' replaces the
+remote OT body with a full Org-to-model encoding.  `ot-incremental' emits a
+paragraph-model diff when safe and falls back to that full encoding for
+structural changes.  Legacy `plain' emits lossy text-only `is'/`ds' operations
+for prepend, append, and mappable single- or multi-region changes.
 
-Refused: edits whose plain-text local view doesn't match the OT
-body's plain view (i.e. the diff crosses or sits inside a table or
-list), non-contiguous diffs, and stale-rev pushes.
+Before any write, decode the freshly fetched OT state and refuse plans that
+cannot preserve unsupported content.  A changed buffer is also refused when
+the fetched revision differs from GDOC_REVISION.  If the canonical local and
+remote bodies already match, no /save is sent; after capability validation the
+fresh remote revision establishes a verified baseline even if the stored
+revision was stale.
 
-Conflict safety: refuses if remote revision differs from stored
-GDOC_REVISION. On success, updates GDOC_REVISION and
-GDOC_CONTENT_HASH from the response."
+The command returns after dispatch.  A package-wide synchronization lock skips
+overlapping work and remains held until the asynchronous chain finishes.
+Failures are logged as warnings.  A successful save or verified no-op updates
+GDOC_REVISION, GDOC_CONTENT_HASH, and GDOC_SYNCED_AT and marks the buffer
+synced.  After an ambiguous post-dispatch failure, refetch and compare the
+expected pre- and post-operation body and revision: accept an observed commit,
+allow one freshly planned throttle retry only from a verified unchanged
+pre-operation state, and refuse conflicting or indeterminate outcomes without
+writing a final hash baseline."
   (interactive)
   (if gdocs--sync-mutex
       (progn (gdocs-log 'warn "Mutex locked - skipping push") nil)

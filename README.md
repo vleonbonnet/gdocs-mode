@@ -50,8 +50,8 @@ probe. At most one edit-state probe is in flight per buffer, and disabling or
 re-enabling the mode invalidates callbacks from an earlier lifecycle. A pull also
 captures the body hash and `GDOC_REVISION` at dispatch and refuses to overwrite the
 buffer if either changes before the asynchronous response is applied. A manual
-`gdocs-push-remotely` likewise refuses to push when the freshly fetched remote
-revision differs from the buffer's `GDOC_REVISION`.
+`gdocs-push-remotely` applies the conflict and verified-no-op rules described
+below.
 
 - **Org link interception** — opening a `docs.google.com/document/d/...` link
 in Org opens it through `gdocs-mode` instead of the browser.
@@ -66,12 +66,51 @@ in Org opens it through `gdocs-mode` instead of the browser.
 | `ot-incremental` | Decodes the live OT body into a document model and computes a paragraph-level model diff. Safe changed regions use incremental operations. If the changed region contains a list, table, standalone inline object, or inline object embedded in prose, it falls back to the same full replacement/re-encoding as `ot-encode`; unchanged image paragraphs outside the changed region can remain incremental. |
 | `plain` | Legacy/experimental incremental plain-text diff. Emits only `is`/`ds` text operations and no style information; it is lossy and not recommended. |
 
-Every push plan is checked against capability data decoded again from the freshly
-fetched remote OT state. A full replacement is refused when it would discard a
-destructive unsupported capability. An incremental edit is allowed only when
-every unsupported capability can be preserved untouched, has a known range, and
-no edited or insertion boundary intersects that range. If that proof is
-unavailable, the push is refused.
+`ot-encode` sends the full delete/insert/style command list in one save.
+`ot-incremental` uses a paragraph-model diff when the changed region is safe;
+list, table, standalone inline-object, and inline-object-in-prose changes fall
+back to the `ot-encode` full replacement. Legacy `plain` can apply pure prepend
+and append operations, mappable single-region replacements, and disjoint
+paragraph changes. Replacements use sequential single-operation saves, and
+multi-region edits are rebuilt latest-first against freshly verified state.
+Plain pushes carry no style operations and can therefore lose formatting.
+
+### Push safety and completion
+
+Every plan is preflighted against capability data decoded again from the
+freshly fetched remote OT state; persisted or buffer-local summaries are not
+trusted. A full replacement is refused when it would discard a destructive
+unsupported capability. An incremental edit is allowed only when every
+unsupported capability permits untouched preservation, has a known range, and
+no deletion or insertion boundary touches that range. Invalid or changed inline
+object markers, ambiguous remote objects, and any plan for which preservation
+cannot be proved are refused before `/save`. A no-op still validates local and
+remote inline-object representations, but untouched unsupported ranges need no
+write-preservation proof.
+
+For a changed body, the fetched remote revision must equal the buffer's
+`GDOC_REVISION`; a mismatch is a revision conflict and no write is attempted.
+There is one intentional exception: when the canonical local body already
+matches the freshly fetched remote body, capability preflight still runs but
+the command sends no `/save`. That verified no-op records the fresh remote
+revision as the new baseline, even when the old `GDOC_REVISION` was stale.
+
+Push is asynchronous. A package-wide synchronization lock covers the initial
+fetch and the complete save/verification chain; overlapping synchronization is
+skipped, and the lock is released on success or error. Asynchronous failures are
+reported through the warning log. A successful save or verified no-op updates
+`GDOC_REVISION`, `GDOC_CONTENT_HASH`, and `GDOC_SYNCED_AT`, then marks the
+buffer synchronized. If a multi-stage plain push commits an intermediate
+operation and a later stage fails, only its revision may be recorded; no final
+content-hash baseline is written.
+
+A transport error, server rejection, or malformed success response after
+dispatch has an ambiguous outcome. The mode refetches the document and compares
+both body and revision with the expected pre- and post-operation snapshots. An
+observed committed result is accepted. A throttle rejection may be retried once
+only when the exact pre-operation state is still present, and the operation is
+rebuilt against that fresh state rather than replayed. Conflicting, undecodable,
+or otherwise indeterminate outcomes fail closed without a final hash baseline.
 
 ### Spacing canonicalization
 
@@ -250,7 +289,8 @@ These properties are maintained on the top-level node of every synced buffer:
 | `GDOC_ID`        | Identifies the remote document.               |
 | `GDOC_TITLE`     | Stores the Google Drive document name. Body `#+title:` keywords remain Title-styled paragraphs and are pushable content. |
 | `GDOC_REVISION`  | Staleness anchor — last known remote revision.|
-| `GDOC_SYNCED_AT` | Timestamp of the last successful pull or push.|
+| `GDOC_CONTENT_HASH` | Hash baseline used to detect local changes. |
+| `GDOC_SYNCED_AT` | Timestamp of the last successful pull, push, or verified no-op.|
 
 ## Configuration
 
