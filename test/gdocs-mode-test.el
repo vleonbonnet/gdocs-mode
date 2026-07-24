@@ -1196,6 +1196,37 @@ END is the inclusive final OT position."
                    (gdocs-test--model-view round-trip)))
     (should (equal org (gdocs-dm-to-org round-trip)))))
 
+(ert-deftest gdocs-test-table-mixed-newlines-normalize-to-one-newline ()
+  "CRLF, lone CR, and LF each become one reversible table-cell newline."
+  (let* ((text "crlf\r\ncr\rlf\nend")
+         (normalized "crlf\ncr\nlf\nend")
+         (doc (gdocs-dm-make-doc
+               :paragraphs
+               (list (list :kind :table :cols 1
+                           :rows (list (list
+                                        (list (list
+                                               (gdocs-dm-make-run text)))))))))
+         (org (gdocs-dm-to-org doc))
+         (round-tripped (gdocs-dm-from-org org))
+         (cell (caar (plist-get (car (gdocs-dm-paragraphs round-tripped))
+                                  :rows))))
+    (should (equal (gdocs--render-runs
+                    (list (gdocs-dm-make-run text)))
+                   text))
+    (should (string-match-p
+             (regexp-quote
+              (concat "crlf\\linebreak{}"
+                      gdocs--org-table-newline-qualifier
+                      "cr\\linebreak{}"
+                      gdocs--org-table-newline-qualifier
+                      "lf\\linebreak{}"
+                      gdocs--org-table-newline-qualifier
+                      "end"))
+             org))
+    (should (equal (gdocs-test--cell-view cell)
+                   (list (list normalized nil nil))))
+    (should (equal org (gdocs-dm-to-org round-tripped)))))
+
 (ert-deftest gdocs-test-table-unsentinelled-escape-forms-stay-literal ()
   "User-written escape-shaped text is not decoded as table structure."
   (let* ((text "literal \\linebreak{} and \\vert{}")
@@ -1235,14 +1266,25 @@ END is the inclusive final OT position."
 (ert-deftest gdocs-test-table-escape-encoding-is-cycle-stable ()
   "Repeated model-to-Org-to-model cycles preserve mixed escape content."
   (let* ((sentinel gdocs--org-table-escape-sentinel)
-         (text (concat "\\linebreak{}|" sentinel "p\n\\vert{}" sentinel))
+         (text (concat "\\linebreak{}|" sentinel
+                       "p\r\nCR\rLF\n\\vert{}" sentinel))
+         (normalized-text (concat "\\linebreak{}|" sentinel
+                                  "p\nCR\nLF\n\\vert{}" sentinel))
          (model (gdocs-dm-make-doc
                  :paragraphs
                  (list (list :kind :table :cols 1
                              :rows (list (list
                                           (list (list
                                                  (gdocs-dm-make-run text)))))))))
-         (expected (gdocs-test--model-view model))
+         (expected
+          (gdocs-test--model-view
+           (gdocs-dm-make-doc
+            :paragraphs
+            (list (list :kind :table :cols 1
+                        :rows (list (list
+                                     (list (list
+                                            (gdocs-dm-make-run
+                                             normalized-text))))))))))
          first-org)
     (dotimes (_ 4)
       (let ((org (gdocs-dm-to-org model)))

@@ -2976,18 +2976,20 @@ emitted verbatim inside a cell.  Sentinel-qualified `\\vert{}' and
 `\\linebreak{}' constructs survive Org parsing and distinguish renderer
 escapes from identical literal text.  This is deliberately applied after
 inline rendering so pipes in link descriptions and style runs are protected
-without changing run boundaries."
-  (mapconcat
-   (lambda (char)
-     (cond
-       ((= char (string-to-char gdocs--org-table-escape-sentinel))
-        (concat gdocs--org-table-escape-sentinel
-                gdocs--org-table-escape-sentinel))
-       ((= char 124) (concat "\\vert{}" gdocs--org-table-pipe-qualifier))
-       ((or (= char 10) (= char 13))
-        (concat "\\linebreak{}" gdocs--org-table-newline-qualifier))
-       (t (string char))))
-   (string-to-list (or text "")) ""))
+without changing run boundaries.  CRLF and lone CR are normalized to one LF
+before escaping."
+  (let ((text (replace-regexp-in-string "\r\n?" "\n" (or text "") t t)))
+    (mapconcat
+     (lambda (char)
+       (cond
+        ((= char (string-to-char gdocs--org-table-escape-sentinel))
+         (concat gdocs--org-table-escape-sentinel
+                 gdocs--org-table-escape-sentinel))
+        ((= char 124) (concat "\\vert{}" gdocs--org-table-pipe-qualifier))
+        ((= char 10)
+         (concat "\\linebreak{}" gdocs--org-table-newline-qualifier))
+        (t (string char))))
+     (string-to-list text) "")))
 
 (defun gdocs--render-table-cell (cell)
   "Render one table CELL while keeping its content in one Org row."
