@@ -783,38 +783,87 @@ per op type, so we can see at a glance what fields each op carries."
                per-ty)
       (sort result (lambda (a b) (string< (car a) (car b)))))))
 
-(defun gdocs-recon-dump (doc-id)
+(defun gdocs--write-sensitive-diagnostic (path writer)
+  "Write a sensitive diagnostic to PATH using WRITER and mode 0600.
+WRITER is called with a temporary buffer current.  The destination is
+replaced atomically, and the staging file is removed if WRITER signals."
+  (let* ((path (expand-file-name path))
+         (directory (file-name-directory path))
+         (staging nil))
+    (unless (file-directory-p directory)
+      (error "Diagnostic output directory does not exist: %s" directory))
+    (unwind-protect
+        (progn
+          (setq staging
+                (make-temp-file
+                 (expand-file-name ".gdocs-diagnostic-" directory)))
+          (with-temp-buffer
+            (funcall writer)
+            (let ((coding-system-for-write 'utf-8-unix))
+              (write-region nil nil staging nil 'silent)))
+          (set-file-modes staging #o600)
+          (rename-file staging path t)
+          (setq staging nil)
+          (set-file-modes path #o600)
+          path)
+      (when (and staging (file-exists-p staging))
+        (ignore-errors (delete-file staging))))))
+
+(defun gdocs-recon-dump (doc-id &optional out-file summary-file)
   "Fetch DOC-ID's /edit page, parse the full modelChunk, and dump it.
 
-Writes the full op stream to `/tmp/gdocs-recon-DOC-ID.eld' as a
-pretty-printed elisp form and prints a short summary (op type counts
-+ attribute keys per type) to *Messages*. Read-only — does not modify
-the doc or any buffer. The caller's `gdocs-auth-function' is used."
+The full op stream is written as a pretty-printed Elisp form.  OUT-FILE
+and SUMMARY-FILE are honored exactly when supplied; otherwise each file
+gets an unpredictable name from `make-temp-file'.  Files have mode 0600.
+
+These dumps contain sensitive document and raw OT content and persist
+until deleted.  The exact paths are reported without logging their raw
+content.  Read-only — does not modify the doc or any buffer.  The
+caller's `gdocs-auth-function' is used."
   (interactive "sDoc ID: ")
   (let* ((html (gdocs--fetch-edit-page-sync doc-id))
          (full (gdocs--parse-model-chunk-full html))
          (revision (plist-get full :revision))
          (ops (plist-get full :ops))
-         (out (format "/tmp/gdocs-recon-%s.eld" doc-id))
-         (summary-out (format "/tmp/gdocs-recon-%s-summary.eld" doc-id))
          (type-counts (gdocs--recon-op-types ops))
-         (attr-keys (gdocs--recon-attribute-keys ops)))
-    (with-temp-file out
-      (let ((print-length nil)
-            (print-level nil))
-        (pp `(:revision ,revision :n-ops ,(length ops) :ops ,ops)
-            (current-buffer))))
-    (with-temp-file summary-out
-      (let ((print-length nil) (print-level nil))
-        (pp `(:revision ,revision
-                        :n-ops ,(length ops)
-                        :type-counts ,type-counts
-                        :attr-keys ,attr-keys)
-            (current-buffer))))
-    (message "gdocs-recon: rev=%S ops=%d types=%S → %s"
-             revision (length ops) type-counts out)
-    (list :revision revision :n-ops (length ops)
-          :type-counts type-counts :dump out :summary summary-out)))
+         (attr-keys (gdocs--recon-attribute-keys ops))
+         (generated-out (null out-file))
+         (generated-summary (null summary-file))
+         out summary-out)
+    (condition-case signal-data
+        (progn
+          (setq out (or out-file
+                        (make-temp-file "gdocs-recon-" nil ".eld")))
+          (setq summary-out
+                (or summary-file
+                    (make-temp-file "gdocs-recon-summary-" nil ".eld")))
+          (gdocs--write-sensitive-diagnostic
+           out
+           (lambda ()
+             (let ((print-length nil)
+                   (print-level nil))
+               (pp `(:revision ,revision :n-ops ,(length ops) :ops ,ops)
+                   (current-buffer)))))
+          (gdocs--write-sensitive-diagnostic
+           summary-out
+           (lambda ()
+             (let ((print-length nil) (print-level nil))
+               (pp `(:revision ,revision
+                               :n-ops ,(length ops)
+                               :type-counts ,type-counts
+                               :attr-keys ,attr-keys)
+                   (current-buffer)))))
+          (message
+           "gdocs-recon: sensitive dumps persist until deleted; dump=%s summary=%s"
+           out summary-out)
+          (list :revision revision :n-ops (length ops)
+                :type-counts type-counts :dump out :summary summary-out))
+      (error
+       (when (and generated-out out (file-exists-p out))
+         (ignore-errors (delete-file out)))
+       (when (and generated-summary summary-out (file-exists-p summary-out))
+         (ignore-errors (delete-file summary-out)))
+       (signal (car signal-data) (cdr signal-data))))))
 
 (defun gdocs--fetch-edit-page-sync (doc-id)
   "Synchronous fetch of /edit page for recon. Bypasses the async paths."
@@ -6866,14 +6915,15 @@ doc has none or the fetch fails."
 
 (defun gdocs-debug-comments-fetch (&optional doc-id)
   "Interactive: dump the /docos/p/sync response + parsed comments.
-Output lands in *gdocs-comments-debug*."
+Output lands in *gdocs-comments-debug*.  The buffer contains sensitive
+document and comment content and persists until killed."
   (interactive)
   (let* ((doc-id (gdocs--get-doc-id doc-id))
          (buf (get-buffer-create "*gdocs-comments-debug*")))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (format ";; gdocs-debug-comments-fetch %s at %s\n;; …fetching…\n"
+        (insert (format ";; WARNING: sensitive document/comment content; kill this buffer when done\n;; gdocs-debug-comments-fetch %s at %s\n;; …fetching…\n"
                         doc-id (gdocs--now-iso)))))
     (display-buffer buf)
     (gdocs--fetch-edit-state-async
@@ -8763,11 +8813,13 @@ completion or error."
 (defun gdocs-debug-push-state (&optional doc-id out-file)
   "Dump everything `gdocs-push-remotely' sees into OUT-FILE for inspection.
 Does NOT push — just captures: local body, remote body, OT state, the
-single-region diff, and the locate result (if any). Default OUT-FILE is
-\"/tmp/gdocs-push-debug.txt\". Returns the file path."
+single-region diff, and the locate result (if any).  An explicit OUT-FILE
+is honored exactly.  Otherwise an unpredictable mode-0600 file is made
+with `make-temp-file'.  The dump contains sensitive document and raw OT
+content and persists until deleted.  Returns and logs its exact path
+without logging raw content."
   (interactive)
   (let* ((doc-id (gdocs--get-doc-id doc-id))
-         (out (or out-file "/tmp/gdocs-push-debug.txt"))
          (local-rev (org-entry-get (point-min) "GDOC_REVISION" t))
          (local-body (gdocs--buffer-body-as-plain))
          (html (gdocs--fetch-edit-page-sync doc-id))
@@ -8786,11 +8838,17 @@ single-region diff, and the locate result (if any). Default OUT-FILE is
          (single (gdocs--diff-single-region remote-body local-stripped))
          (paras (gdocs--diff-paragraphs remote-body local-stripped))
          (locate (and single
-                      (gdocs--locate-edit-in-ot
-                       ot-body remote-body
-                       (plist-get single :start)
-                       (plist-get single :rem-end)))))
-    (with-temp-file out
+                       (gdocs--locate-edit-in-ot
+                        ot-body remote-body
+                        (plist-get single :start)
+                        (plist-get single :rem-end))))
+         (generated-out (null out-file))
+         (out (or out-file
+                  (make-temp-file "gdocs-push-debug-" nil ".txt"))))
+    (condition-case signal-data
+        (gdocs--write-sensitive-diagnostic
+         out
+         (lambda ()
       (insert (format "doc-id: %s\n" doc-id))
       (insert (format "local-rev: %s\n" local-rev))
       (insert (format "remote-rev: %s\n" remote-rev))
@@ -8840,8 +8898,14 @@ single-region diff, and the locate result (if any). Default OUT-FILE is
                           i i
                           (substring plain
                                      (max 0 (- i 30))
-                                     (min (length plain) (+ i 30))))))))
-    (message "gdocs-debug-push-state: wrote %s" out)
+                                      (min (length plain) (+ i 30)))))))))
+      (error
+       (when (and generated-out (file-exists-p out))
+         (ignore-errors (delete-file out)))
+       (signal (car signal-data) (cdr signal-data))))
+    (message
+     "gdocs-debug-push-state: sensitive dump persists until deleted: %s"
+     out)
     out))
 
 

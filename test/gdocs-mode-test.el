@@ -363,6 +363,86 @@
   "Construct an OT insert operation for BODY."
   `((ty . "is") (s . ,body)))
 
+(ert-deftest gdocs-test-recon-dump-defaults-are-private-and-unpredictable ()
+  "Recon defaults avoid identifiers, use mode 0600, and log paths only."
+  (let* ((doc-id "sensitive-document-identifier")
+         (secret "sensitive-recon-body")
+         (html (gdocs-test--html-for-ops
+                7 (list (gdocs-test--insert-op (concat secret "\n")))))
+         messages results)
+    (unwind-protect
+        (cl-letf (((symbol-function 'gdocs--fetch-edit-page-sync)
+                   (lambda (_doc-id) html))
+                  ((symbol-function 'message)
+                   (lambda (format-string &rest args)
+                     (push (apply #'format format-string args) messages))))
+          (setq results (list (gdocs-recon-dump doc-id)
+                              (gdocs-recon-dump doc-id)))
+          (let ((paths (mapcan
+                        (lambda (result)
+                          (list (plist-get result :dump)
+                                (plist-get result :summary)))
+                        results)))
+            (should (= (length (delete-dups (copy-sequence paths))) 4))
+            (dolist (path paths)
+              (should (file-exists-p path))
+              (should (= (logand (file-modes path) #o777) #o600))
+              (should-not (string-match-p (regexp-quote doc-id)
+                                          (file-name-nondirectory path))))
+            (dolist (result results)
+              (let ((log (seq-find
+                          (lambda (entry)
+                            (string-match-p
+                             (regexp-quote (plist-get result :dump)) entry))
+                          messages)))
+                (should log)
+                (should (string-match-p
+                         (regexp-quote (plist-get result :summary)) log))
+                (should-not (string-match-p (regexp-quote secret) log))))))
+      (dolist (result results)
+        (dolist (key '(:dump :summary))
+          (let ((path (plist-get result key)))
+            (when (and path (file-exists-p path))
+              (delete-file path))))))))
+
+(ert-deftest gdocs-test-recon-dump-honors-explicit-paths ()
+  "Recon writes to both exact caller-supplied paths with private modes."
+  (let* ((directory (make-temp-file "gdocs-recon-explicit-" t))
+         (dump (expand-file-name "chosen dump.eld" directory))
+         (summary (expand-file-name "chosen summary.eld" directory))
+         (html (gdocs-test--html-for-ops
+                3 (list (gdocs-test--insert-op "Body\n")))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gdocs--fetch-edit-page-sync)
+                   (lambda (_doc-id) html)))
+          (let ((result (gdocs-recon-dump "synthetic-id" dump summary)))
+            (should (equal (plist-get result :dump) dump))
+            (should (equal (plist-get result :summary) summary))
+            (should (= (logand (file-modes dump) #o777) #o600))
+            (should (= (logand (file-modes summary) #o777) #o600))))
+      (delete-directory directory t))))
+
+(ert-deftest gdocs-test-recon-dump-cleans-generated-files-on-failure ()
+  "A failed multi-file recon dump leaves no generated artifacts behind."
+  (let* ((directory (make-temp-file "gdocs-recon-failure-" t))
+         (temporary-file-directory (file-name-as-directory directory))
+         (html (gdocs-test--html-for-ops
+                3 (list (gdocs-test--insert-op "Sensitive body\n"))))
+         (writer (symbol-function 'gdocs--write-sensitive-diagnostic))
+         (writes 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gdocs--fetch-edit-page-sync)
+                   (lambda (_doc-id) html))
+                  ((symbol-function 'gdocs--write-sensitive-diagnostic)
+                   (lambda (path callback)
+                     (if (= (cl-incf writes) 2)
+                         (error "synthetic write failure")
+                       (funcall writer path callback)))))
+          (should-error (gdocs-recon-dump "synthetic-id") :type 'error)
+          (should-not
+           (directory-files directory nil directory-files-no-dot-files-regexp)))
+      (delete-directory directory t))))
+
 (defun gdocs-test--push-state (revision remote-body &optional ot-body)
   "Build a small push state with an independently configurable OT body."
   (let ((ot-body (or ot-body remote-body)))
@@ -4483,15 +4563,52 @@ that a removed preflight guard would be observed as an unexpected success."
       (org-mode)
       (cl-letf (((symbol-function 'gdocs--fetch-edit-page-sync)
                  (lambda (_doc) html)))
-        (gdocs-debug-push-state "synthetic-id" out)))
+        (should (equal (gdocs-debug-push-state "synthetic-id" out) out))))
     (unwind-protect
         (with-temp-buffer
           (insert-file-contents out)
+          (should (= (logand (file-modes out) #o777) #o600))
           (should (search-forward "unsupported capability summary: 1 unknown entity"
                                   nil t))
           (goto-char (point-min))
           (should-not (search-forward "secret-debug-entity" nil t)))
       (delete-file out))))
+
+(ert-deftest gdocs-test-debug-push-default-is-private-unpredictable-and-cleaned ()
+  "Push diagnostics use private random defaults and tests remove both files."
+  (let* ((doc-id "sensitive-debug-document-id")
+         (secret "sensitive-debug-body")
+         (body (concat secret "\n"))
+         (html (gdocs-test--html-for-ops
+                7 (list (gdocs-test--insert-op body))))
+         outputs messages)
+    (unwind-protect
+        (with-temp-buffer
+          (insert ":PROPERTIES:\n:GDOC_ID: " doc-id
+                  "\n:GDOC_REVISION: 7\n:END:\n\n" body)
+          (org-mode)
+          (cl-letf (((symbol-function 'gdocs--fetch-edit-page-sync)
+                     (lambda (_doc-id) html))
+                    ((symbol-function 'message)
+                     (lambda (format-string &rest args)
+                       (push (apply #'format format-string args) messages))))
+            (setq outputs (list (gdocs-debug-push-state doc-id)
+                                (gdocs-debug-push-state doc-id)))
+            (should-not (equal (car outputs) (cadr outputs)))
+            (dolist (path outputs)
+              (should (file-exists-p path))
+              (should (= (logand (file-modes path) #o777) #o600))
+              (should-not (string-match-p (regexp-quote doc-id)
+                                          (file-name-nondirectory path)))
+              (let ((log (seq-find
+                          (lambda (entry)
+                            (string-match-p (regexp-quote path) entry))
+                          messages)))
+                (should log)
+                (should-not (string-match-p (regexp-quote secret) log))))))
+      (dolist (path outputs)
+        (when (and path (file-exists-p path))
+          (delete-file path))))))
 
 (ert-deftest gdocs-test-local-image-marker-cannot-recreate-an-image ()
   "A local remote-object marker is not silently emitted as plain text."

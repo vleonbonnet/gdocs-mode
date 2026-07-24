@@ -270,9 +270,16 @@ a documented OAuth-capable API.
 | `gdocs-out-of-date`   | Check whether the remote document has advanced.                |
 | `gdocs-mode`          | The Org minor mode that ties pull/push/auto-sync together.     |
 | `gdocs-session-reset` | Delete the persisted `/save` SID/request-id session and create a new one on the next push. |
-| `gdocs-recon-dump` | Write a read-only OT reconstruction dump under `/tmp` for diagnostics. |
+| `gdocs-recon-dump` | Write read-only OT reconstruction and summary dumps to unpredictable mode-0600 temporary files. |
 | `gdocs-debug-comments-fetch` | Fetch comments into `*gdocs-comments-debug*` for diagnostics; does not push. |
-| `gdocs-debug-push-state` | Write a read-only push-planning dump to `/tmp/gdocs-push-debug.txt` by default. |
+| `gdocs-debug-push-state` | Write a read-only push-planning dump to an unpredictable mode-0600 temporary file. |
+
+Diagnostic dumps and the comments debug buffer contain sensitive document,
+comment, and raw OT content. They persist until explicitly deleted or killed.
+The commands report exact generated paths without logging raw content; supplied
+output paths are honored. Delete file dumps after use, for example with
+`M-: (delete-file "/exact/path/reported/by/the/command")`, and kill
+`*gdocs-comments-debug*` when finished.
 
 Open a document with `M-x gdocs-open` and paste the URL or document ID. The
 mode opens (or reuses) a local `.org` buffer named after the document title and
