@@ -275,9 +275,25 @@ contacts Google, reads browser cookies, or mutates user buffers/files:
 make test
 ```
 
-Run byte-compilation validation with `make byte-compile`, or run both checks
-with `make check`. Run `make space-path-check` to repeat all three commands
-through a temporary symlink whose path contains a space. The optional
+Production byte-compilation deliberately does not load the offline request
+shim. Install request 0.3.2 or newer yourself and pass the directory containing
+`request.el` or `request.elc` explicitly:
+
+```sh
+make byte-compile REQUEST_DIR="$HOME/.emacs.d/elpa/request-0.3.3"
+make check REQUEST_DIR="$HOME/.emacs.d/elpa/request-0.3.3"
+make space-path-check REQUEST_DIR="$HOME/.emacs.d/elpa/request-0.3.3"
+```
+
+No dependency is downloaded by these targets. A missing `REQUEST_DIR`, a
+directory that does not contain request, or request older than 0.3.2 fails the
+production compile with a diagnostic. `make check` also verifies those failure
+cases and a successful real-request compile. The test suite and test-file
+compilation load the offline shim separately after the production file has
+compiled against real request.
+
+Run `make space-path-check` to repeat all three commands through a temporary
+symlink whose path contains a space. The optional
 `make integration` target only selects the
 `integration` ERT tag after explicitly setting `GDOCS_MODE_RUN_INTEGRATION=1`;
 no live credentials or live integration tests are required by this repository.
