@@ -3036,6 +3036,18 @@ a different document-model value."
     (when (and (stringp source) (not (string-empty-p source)))
       (gdocs--unescape-org-inline source inherited-link table-cell))))
 
+(defun gdocs--org-element-escaped-p (el)
+  "Return non-nil when EL is preceded by an odd number of backslashes."
+  (let ((position (org-element-property :begin el))
+        (count 0))
+    (when (integerp position)
+      (setq position (1- position))
+      (while (and (>= position (point-min))
+                  (= (char-after position) ?\\))
+        (cl-incf count)
+        (cl-decf position)))
+    (cl-oddp count)))
+
 (defun gdocs--org-table-escape-value (el)
   "Return the literal value of a renderer-generated table escape EL."
   (let ((end (org-element-property :end el)))
@@ -3081,20 +3093,28 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
            (style (cdr (assq type gdocs--org-element-styles))))
       (cond
         ((and (eq type 'export-snippet)
-              (string= (downcase (format "%s"
-                                         (or (plist-get props :backend)
-                                             (plist-get props :back-end))))
-                       "gdocs-inline-object"))
-         (let ((object (gdocs--parse-inline-object-spec
-                        (plist-get props :value))))
-           (cond
-            (object (list (list :inline-object object)))
-            (visible-fallback
-             (let ((text (gdocs--org-element-visible-text
-                          el inherited-link table-cell)))
-               (when text
-                 (list (gdocs-dm-make-run
-                        text inherited-styles inherited-link))))))))
+               (string= (downcase (format "%s"
+                                          (or (plist-get props :backend)
+                                              (plist-get props :back-end))))
+                        "gdocs-inline-object"))
+          (let ((object (and (not (gdocs--org-element-escaped-p el))
+                             (gdocs--parse-inline-object-spec
+                              (plist-get props :value)))))
+            (cond
+             (object (list (list :inline-object object)))
+             ((gdocs--org-element-escaped-p el)
+              (let ((text (gdocs--org-element-visible-text
+                           el inherited-link table-cell)))
+                (when text
+                  (list (gdocs-dm-make-run
+                         text inherited-styles inherited-link)))))
+             (t
+              (let* ((text (and visible-fallback
+                                (gdocs--org-element-visible-text
+                                 el inherited-link table-cell)))
+                     (run (gdocs-dm-make-run
+                           (or text "") inherited-styles inherited-link)))
+                (list (plist-put run :inline-object-malformed t)))))))
        ((eq type 'link)
         (let* ((path (plist-get props :path))
                (kind (plist-get props :type))
@@ -3241,9 +3261,10 @@ VISIBLE-FALLBACK is passed to `gdocs--element-runs'."
                   runs))
     ;; Drop empty runs.
     (seq-remove (lambda (r)
-                  (and (not (plist-get r :inline-object))
-                       (string-empty-p (or (plist-get r :text) ""))))
-                runs)))
+                   (and (not (plist-get r :inline-object))
+                        (not (plist-get r :inline-object-malformed))
+                        (string-empty-p (or (plist-get r :text) ""))))
+                 runs)))
 
 (defun gdocs--org-inline-content-runs (text &optional visible-fallback)
   "Parse TEXT as inline Org content and return its doc-model runs.
@@ -3293,10 +3314,11 @@ visible content."
                                 first-text (length sentinel)))
                     (setq runs (cons trimmed (cdr runs)))
                     (or (seq-remove
-                         (lambda (run)
-                           (and (not (plist-get run :inline-object))
-                                (string-empty-p
-                                 (or (plist-get run :text) ""))))
+                          (lambda (run)
+                            (and (not (plist-get run :inline-object))
+                                 (not (plist-get run :inline-object-malformed))
+                                 (string-empty-p
+                                  (or (plist-get run :text) ""))))
                          runs)
                         fallback))
                 fallback)))
@@ -3343,10 +3365,12 @@ entities and post-blank whitespace."
     (dolist (run runs (nreverse out))
       (let ((previous (car out)))
         (if (and previous
-                 (not (plist-get previous :inline-object))
-                 (not (plist-get run :inline-object))
-                 (equal (plist-get previous :styles)
-                        (plist-get run :styles))
+                  (not (plist-get previous :inline-object))
+                  (not (plist-get run :inline-object))
+                  (not (plist-get previous :inline-object-malformed))
+                  (not (plist-get run :inline-object-malformed))
+                  (equal (plist-get previous :styles)
+                         (plist-get run :styles))
                  (equal (plist-get previous :link)
                         (plist-get run :link)))
             (setcar out
@@ -3396,10 +3420,11 @@ empty run list rather than disappearing from its row."
           (setcar (nthcdr last-index runs)
                   (plist-put (copy-sequence last-run) :text last-text)))))
     (gdocs--coalesce-table-cell-runs
-     (seq-remove (lambda (run)
-                   (and (not (plist-get run :inline-object))
-                        (string-empty-p (or (plist-get run :text) ""))))
-                 runs))))
+      (seq-remove (lambda (run)
+                    (and (not (plist-get run :inline-object))
+                         (not (plist-get run :inline-object-malformed))
+                         (string-empty-p (or (plist-get run :text) ""))))
+                  runs))))
 
 (defun gdocs--src-block-paragraphs (sb)
   "Split a src-block's :value into a list of :code paragraphs."
@@ -3637,13 +3662,14 @@ caller can distinguish meaningful blank lines from heading padding."
                       para (gdocs--org-element-line-number el)
                       (gdocs--org-element-last-line-number el))
                    para))))
-        ((equal key "gdocs_inline_object")
-         (let* ((object (gdocs--parse-inline-object-spec val))
-                (para (or object
-                          (list :kind :unsupported
-                                :runs nil
-                                :unsupported-reason
-                                "malformed gdocs_inline_object placeholder"))))
+         ((equal key "gdocs_inline_object")
+          (let* ((object (gdocs--parse-inline-object-spec val))
+                 (para (or object
+                           (list :kind :unsupported
+                                 :runs nil
+                                 :inline-object-malformed t
+                                 :unsupported-reason
+                                 "malformed gdocs_inline_object placeholder"))))
            (list (if source-spans
                      (gdocs--org-annotate-paragraph
                       para (gdocs--org-element-line-number el)
@@ -5316,21 +5342,18 @@ payload, because the payload is not the complete local document."
                     errors))))))
     (nreverse errors)))
 
-(defun gdocs--inline-marker-count (text)
-  "Return the number of standalone and embedded image markers in TEXT."
-  (let ((text (or text ""))
-        (count 0)
-        (start 0))
-    (while (string-match
-            "\\(^\\|\\n\\)#\\+gdocs_inline_object:[^\n]*"
-            text start)
-      (cl-incf count)
-      (setq start (match-end 0)))
-    (setq start 0)
-    (while (string-match "@@gdocs-inline-object:[^@\n]*@@" text start)
-      (cl-incf count)
-      (setq start (match-end 0)))
-    count))
+(defun gdocs--doc-malformed-inline-object-count (doc)
+  "Return the number of malformed inline-object marker nodes in DOC."
+  (cl-loop
+   for paragraph in (gdocs-dm-paragraphs doc)
+   sum (+ (if (plist-get paragraph :inline-object-malformed) 1 0)
+          (cl-count-if
+           (lambda (run) (plist-get run :inline-object-malformed))
+           (if (eq (plist-get paragraph :kind) :table)
+               (cl-loop for row in (plist-get paragraph :rows)
+                        append (cl-loop for cell in row
+                                        append (gdocs--table-cell-runs cell)))
+             (plist-get paragraph :runs))))))
 
 (defun gdocs--remote-inline-object-validation-errors (reports)
   "Return hard inline-image reports from remote capability REPORTS.
@@ -5347,18 +5370,18 @@ ambiguous remote object data that must also block a no-op."
 (defun gdocs--local-capability-analysis (local-body)
   "Decode local unsupported markers and inline objects for preflight.
 Local object payloads are used only for equality checking against the fresh
-remote analysis; they are never put into a capability report. Marker-like text
-that does not decode to exactly one object per marker is reported as invalid."
+remote analysis; they are never put into a capability report.  Malformed
+parsed marker nodes are reported as invalid."
   (let* ((body (or local-body ""))
          (doc (gdocs-dm-from-org body))
          (objects (gdocs-dm-inline-objects doc))
          (reports (mapcar #'gdocs--local-inline-object-capability-report
-                          objects))
-         (marker-count (gdocs--inline-marker-count body))
+                           objects))
+         (malformed-count (gdocs--doc-malformed-inline-object-count doc))
          (marker-errors
-          (if (= marker-count (length objects))
-              nil
-            (list
+           (if (zerop malformed-count)
+               nil
+             (list
              (gdocs--capability-report
               :inline-image
               "The local document contains an invalid inline image marker."
@@ -5452,11 +5475,44 @@ The rendered Org view carries a descriptive line or embedded export token,
 while Google indexes one literal asterisk. This normalization is used only
 for diff anchoring after capability validation; the original local body is
 never rewritten."
-  (let ((text (replace-regexp-in-string
-               "\\(^\\|\\n\\)#\\+gdocs_inline_object:[^\n]*"
-               "\\1*" (or text ""))))
-    (replace-regexp-in-string
-     "@@gdocs-inline-object:[^@\n]*@@" "*" text)))
+  (with-temp-buffer
+    (let ((org-inhibit-startup t))
+      (insert (or text "")))
+    (org-mode)
+    (let ((tree (org-element-parse-buffer))
+          replacements)
+      (org-element-map tree '(keyword export-snippet)
+        (lambda (element)
+          (let* ((type (car element))
+                 (key (org-element-property :key element))
+                 (backend (or (org-element-property :backend element)
+                              (org-element-property :back-end element)))
+                 (value (org-element-property :value element))
+                 (standalone (and (eq type 'keyword)
+                                  (stringp key)
+                                  (string= (downcase key)
+                                           "gdocs_inline_object")))
+                 (embedded (and (eq type 'export-snippet)
+                                (string= (downcase (format "%s" backend))
+                                         "gdocs-inline-object")
+                                (not (gdocs--org-element-escaped-p element)))))
+            (when (and (or standalone embedded)
+                       (gdocs--parse-inline-object-spec value))
+              (let ((begin (org-element-property :begin element))
+                    (end (org-element-property :end element)))
+                (when embedded
+                  (setq end (- end (or (org-element-property :post-blank element)
+                                       0))))
+                (when (and standalone (> end begin)
+                           (= (char-before end) ?\n))
+                  (cl-decf end))
+                (push (cons begin end) replacements))))))
+      (dolist (range (sort replacements
+                           (lambda (a b) (> (car a) (car b)))))
+        (delete-region (car range) (cdr range))
+        (goto-char (car range))
+        (insert "*"))
+      (buffer-string))))
 
 (defun gdocs--push-capability-summary-error (reports reason)
   "Signal a sanitized user-error for REPORTS and REASON."

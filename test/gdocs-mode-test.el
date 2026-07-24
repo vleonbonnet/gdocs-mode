@@ -2425,6 +2425,50 @@ END is the inclusive final OT position."
        (gdocs--push-preflight plain-state malformed '(:kind :noop))
        :type 'user-error))))
 
+(ert-deftest gdocs-test-inline-object-analysis-uses-structural-marker-contexts ()
+  "Only parsed marker nodes participate in local image validation."
+  (let* ((spec "image kix.synthetic 1x1 content-id=s-blob-v1-IMAGE-synthetic")
+         (embedded (format "@@gdocs-inline-object:%s@@" spec))
+         (standalone (format "#+gdocs_inline_object: %s" spec))
+         (literal
+          (concat "#+begin_src text\n" standalone "\n" embedded "\n#+end_src\n"
+                  "#+begin_example\n" standalone "\n#+end_example\n"
+                  "=" embedded "= ~" embedded "~\n"
+                  "\\" embedded "\n"))
+         (literal-analysis (gdocs--local-capability-analysis literal))
+         (mixed-analysis
+          (gdocs--local-capability-analysis
+           (concat literal standalone "\nBefore " embedded " after\n"))))
+    (should-not (plist-get literal-analysis :objects))
+    (should-not (plist-get literal-analysis :inline-marker-errors))
+    (should (= (length (plist-get mixed-analysis :objects)) 2))
+    (should-not (plist-get mixed-analysis :inline-marker-errors))))
+
+(ert-deftest gdocs-test-inline-object-analysis-fails-closed-on-parsed-malformed-markers ()
+  "Malformed standalone and embedded marker nodes remain hard errors."
+  (dolist (body '("#+gdocs_inline_object: broken\n"
+                  "Before @@gdocs-inline-object:broken@@ after\n"
+                  "| Before @@gdocs-inline-object:broken@@ after |\n"))
+    (let ((analysis (gdocs--local-capability-analysis body)))
+      (should-not (plist-get analysis :objects))
+      (should (= (length (plist-get analysis :inline-marker-errors)) 1)))))
+
+(ert-deftest gdocs-test-inline-object-normalization-is-structural ()
+  "Placeholder normalization leaves marker-like literal text untouched."
+  (let* ((spec "image kix.synthetic 1x1 content-id=s-blob-v1-IMAGE-synthetic")
+         (embedded (format "@@gdocs-inline-object:%s@@" spec))
+         (standalone (format "#+gdocs_inline_object: %s" spec))
+         (text (concat "#+begin_src text\n" standalone "\n#+end_src\n"
+                       "=" embedded "=\n\\" embedded "\n"
+                       standalone "\nBefore " embedded " after\n"))
+         (normalized (gdocs--inline-markers-as-ot-placeholders text)))
+    (should (string-match-p (regexp-quote (concat standalone "\n#+end_src"))
+                            normalized))
+    (should (string-match-p (regexp-quote (concat "=" embedded "="))
+                            normalized))
+    (should (string-match-p (regexp-quote (concat "\\" embedded)) normalized))
+    (should (string-suffix-p "*\nBefore * after\n" normalized))))
+
 (ert-deftest gdocs-test-inline-object-insertion-allows-literal-star ()
   "An ordinary literal star insertion is not mistaken for an image marker."
   (let ((state (gdocs-test--inline-state "one-image-between-paragraphs")))
