@@ -6438,53 +6438,57 @@ Returns the response body string. Signals an error on non-2xx.
 We bypass `request.el' here because its persistent cookie jar layers
 stale Google session cookies on top of our explicit Cookie header and
 that causes intermittent code-13 rejections from /save."
-  (let* ((body-file (make-temp-file "gdocs-req-" nil ".bin"))
-         (resp-file (make-temp-file "gdocs-resp-" nil ".bin"))
-         (args (append (list "--silent" "--compressed")
-                       (gdocs--curl-timeout-args)
-                       (list
-                             "-X" "POST"
-                             "-o" resp-file
-                             "-w" "%{http_code}"
-                             "--data-binary" (concat "@" body-file))
-                       (mapcan (lambda (h)
-                                 (list "-H" (format "%s: %s" (car h) (cdr h))))
-                               headers)
-                       (list url))))
+  (let ((timeout-args (gdocs--curl-timeout-args))
+        body-file resp-file args)
     (unwind-protect
-        (let* ((_ (let ((coding-system-for-write 'utf-8))
-                    (with-temp-file body-file (insert body))))
-               (status-string
-                (with-temp-buffer
-                  (let ((exit (apply #'call-process "curl" nil t nil args)))
-                    (unless (zerop exit)
-                      (signal 'gdocs-save-post-dispatch-failed
-                              (list (gdocs--curl-exit-error exit)))))
-                  (buffer-string)))
-               (http-code (string-to-number status-string))
-               (response
-                (condition-case sig
-                    (with-temp-buffer
-                      (set-buffer-multibyte nil)
-                      (insert-file-contents-literally resp-file)
-                      (decode-coding-region (point-min) (point-max) 'utf-8)
-                      (buffer-string))
-                  (error
-                   (signal 'gdocs-save-post-dispatch-failed
-                           (list (error-message-string sig)))))))
-          (unless (and (>= http-code 200) (< http-code 300))
-            (let* ((parsed (gdocs--parse-save-error-body response))
-                   (err-code (car parsed))
-                   (di (cdr parsed)))
-              (signal 'gdocs-save-rejected
-                      (list :http-code http-code
-                            :err-code err-code
-                            :di di
-                            :body (substring response 0
-                                             (min 300 (length response)))))))
-          response)
-      (ignore-errors (delete-file body-file))
-      (ignore-errors (delete-file resp-file)))))
+        (progn
+          (setq body-file (make-temp-file "gdocs-req-" nil ".bin")
+                resp-file (make-temp-file "gdocs-resp-" nil ".bin")
+                args (append (list "--silent" "--compressed")
+                             timeout-args
+                             (list
+                              "-X" "POST"
+                              "-o" resp-file
+                              "-w" "%{http_code}"
+                              "--data-binary" (concat "@" body-file))
+                             (mapcan
+                              (lambda (h)
+                                (list "-H" (format "%s: %s" (car h) (cdr h))))
+                              headers)
+                             (list url)))
+          (let* ((_ (let ((coding-system-for-write 'utf-8))
+                       (with-temp-file body-file (insert body))))
+                 (status-string
+                  (with-temp-buffer
+                    (let ((exit (apply #'call-process "curl" nil t nil args)))
+                      (unless (zerop exit)
+                        (signal 'gdocs-save-post-dispatch-failed
+                                (list (gdocs--curl-exit-error exit)))))
+                    (buffer-string)))
+                 (http-code (string-to-number status-string))
+                 (response
+                  (condition-case sig
+                      (with-temp-buffer
+                        (set-buffer-multibyte nil)
+                        (insert-file-contents-literally resp-file)
+                        (decode-coding-region (point-min) (point-max) 'utf-8)
+                        (buffer-string))
+                    (error
+                     (signal 'gdocs-save-post-dispatch-failed
+                             (list (error-message-string sig)))))))
+            (unless (and (>= http-code 200) (< http-code 300))
+              (let* ((parsed (gdocs--parse-save-error-body response))
+                     (err-code (car parsed))
+                     (di (cdr parsed)))
+                (signal 'gdocs-save-rejected
+                        (list :http-code http-code
+                              :err-code err-code
+                              :di di
+                              :body (substring response 0
+                                               (min 300 (length response)))))))
+            response))
+      (when body-file (ignore-errors (delete-file body-file)))
+      (when resp-file (ignore-errors (delete-file resp-file))))))
 
 (defconst gdocs--inter-region-delay 3
   "Seconds to sleep between regions of a multi-region in-place push.
@@ -6620,71 +6624,92 @@ RESP is the response body (utf-8 string) or nil. HTTP-CODE is the integer
 status code parsed from `-w %{http_code}', or nil. ERR is a short
 human-readable string on curl-side failure, otherwise nil. Caller decides
 how to interpret HTTP-CODE (e.g. 550 is a /save throttle, not a hard error)."
-  (let* ((body-file (and body (make-temp-file "gdocs-req-" nil ".bin")))
-         (resp-file (make-temp-file "gdocs-resp-" nil ".bin"))
-         (stdout-buf (generate-new-buffer " *gdocs-curl-out*"))
-         (args (append (list "--silent" "--compressed")
-                       (gdocs--curl-timeout-args)
-                       (list
-                             "-X" method
-                             "-o" resp-file
-                             "-w" "%{http_code}")
-                       (when body (list "--data-binary" (concat "@" body-file)))
-                       (mapcan (lambda (h)
-                                 (list "-H" (format "%s: %s" (car h) (cdr h))))
-                               headers)
-                       (list url)))
-         (finished nil)
-         (cleanup
-          (lambda ()
-            (when body-file (ignore-errors (delete-file body-file)))
-            (ignore-errors (delete-file resp-file))
-            (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf)))))
-    (condition-case sig
-        (progn
-          (when body
-            (let ((coding-system-for-write 'utf-8))
-              (with-temp-file body-file (insert body))))
-          (make-process
-           :name "gdocs-curl"
-           :noquery t
-           :command (cons "curl" args)
-           :buffer stdout-buf
-           :sentinel
-           (lambda (proc _event)
-             (when (and (not finished)
-                        (memq (process-status proc) '(exit signal)))
-               (setq finished t)
-               (let ((exit-code (process-exit-status proc))
-                     (http-code nil) (response nil) (err nil))
-                 (condition-case response-sig
-                     (unwind-protect
-                         (cond
-                          ((not (zerop exit-code))
-                           (setq err (gdocs--curl-exit-error exit-code)))
-                          (t
-                           (when (buffer-live-p stdout-buf)
-                             (with-current-buffer stdout-buf
-                               (let ((s (string-trim (buffer-string))))
-                                 (setq http-code
-                                       (and (string-match-p "^[0-9]+$" s)
-                                            (string-to-number s))))))
-                           (when (file-exists-p resp-file)
-                             (with-temp-buffer
-                               (let ((coding-system-for-read 'utf-8))
-                                 (insert-file-contents resp-file))
-                               (setq response (buffer-string))))))
-                       (funcall cleanup))
-                   (error
-                    (setq err (error-message-string response-sig))))
-                 (condition-case callback-sig
-                     (funcall callback response http-code err)
-                   (error
-                    (gdocs-log 'error "async callback failed: %s"
-                               (error-message-string callback-sig)))))))))
-      (error
-       (funcall cleanup)
-       (signal (car sig) (cdr sig))))))
+  (let ((timeout-args (gdocs--curl-timeout-args))
+        body-file resp-file stdout-buf process args finished)
+    (cl-labels
+        ((cleanup ()
+           (when (and (processp process) (process-live-p process))
+             (ignore-errors (delete-process process)))
+           (when body-file (ignore-errors (delete-file body-file)))
+           (when resp-file (ignore-errors (delete-file resp-file)))
+           (when (buffer-live-p stdout-buf)
+             (ignore-errors (kill-buffer stdout-buf))))
+         (deliver (response http-code err)
+           (unless finished
+             (setq finished t)
+             (cleanup)
+             (condition-case callback-sig
+                 (funcall callback response http-code err)
+               (error
+                (gdocs-log 'error "async callback failed: %s"
+                           (error-message-string callback-sig)))))))
+      (condition-case setup-sig
+          (let ((setup-complete nil))
+            (unwind-protect
+                (progn
+                  (when body
+                    (setq body-file
+                          (make-temp-file "gdocs-req-" nil ".bin")))
+                  (setq resp-file (make-temp-file "gdocs-resp-" nil ".bin")
+                        stdout-buf
+                        (generate-new-buffer " *gdocs-curl-out*")
+                        args
+                        (append
+                         (list "--silent" "--compressed")
+                         timeout-args
+                         (list "-X" method
+                               "-o" resp-file
+                               "-w" "%{http_code}")
+                         (when body
+                           (list "--data-binary" (concat "@" body-file)))
+                         (mapcan
+                          (lambda (h)
+                            (list "-H" (format "%s: %s" (car h) (cdr h))))
+                          headers)
+                         (list url)))
+                  (when body
+                    (let ((coding-system-for-write 'utf-8))
+                      (with-temp-file body-file (insert body))))
+                  (setq process
+                        (make-process
+                         :name "gdocs-curl"
+                         :noquery t
+                         :command (cons "curl" args)
+                         :buffer stdout-buf
+                         :sentinel
+                         (lambda (proc _event)
+                           (when (memq (process-status proc) '(exit signal))
+                             (condition-case response-sig
+                                 (let ((exit-code (process-exit-status proc))
+                                       http-code response err)
+                                   (if (not (zerop exit-code))
+                                       (setq err
+                                             (gdocs--curl-exit-error exit-code))
+                                     (when (buffer-live-p stdout-buf)
+                                       (with-current-buffer stdout-buf
+                                         (let ((status
+                                                (string-trim (buffer-string))))
+                                           (setq http-code
+                                                 (and
+                                                  (string-match-p
+                                                   "^[0-9]+$" status)
+                                                  (string-to-number status))))))
+                                     (when (file-exists-p resp-file)
+                                       (with-temp-buffer
+                                         (let ((coding-system-for-read 'utf-8))
+                                           (insert-file-contents resp-file))
+                                         (setq response (buffer-string)))))
+                                   (deliver response http-code err))
+                               (error
+                                (deliver nil nil
+                                         (error-message-string
+                                          response-sig))))))))
+                  (setq setup-complete t)
+                  process)
+              (unless setup-complete (cleanup))))
+        (error
+         (deliver nil nil (error-message-string setup-sig))
+         (signal (car setup-sig) (cdr setup-sig)))))))
 
 (defun gdocs--make-request-async (url method data parser callback)
   "Async sibling of `gdocs--make-request'. CALLBACK = `(funcall CB RESULT ERR)'.

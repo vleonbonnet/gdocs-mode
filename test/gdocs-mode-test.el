@@ -160,6 +160,119 @@
     (let ((gdocs-curl-total-timeout value))
       (should-error (gdocs--curl-timeout-args) :type 'user-error))))
 
+(ert-deftest gdocs-test-invalid-curl-timeout-precedes-transport-allocation ()
+  "Invalid transport limits fail before synchronous or asynchronous setup."
+  (let ((gdocs-curl-connect-timeout 0)
+        (allocation-count 0)
+        (callback-count 0))
+    (cl-letf (((symbol-function 'make-temp-file)
+               (lambda (&rest _args)
+                 (cl-incf allocation-count)
+                 (error "unexpected tempfile allocation")))
+              ((symbol-function 'generate-new-buffer)
+               (lambda (&rest _args)
+                 (cl-incf allocation-count)
+                 (error "unexpected buffer allocation")))
+              ((symbol-function 'make-process)
+               (lambda (&rest _args)
+                 (cl-incf allocation-count)
+                 (error "unexpected process allocation")))
+              ((symbol-function 'gdocs--curl-post)
+               gdocs-test--production-curl-post)
+              ((symbol-function 'gdocs--curl-async)
+               gdocs-test--production-curl-async))
+      (should-error
+       (gdocs--curl-post "https://example.invalid/save" nil "secret-body")
+       :type 'user-error)
+      (should-error
+       (gdocs--curl-async
+        "https://example.invalid/save" "POST" nil "secret-body"
+        (lambda (&rest _args) (cl-incf callback-count)))
+       :type 'user-error))
+    (should (zerop allocation-count))
+    (should (zerop callback-count))))
+
+(ert-deftest gdocs-test-sync-curl-early-setup-failures-clean-resources ()
+  "Each synchronous setup failure removes every earlier allocation."
+  (dolist (stage '(first-tempfile second-tempfile buffer))
+    (let ((real-make-temp-file (symbol-function 'make-temp-file))
+          (real-generate-new-buffer (symbol-function 'generate-new-buffer))
+          files buffers
+          (tempfile-count 0))
+      (cl-letf
+          (((symbol-function 'make-temp-file)
+            (lambda (&rest args)
+              (cl-incf tempfile-count)
+              (if (or (and (eq stage 'first-tempfile) (= tempfile-count 1))
+                      (and (eq stage 'second-tempfile) (= tempfile-count 2)))
+                  (error "synthetic %s failure" stage)
+                (let ((file (apply real-make-temp-file args)))
+                  (push file files)
+                  file))))
+           ((symbol-function 'generate-new-buffer)
+            (lambda (&rest args)
+              (if (eq stage 'buffer)
+                  (error "synthetic buffer failure")
+                (let ((buffer (apply real-generate-new-buffer args)))
+                  (push buffer buffers)
+                  buffer))))
+           ((symbol-function 'call-process)
+            (lambda (&rest _args) (error "unexpected curl dispatch")))
+           ((symbol-function 'gdocs--curl-post)
+            gdocs-test--production-curl-post))
+        (let ((err
+               (should-error
+                (gdocs--curl-post
+                 "https://example.invalid/save" nil "secret-request-body"))))
+          (should-not
+           (string-match-p "secret-request-body" (error-message-string err)))))
+      (dolist (file files) (should-not (file-exists-p file)))
+      (dolist (buffer buffers) (should-not (buffer-live-p buffer))))))
+
+(ert-deftest gdocs-test-async-curl-early-setup-failures-clean-and-call-once ()
+  "Each asynchronous setup failure cleans up and reports exactly once."
+  (dolist (stage '(first-tempfile second-tempfile buffer process))
+    (let ((real-make-temp-file (symbol-function 'make-temp-file))
+          (real-generate-new-buffer (symbol-function 'generate-new-buffer))
+          files buffers callback-error
+          (tempfile-count 0)
+          (callback-count 0))
+      (cl-letf
+          (((symbol-function 'make-temp-file)
+            (lambda (&rest args)
+              (cl-incf tempfile-count)
+              (if (or (and (eq stage 'first-tempfile) (= tempfile-count 1))
+                      (and (eq stage 'second-tempfile) (= tempfile-count 2)))
+                  (error "synthetic %s failure" stage)
+                (let ((file (apply real-make-temp-file args)))
+                  (push file files)
+                  file))))
+           ((symbol-function 'generate-new-buffer)
+            (lambda (&rest args)
+              (if (eq stage 'buffer)
+                  (error "synthetic buffer failure")
+                (let ((buffer (apply real-generate-new-buffer args)))
+                  (push buffer buffers)
+                  buffer))))
+           ((symbol-function 'make-process)
+            (lambda (&rest _args)
+              (if (eq stage 'process)
+                  (error "synthetic process failure")
+                (error "unexpected process creation"))))
+           ((symbol-function 'gdocs--curl-async)
+            gdocs-test--production-curl-async))
+        (should-error
+         (gdocs--curl-async
+          "https://example.invalid/save" "POST" nil "secret-request-body"
+          (lambda (_response _code err)
+            (cl-incf callback-count)
+            (setq callback-error err)))))
+      (should (= callback-count 1))
+      (should (stringp callback-error))
+      (should-not (string-match-p "secret-request-body" callback-error))
+      (dolist (file files) (should-not (file-exists-p file)))
+      (dolist (buffer buffers) (should-not (buffer-live-p buffer))))))
+
 (ert-deftest gdocs-test-sync-curl-timeout-args-and-sanitized-diagnostic ()
   "The synchronous curl transport applies both limits without exposing BODY."
   (let ((gdocs-curl-connect-timeout 3)
