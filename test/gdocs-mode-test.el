@@ -1091,13 +1091,40 @@ END is the inclusive final OT position."
 
 (ert-deftest gdocs-test-inline-object-dimensions-reject-invalid-values ()
   "Rendering rejects non-finite and non-positive dimensions."
-  (dolist (value (list nil "1" 0 -1 -0.0
+  (dolist (value (list nil "1" 0 -1 -0.0 (expt 10 400)
                        (read "0.0e+NaN")
                        (read "1.0e+INF")
                        (read "-1.0e+INF")))
     (should-error (gdocs--inline-object-number value) :type 'user-error))
   (dolist (token '("0" "-1" "NaN" "1.0e+INF" "1e400"))
     (should-not (gdocs--inline-object-dimension token))))
+
+(ert-deftest gdocs-test-inline-object-render-validates-programmatic-objects ()
+  "Programmatic rendering accepts only complete, safe image metadata."
+  (let ((object '(:kind :inline-object :object-kind :image
+                        :entity-id "kix.safe" :content-id "content-safe"
+                        :width 1 :height 2)))
+    (should (equal (gdocs--render-inline-object object)
+                   "#+gdocs_inline_object: image kix.safe 1x2 content-id=content-safe"))
+    (dolist (change '((:kind :para)
+                      (:object-kind :video)
+                      (:entity-id nil)
+                      (:entity-id "")
+                      (:entity-id "two fields")
+                      (:entity-id "line\nbreak")
+                      (:entity-id "control\0char")
+                      (:content-id nil)
+                      (:content-id "")
+                      (:content-id "line\rbreak")
+                      (:content-id "control\0char")
+                      (:width 0)
+                      (:width 1.0e+INF)
+                      (:height 0.0e+NaN)
+                      (:height 1e400)))
+      (should-error
+       (gdocs--render-inline-object
+        (plist-put (copy-sequence object) (car change) (cadr change)))
+       :type 'user-error))))
 
 (ert-deftest gdocs-test-inline-images-use-te-positions-not-entity-order ()
   "Multiple images are sorted by OT position, not ae or te order."
@@ -3151,7 +3178,14 @@ END is the inclusive final OT position."
                   "image kix.synthetic 1x-1 content-id=content"
                   "image kix.synthetic invalidx1 content-id=content"
                   "image kix.synthetic 1xinvalid content-id=content"
-                  "image kix.synthetic 1x1x1 content-id=content"))
+                  "image kix.synthetic 1x1x1 content-id=content"
+                  "image kix.synthetic 1e400x1 content-id=content"
+                  "image kix.synthetic 1x1e400 content-id=content"
+                  "image kix.synthetic 1x1 content-id=content\nextra"
+                  "image kix.syn\nthetic 1x1 content-id=content"
+                  "image kix.syn\0thetic 1x1 content-id=content"
+                  "image kix.synthetic 1x1 content-id=con\rtent"
+                  "image kix.synthetic 1x1 content-id=con\0tent"))
     (should-not (gdocs--parse-inline-object-spec spec))))
 
 (ert-deftest gdocs-test-malformed-inline-object-grammar-is-never-normalized ()
@@ -3163,7 +3197,10 @@ END is the inclusive final OT position."
                     "image 1x1 content-id=content"
                     "image kix.synthetic 0x1 content-id=content"
                     "image kix.synthetic -1x1 content-id=content"
-                    "image kix.synthetic invalidx1 content-id=content"))
+                    "image kix.synthetic invalidx1 content-id=content"
+                    "image kix.synthetic 1e400x1 content-id=content"
+                    "image kix.syn\0thetic 1x1 content-id=content"
+                    "image kix.synthetic 1x1 content-id=con\rtent"))
       (dolist (body (list (format "#+gdocs_inline_object: %s\n" spec)
                           (format "Before @@gdocs-inline-object:%s@@ after\n"
                                   spec)))

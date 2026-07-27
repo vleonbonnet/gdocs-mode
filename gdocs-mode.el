@@ -3000,7 +3000,17 @@ than the reverse (which org would treat as opaque).")
            (let ((as-float (float value)))
              (and (= as-float as-float)
                   (< as-float 1.0e+INF)))
-         (arithmetic-error nil))))
+         (error nil))))
+
+(defun gdocs--valid-inline-object-id-p (value)
+  "Return non-nil when VALUE is a nonempty, control-free marker field."
+  (and (stringp value)
+       (not (string-empty-p value))
+       (not (string-match-p "[[:space:]]" value))
+       (not (seq-some
+             (lambda (char)
+               (eq (get-char-code-property char 'general-category) 'Cc))
+             value))))
 
 (defun gdocs--inline-object-number (value)
   "Format inline-object dimension VALUE for an Org placeholder."
@@ -3016,11 +3026,19 @@ than the reverse (which org would treat as opaque).")
 
 (defun gdocs--inline-object-spec (object)
   "Return the unambiguous, remote-marked Org payload for OBJECT."
+  (unless (and (listp object)
+               (eq (plist-get object :kind) :inline-object)
+               (eq (plist-get object :object-kind) :image)
+               (gdocs--valid-inline-object-id-p
+                (plist-get object :entity-id))
+               (gdocs--valid-inline-object-id-p
+                (plist-get object :content-id)))
+    (user-error "gdocs: invalid inline-object marker metadata"))
   (format "image %s %sx%s content-id=%s"
-          (or (plist-get object :entity-id) "unknown-entity")
+          (plist-get object :entity-id)
           (gdocs--inline-object-number (plist-get object :width))
           (gdocs--inline-object-number (plist-get object :height))
-          (or (plist-get object :content-id) "unknown-content")))
+          (plist-get object :content-id)))
 
 (defun gdocs--render-inline-object (object &optional embedded)
   "Render OBJECT as an explicit Org remote-object placeholder.
@@ -3472,8 +3490,16 @@ than to the final text, so it never appears inside a source block."
   "Parse the payload of a `gdocs_inline_object' Org placeholder.
 
 The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT'."
-  (let* ((fields (split-string (string-trim (or value ""))
-                                "[ \t]+" t))
+  (let* ((valid-payload (and (stringp value)
+                             (not (seq-some
+                                   (lambda (char)
+                                     (eq (get-char-code-property
+                                          char 'general-category)
+                                         'Cc))
+                                   value))))
+         (fields (and valid-payload
+                      (split-string (string-trim value)
+                                    "[ \t]+" t)))
          (dimensions (nth 2 fields))
          (content-field (nth 3 fields))
          (content-id (and (stringp content-field)
@@ -3492,8 +3518,8 @@ The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT'."
             height-token (match-string 2 dimensions))
       (when (and (gdocs--inline-object-dimension width-token)
                   (gdocs--inline-object-dimension height-token)
-                  (stringp content-id)
-                  (not (string-empty-p content-id)))
+                  (gdocs--valid-inline-object-id-p (nth 1 fields))
+                  (gdocs--valid-inline-object-id-p content-id))
         (list :kind :inline-object
               :entity-id (nth 1 fields)
               :object-kind :image
