@@ -5332,53 +5332,57 @@ modelChunk we need for the op stream. Comments live in the cookie-auth
        (cond
          (err (finish nil err))
          (t
-         (gdocs--fetch-docdetails-async
-          doc-id state
-          (lambda (details details-err)
-            (when details-err
-              (gdocs-log 'debug "docdetails fetch failed for %s: %s"
-                         doc-id details-err))
-            (condition-case sig
-                (let* ((creation-time-ms
-                        (and (listp details)
-                             (alist-get 'CREATION_TIME details)))
-                       (built (gdocs--ot-decode-pipeline
-                               doc-id edit-html state creation-time-ms))
-                       (title (car built))
-                       (body (cdr built))
-                       (parsed (gdocs--parse-model-chunk-full edit-html))
-                       (anchor-map (gdocs--decode-doco-anchors
-                                    (plist-get parsed :ops)))
-                       (ot-body (plist-get state :ot-body)))
-                  (gdocs--docos-sync-raw-async
-                   doc-id state
-                   (lambda (raw _docos-err)
-                     (condition-case sig2
-                         (let* ((comments (and raw
-                                               (gdocs--parse-docos-sync-response
-                                                raw)))
-                                 (_namespace-available
-                                  (and comments
-                                       (gdocs--assert-comment-footnote-namespace-available
-                                        body)))
-                                 (body-with-refs
-                                 (if (and comments ot-body)
-                                     (gdocs--inline-comment-refs
-                                      body ot-body anchor-map comments)
-                                   body))
-                                (final (if comments
-                                           (concat (string-trim-right
-                                                    body-with-refs)
-                                                   "\n\n"
-                                                   (gdocs--render-comments-section
-                                                    comments))
-                                         body-with-refs)))
-                            (gdocs--apply-pull-into-buffer
-                             doc-id buf title final snapshot
-                             (plist-get state :revision))
-                            (finish final nil))
-                        (error (finish nil (error-message-string sig2)))))))
-              (error (finish nil (error-message-string sig)))))))))))))
+          (condition-case setup-sig
+              (gdocs--fetch-docdetails-async
+               doc-id state
+               (lambda (details details-err)
+                 (when details-err
+                   (gdocs-log 'debug "docdetails fetch failed for %s: %s"
+                              doc-id details-err))
+                 (condition-case sig
+                     (let* ((creation-time-ms
+                             (and (listp details)
+                                  (alist-get 'CREATION_TIME details)))
+                            (built (gdocs--ot-decode-pipeline
+                                    doc-id edit-html state creation-time-ms))
+                            (title (car built))
+                            (body (cdr built))
+                            (parsed (gdocs--parse-model-chunk-full edit-html))
+                            (anchor-map (gdocs--decode-doco-anchors
+                                         (plist-get parsed :ops)))
+                            (ot-body (plist-get state :ot-body)))
+                       (gdocs--docos-sync-raw-async
+                        doc-id state
+                        (lambda (raw _docos-err)
+                          (condition-case sig2
+                              (let* ((comments
+                                      (and raw
+                                           (gdocs--parse-docos-sync-response raw)))
+                                     (_namespace-available
+                                      (and comments
+                                           (gdocs--assert-comment-footnote-namespace-available
+                                            body)))
+                                     (body-with-refs
+                                      (if (and comments ot-body)
+                                          (gdocs--inline-comment-refs
+                                           body ot-body anchor-map comments)
+                                        body))
+                                     (final
+                                      (if comments
+                                          (concat
+                                           (string-trim-right body-with-refs)
+                                           "\n\n"
+                                           (gdocs--render-comments-section
+                                            comments))
+                                        body-with-refs)))
+                                (gdocs--apply-pull-into-buffer
+                                 doc-id buf title final snapshot
+                                 (plist-get state :revision))
+                                (finish final nil))
+                            (error
+                             (finish nil (error-message-string sig2)))))))
+                   (error (finish nil (error-message-string sig))))))
+            (error (finish nil (error-message-string setup-sig)))))))))))
 
 (defface gdocs-pull-flash
   '((((background dark))  :background "#264f3a" :extend t)
@@ -7471,25 +7475,45 @@ an explicit retry policy such as the bounded throttle retry."
 (defun gdocs--run-op-result-async-verify-save
     (doc-id plan delay callback)
   "Refetch after a failed save and callback with `(OUTCOME STATE ERR)'."
-  (let ((verify
-         (lambda ()
-           (gdocs--fetch-edit-state-async
-            doc-id
-            (lambda (fresh-state state-err)
-              (if state-err
-                  (funcall callback nil nil
-                           (format "state refetch failed: %s" state-err))
-                (condition-case sig
-                    (funcall callback
-                             (gdocs--push-classify-refetched-state
-                              doc-id fresh-state plan)
-                             fresh-state nil)
+  (let (done verify)
+    (cl-labels
+        ((finish (outcome state err)
+           (unless done
+             (setq done t)
+             (funcall callback outcome state err))))
+      (setq verify
+            (lambda ()
+              (unless done
+                (condition-case setup-sig
+                    (gdocs--fetch-edit-state-async
+                     doc-id
+                     (lambda (fresh-state state-err)
+                       (if state-err
+                           (finish nil nil
+                                   (format "state refetch failed: %s"
+                                           state-err))
+                         (condition-case sig
+                             (finish
+                              (gdocs--push-classify-refetched-state
+                               doc-id fresh-state plan)
+                              fresh-state nil)
+                           (error
+                            (finish nil nil
+                                    (error-message-string sig)))))))
                   (error
-                   (funcall callback nil nil
-                            (error-message-string sig))))))))))
-    (if (> delay 0)
-        (run-with-timer delay nil verify)
-      (funcall verify))))
+                   (finish nil nil (error-message-string setup-sig)))))))
+      (condition-case timer-sig
+          (if (> delay 0)
+              (run-with-timer
+               delay nil
+               (lambda ()
+                 (condition-case sig
+                     (funcall verify)
+                   (error
+                    (finish nil nil (error-message-string sig))))))
+            (funcall verify))
+        (error
+         (finish nil nil (error-message-string timer-sig)))))))
 
 (defun gdocs--run-op-result-async-handle-failure
     (doc-id intent plan callback attempt failure retryable
@@ -7692,38 +7716,43 @@ so the insertion position is never copied from the delete plan."
                             ;; content hash until every stage succeeds.
                             (gdocs--put-top-property
                              "GDOC_REVISION" (number-to-string rev))))
-                        (gdocs--fetch-edit-state-async
-                         doc-id
-                         (lambda (fresh-state state-err)
-                           (condition-case verify-sig
-                               (if state-err
-                                   (finish op-result state-err)
-                                 (gdocs--push-verify-state
-                                  doc-id fresh-state post-body rev)
-                                 (let ((fresh-body
-                                        (gdocs--push-state-body
-                                         doc-id fresh-state)))
-                                   (if (and (eq stage :delete)
-                                            (length> inserted 0))
-                                       (run-stage
-                                        :insert
-                                        fresh-state
-                                        fresh-body
-                                        (list :start
-                                              (plist-get
-                                               (plist-get plan :region)
-                                               :start)
-                                              :deleted ""
-                                              :inserted inserted))
-                                     (finish
-                                      (list :revision rev
-                                            :state fresh-state
-                                            :body fresh-body
-                                            :plan plan)
-                                      nil))))
-                             (error
-                              (finish op-result
-                                      (error-message-string verify-sig))))))))
+                        (condition-case setup-sig
+                            (gdocs--fetch-edit-state-async
+                             doc-id
+                             (lambda (fresh-state state-err)
+                               (condition-case verify-sig
+                                   (if state-err
+                                       (finish op-result state-err)
+                                     (gdocs--push-verify-state
+                                      doc-id fresh-state post-body rev)
+                                     (let ((fresh-body
+                                            (gdocs--push-state-body
+                                             doc-id fresh-state)))
+                                       (if (and (eq stage :delete)
+                                                (length> inserted 0))
+                                           (run-stage
+                                            :insert
+                                            fresh-state
+                                            fresh-body
+                                            (list :start
+                                                  (plist-get
+                                                   (plist-get plan :region)
+                                                   :start)
+                                                  :deleted ""
+                                                  :inserted inserted))
+                                         (finish
+                                          (list :revision rev
+                                                :state fresh-state
+                                                :body fresh-body
+                                                :plan plan)
+                                          nil))))
+                                 (error
+                                  (finish
+                                   op-result
+                                   (error-message-string verify-sig))))))
+                          (error
+                           (finish op-result
+                                   (error-message-string setup-sig))))))
                   (error
                    (finish nil (error-message-string callback-sig)))))))))
       ;; The selector is content-based.  It is only used to choose the same
@@ -7810,19 +7839,35 @@ so the insertion position is never copied from the delete plan."
                       (cl-decf remaining)
                       (if (zerop remaining)
                           (finish last-rev nil)
-                        (run-with-timer
-                         gdocs--inter-region-delay nil
-                         (lambda ()
-                           (gdocs--multi-regions-refetch-async
-                            doc-id current-state current-body
-                            (lambda (fresh-state refetch-err)
-                              (if refetch-err
-                                  (finish last-rev refetch-err)
-                                (setq current-state fresh-state
-                                      current-body
-                                      (gdocs--push-state-body
-                                       doc-id fresh-state))
-                                (step)))))))))))))))
+                        (condition-case timer-sig
+                            (run-with-timer
+                             gdocs--inter-region-delay nil
+                             (lambda ()
+                               (unless done
+                                 (condition-case setup-sig
+                                     (gdocs--multi-regions-refetch-async
+                                      doc-id current-state current-body
+                                      (lambda (fresh-state refetch-err)
+                                        (condition-case callback-sig
+                                            (if refetch-err
+                                                (finish last-rev refetch-err)
+                                              (setq current-state fresh-state
+                                                    current-body
+                                                    (gdocs--push-state-body
+                                                     doc-id fresh-state))
+                                              (step))
+                                          (error
+                                           (finish
+                                            last-rev
+                                            (error-message-string
+                                             callback-sig))))))
+                                   (error
+                                    (finish last-rev
+                                            (error-message-string
+                                             setup-sig)))))))
+                          (error
+                           (finish last-rev
+                                   (error-message-string timer-sig)))))))))))))
       (if (zerop remaining)
           (finish nil nil)
         (step)))))
@@ -8791,49 +8836,56 @@ writing a final hash baseline."
 Single GET on /edit gives both the edit state and the modelChunk we
 decode into the org view we diff against. Releases the sync mutex on
 completion or error."
-  (let ((release (lambda (err)
-                   (gdocs--sync-release owner)
-                   (when err (gdocs-log 'warn "Push %s: %s" doc-id err)))))
+  (let* ((done nil)
+         (release
+          (lambda (err)
+           (unless done
+             (setq done t)
+             (gdocs--sync-release owner)
+             (when err (gdocs-log 'warn "Push %s: %s" doc-id err))
+             t))))
     (gdocs--fetch-edit-page-async
      doc-id
      (lambda (state html err)
-       (let* ((remote-rev (and state (plist-get state :revision)))
-              (token (and state (plist-get state :token)))
-              (ouid (and state (plist-get state :ouid))))
-         (cond
-          (err (funcall release err))
-          ((null state) (funcall release "empty edit state"))
-          ((not (and token ouid remote-rev))
-           (funcall release "missing token/ouid/rev"))
-          (t
-           (condition-case sig
-               (let* ((remote-body
-                       (gdocs--ot-remote-org-body doc-id html state))
-                      (plan (gdocs--push-plan-for-diff
-                             state local-body remote-body)))
-                 ;; STATE and HTML came from the current /edit fetch above;
-                 ;; preflight decodes their raw ops again rather than trusting
-                 ;; any capability summary serialized in the buffer.
-                 (gdocs--push-preflight state local-body plan)
-                 (cond
-                  ((string= (car (gdocs--strip-heading-drawers local-body))
-                            remote-body)
-                   (when (buffer-live-p buf)
-                     (with-current-buffer buf
-                       (gdocs--finalize-push-props remote-rev local-body)))
-                   (gdocs--sync-release owner)
-                   (gdocs-log 'info "Push: no local changes for %s" doc-id))
-                  ((not (string= local-rev (format "%s" remote-rev)))
-                   (funcall release
-                            (format "refusing push: remote rev %s != local %s"
-                                    remote-rev local-rev)))
-                  (t
-                   (gdocs--apply-push-async
-                    doc-id state local-body remote-body buf
-                    (lambda (_rev e2)
-                      (gdocs--sync-release owner)
-                      (when e2 (gdocs-log 'warn "Push %s: %s" doc-id e2)))))))
-             (error (funcall release (error-message-string sig)))))))))))
+       (unless done
+         (let* ((remote-rev (and state (plist-get state :revision)))
+                (token (and state (plist-get state :token)))
+                (ouid (and state (plist-get state :ouid))))
+           (cond
+            (err (funcall release err))
+            ((null state) (funcall release "empty edit state"))
+            ((not (and token ouid remote-rev))
+             (funcall release "missing token/ouid/rev"))
+            (t
+             (condition-case sig
+                 (let* ((remote-body
+                         (gdocs--ot-remote-org-body doc-id html state))
+                        (plan (gdocs--push-plan-for-diff
+                               state local-body remote-body)))
+                   ;; STATE and HTML came from the current /edit fetch above;
+                   ;; preflight decodes their raw ops again rather than trusting
+                   ;; any capability summary serialized in the buffer.
+                   (gdocs--push-preflight state local-body plan)
+                   (cond
+                    ((string= (car (gdocs--strip-heading-drawers local-body))
+                              remote-body)
+                     (when (buffer-live-p buf)
+                       (with-current-buffer buf
+                         (gdocs--finalize-push-props remote-rev local-body)))
+                     (when (funcall release nil)
+                       (gdocs-log 'info "Push: no local changes for %s" doc-id)))
+                    ((not (string= local-rev (format "%s" remote-rev)))
+                     (funcall release
+                              (format
+                               "refusing push: remote rev %s != local %s"
+                               remote-rev local-rev)))
+                    (t
+                     (gdocs--apply-push-async
+                      doc-id state local-body remote-body buf
+                      (lambda (_rev e2)
+                        (funcall release e2))))))
+               (error
+                (funcall release (error-message-string sig))))))))))))
 
 (defun gdocs-debug-push-state (&optional doc-id out-file)
   "Dump everything `gdocs-push-remotely' sees into OUT-FILE for inspection.

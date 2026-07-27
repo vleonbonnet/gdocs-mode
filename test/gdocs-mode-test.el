@@ -5194,6 +5194,170 @@ that a removed preflight guard would be observed as an unexpected success."
     (should (zerop fetch-count))
     (should (= callback-count 1))))
 
+(ert-deftest gdocs-test-pull-docdetails-setup-failure-finishes-once ()
+  "A chained docdetails setup signal releases only its captured owner."
+  (let ((gdocs--sync-mutex nil)
+        edit-callback
+        (callback-count 0)
+        callback-error)
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:END:\n\nBody\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                 (lambda (_doc callback) (setq edit-callback callback)))
+                ((symbol-function 'gdocs--fetch-docdetails-async)
+                 (lambda (&rest _args)
+                   (error "synthetic docdetails setup failure"))))
+        (gdocs-pull-locally
+         "synthetic-id"
+         (lambda (_body err)
+           (cl-incf callback-count)
+           (setq callback-error err)))
+        (let ((old-owner gdocs--sync-mutex))
+          (funcall edit-callback '(:revision 1) "html" nil)
+          (should-not gdocs--sync-mutex)
+          (let ((new-owner (gdocs--sync-acquire)))
+            (should new-owner)
+            (funcall edit-callback '(:revision 1) "html" nil)
+            (should (eq gdocs--sync-mutex new-owner))
+            (should-not (gdocs--sync-release old-owner))
+            (should (gdocs--sync-release new-owner))))))
+    (should (= callback-count 1))
+    (should (string-match-p "docdetails setup failure" callback-error))))
+
+(ert-deftest gdocs-test-reconciliation-refetch-setup-failure-finishes-once ()
+  "A reconciliation refetch setup signal reaches the once-only callback."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         (callback-count 0)
+         callback-error)
+    (cl-letf (((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (funcall callback nil "lost response")))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (&rest _args)
+                 (error "synthetic reconciliation setup failure"))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (_result err)
+         (cl-incf callback-count)
+         (setq callback-error err))))
+    (should (= callback-count 1))
+    (should (string-match-p "reconciliation setup failure" callback-error))))
+
+(ert-deftest gdocs-test-throttle-timer-setup-failure-finishes-once ()
+  "A throttle timer setup signal is returned instead of escaping."
+  (let* ((gdocs--rate-limit-retry-delay 1)
+         (state (gdocs-test--push-state 1 "A"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         (callback-count 0)
+         callback-error)
+    (cl-letf (((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (funcall callback nil
+                          '(:http-code 550 :err-code 13 :di 1))))
+              ((symbol-function 'run-with-timer)
+               (lambda (&rest _args)
+                 (error "synthetic timer setup failure"))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (_result err)
+         (cl-incf callback-count)
+         (setq callback-error err))))
+    (should (= callback-count 1))
+    (should (string-match-p "timer setup failure" callback-error))))
+
+(ert-deftest gdocs-test-throttle-timer-body-guards-refetch-setup-failure ()
+  "The delayed throttle body converts a refetch setup signal to completion."
+  (let* ((gdocs--rate-limit-retry-delay 1)
+         (state (gdocs-test--push-state 1 "A"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         timer-function
+         (callback-count 0)
+         callback-error)
+    (cl-letf (((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (funcall callback nil
+                          '(:http-code 550 :err-code 13 :di 1))))
+              ((symbol-function 'run-with-timer)
+               (lambda (_delay _repeat function &rest _args)
+                 (setq timer-function function)))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (&rest _args)
+                 (error "synthetic delayed refetch setup failure"))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (_result err)
+         (cl-incf callback-count)
+         (setq callback-error err)))
+      (funcall timer-function)
+      (funcall timer-function))
+    (should (= callback-count 1))
+    (should (string-match-p "delayed refetch setup failure" callback-error))))
+
+(ert-deftest gdocs-test-region-verification-setup-failure-preserves-revision ()
+  "A committed region revision survives verification dispatch failure."
+  (let* ((state (gdocs-test--push-state 1 "old\n"))
+         (region (gdocs--diff-single-region "old\n" "new\n"))
+         (callback-count 0)
+         result callback-error)
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_REVISION: 1\n:END:\n\nnew\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--save-request-async)
+                 (lambda (_doc _state _commands callback)
+                   (funcall callback
+                            '((metadata . ((serverRevision . 2)))) nil)))
+                ((symbol-function 'gdocs--fetch-edit-state-async)
+                 (lambda (&rest _args)
+                   (error "synthetic verification setup failure"))))
+        (gdocs--apply-in-place-region-result-async
+         "synthetic" state "old\n" region (current-buffer) "new\n"
+         (lambda (value err)
+           (cl-incf callback-count)
+           (setq result value callback-error err)))))
+    (should (= callback-count 1))
+    (should (= (plist-get result :revision) 2))
+    (should (string-match-p "verification setup failure" callback-error))))
+
+(ert-deftest gdocs-test-multi-region-refetch-setup-failure-preserves-revision ()
+  "A delayed boundary setup signal reports the last committed revision."
+  (let ((state (gdocs-test--push-state 1 "one\n\ntwo\n"))
+        (regions (list '(:start 0) '(:start 5)))
+        (callback-count 0)
+        callback-revision callback-error)
+    (cl-letf (((symbol-function 'gdocs--apply-in-place-region-result-async)
+               (lambda (_doc _state _body _region _buffer _local callback)
+                 (funcall callback
+                          '(:revision 2 :state (:revision 2) :body "changed")
+                          nil)))
+              ((symbol-function 'run-with-timer)
+               (lambda (_delay _repeat function &rest args)
+                 (apply function args)))
+              ((symbol-function 'gdocs--multi-regions-refetch-async)
+               (lambda (&rest _args)
+                 (error "synthetic boundary setup failure"))))
+      (gdocs--apply-multi-regions-async
+       "synthetic" state "one\n\ntwo\n" regions nil
+       (lambda (revision err)
+         (cl-incf callback-count)
+         (setq callback-revision revision callback-error err))))
+    (should (= callback-count 1))
+    (should (= callback-revision 2))
+    (should (string-match-p "boundary setup failure" callback-error))))
+
 (ert-deftest gdocs-test-async-partial-success-reports-committed-revision ()
   "A partial push records its revision without establishing a baseline."
   (let* ((gdocs--rate-limit-retry-delay 0)
