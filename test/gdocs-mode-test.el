@@ -5713,6 +5713,122 @@ that a removed preflight guard would be observed as an unexpected success."
     (should (zerop save-count))
     (should-not gdocs--sync-mutex)))
 
+(ert-deftest gdocs-test-public-push-canonical-noop-refreshes-stale-baseline ()
+  "The public path trusts a fresh canonical no-op rather than raw Org text."
+  (let* ((gdocs-push-backend 'ot-incremental)
+         (gdocs--sync-mutex nil)
+         (old (gdocs-dm-make-doc
+               :paragraphs
+               (list (list :kind :heading
+                           :runs (list (gdocs-dm-make-run "Heading"))))))
+         (local-body "* Heading\n")
+         (remote-body "Heading\n")
+         (state (list :revision 9 :token "token" :ouid "ouid"
+                      :ot-body remote-body
+                      :ot-ops (list (gdocs-test--insert-op remote-body))))
+         (save-count 0)
+         (apply-count 0))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n"
+              ":GDOC_REVISION: 8\n:END:\n\n" local-body)
+      (org-mode)
+      (let ((captured-body (gdocs--buffer-body-as-plain)))
+        (should-not (string= captured-body remote-body))
+        (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                   (lambda (_doc callback)
+                     (funcall callback state "synthetic-html" nil)))
+                  ((symbol-function 'gdocs--ot-remote-org-body)
+                   (lambda (&rest _args) remote-body))
+                  ((symbol-function 'gdocs-dm-from-ops)
+                   (lambda (&rest _args) old))
+                  ((symbol-function 'gdocs--save-request-async)
+                   (lambda (&rest _args) (cl-incf save-count)))
+                  ((symbol-function 'gdocs--apply-push-async)
+                   (lambda (&rest _args) (cl-incf apply-count))))
+          (gdocs-push-remotely "synthetic-id"))
+        (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "9"))
+        (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                       (secure-hash 'sha256 captured-body)))
+        (should (eq (gdocs--sync-state) 'clean))))
+    (should (zerop save-count))
+    (should (zerop apply-count))
+    (should-not gdocs--sync-mutex)))
+
+(ert-deftest gdocs-test-public-push-stale-non-noop-is-refused-before-transport ()
+  "A fresh non-noop plan does not bypass stale-revision refusal."
+  (let* ((gdocs-push-backend 'ot-incremental)
+         (gdocs--sync-mutex nil)
+         (old (gdocs-dm-make-doc
+               :paragraphs
+               (list (list :kind :para
+                           :runs (list (gdocs-dm-make-run "Remote"))))))
+         (remote-body "Remote\n")
+         (state (list :revision 9 :token "token" :ouid "ouid"
+                      :ot-body remote-body
+                      :ot-ops (list (gdocs-test--insert-op remote-body))))
+         (save-count 0)
+         (apply-count 0)
+         warning)
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n"
+              ":GDOC_REVISION: 8\n:END:\n\nChanged\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                 (lambda (_doc callback)
+                   (funcall callback state "synthetic-html" nil)))
+                ((symbol-function 'gdocs--ot-remote-org-body)
+                 (lambda (&rest _args) remote-body))
+                ((symbol-function 'gdocs-dm-from-ops)
+                 (lambda (&rest _args) old))
+                ((symbol-function 'gdocs--save-request-async)
+                 (lambda (&rest _args) (cl-incf save-count)))
+                ((symbol-function 'gdocs--apply-push-async)
+                 (lambda (&rest _args) (cl-incf apply-count)))
+                ((symbol-function 'gdocs-log)
+                 (lambda (_level format-string &rest args)
+                   (setq warning (apply #'format format-string args)))))
+        (gdocs-push-remotely "synthetic-id"))
+      (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "8")))
+    (should (string-match-p "refusing push: remote rev 9 != local 8" warning))
+    (should (zerop save-count))
+    (should (zerop apply-count))
+    (should-not gdocs--sync-mutex)))
+
+(ert-deftest gdocs-test-public-canonical-noop-preserves-concurrent-edit ()
+  "Canonical no-op metadata hashes the captured body, not a later edit."
+  (let* ((gdocs-push-backend 'ot-incremental)
+         (gdocs--sync-mutex nil)
+         (old (gdocs-dm-make-doc
+               :paragraphs
+               (list (list :kind :heading
+                           :runs (list (gdocs-dm-make-run "Heading"))))))
+         (remote-body "Heading\n")
+         (state (list :revision 9 :token "token" :ouid "ouid"
+                      :ot-body remote-body
+                      :ot-ops (list (gdocs-test--insert-op remote-body))))
+         fetch-callback
+         (save-count 0))
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n"
+              ":GDOC_REVISION: 8\n:END:\n\n* Heading\n")
+      (org-mode)
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                 (lambda (_doc callback) (setq fetch-callback callback)))
+                ((symbol-function 'gdocs--ot-remote-org-body)
+                 (lambda (&rest _args) remote-body))
+                ((symbol-function 'gdocs-dm-from-ops)
+                 (lambda (&rest _args) old))
+                ((symbol-function 'gdocs--save-request-async)
+                 (lambda (&rest _args) (cl-incf save-count))))
+        (gdocs-push-remotely "synthetic-id")
+        (goto-char (point-max))
+        (insert "Later\n")
+        (funcall fetch-callback state "synthetic-html" nil))
+      (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "9"))
+      (should (eq (gdocs--sync-state) 'dirty)))
+    (should (zerop save-count))
+    (should-not gdocs--sync-mutex)))
+
 (ert-deftest gdocs-test-canonical-incremental-no-command-finalizes-without-save ()
   "A canonical incremental no-op establishes metadata without /save."
   (let* ((gdocs-push-backend 'ot-incremental)

@@ -8901,8 +8901,7 @@ completion or error."
                    ;; any capability summary serialized in the buffer.
                    (gdocs--push-preflight state local-body plan)
                    (cond
-                    ((string= (car (gdocs--strip-heading-drawers local-body))
-                              remote-body)
+                    ((eq (plist-get plan :kind) :noop)
                      (when (buffer-live-p buf)
                        (with-current-buffer buf
                          (gdocs--finalize-push-props remote-rev local-body)))
