@@ -274,6 +274,11 @@ a documented OAuth-capable API.
 | `gdocs-debug-comments-fetch` | Fetch comments into `*gdocs-comments-debug*` for diagnostics; does not push. |
 | `gdocs-debug-push-state` | Write a read-only push-planning dump to an unpredictable mode-0600 temporary file. |
 
+When called from Lisp with a callback, `gdocs-pull-locally` completes it
+exactly once as `(CALLBACK BODY ERR)`. If another sync operation owns the
+global lock, it returns a nil body and `"sync busy"` without disturbing that
+operation. Interactive busy pulls continue to log a warning.
+
 Diagnostic dumps and the comments debug buffer contain sensitive document,
 comment, and raw OT content. They persist until explicitly deleted or killed.
 The commands report exact generated paths without logging raw content; supplied

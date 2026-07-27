@@ -5251,10 +5251,18 @@ Returns the doc's title string, or nil if not reachable."
   "Pull remote into current buffer asynchronously.
 DOC-ID falls back to the buffer's GDOC_ID property. The network I/O runs
 in a background curl subprocess so Emacs stays responsive. Optional
-CALLBACK is `(funcall CB BODY ERR)' on completion."
+CALLBACK is called exactly once as `(funcall CALLBACK BODY ERR)'. If a
+sync operation is already active, BODY is nil and ERR is \"sync busy\"."
   (interactive)
   (if gdocs--sync-mutex
-      (gdocs-log 'warn "Mutex locked - skipping pull")
+      (progn
+        (gdocs-log 'warn "Mutex locked - skipping pull")
+        (when callback
+          (condition-case callback-sig
+              (funcall callback nil "sync busy")
+            (error
+             (gdocs-log 'error "busy pull callback failed: %s"
+                        (error-message-string callback-sig))))))
     (let ((owner (gdocs--sync-acquire))
           (dispatched nil))
       (unwind-protect

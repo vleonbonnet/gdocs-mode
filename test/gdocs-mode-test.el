@@ -4754,6 +4754,49 @@ that a removed preflight guard would be observed as an unexpected success."
         (should-error (gdocs-pull-locally) :type 'user-error)))
     (should-not gdocs--sync-mutex)))
 
+(ert-deftest gdocs-test-busy-pull-completes-callback-once ()
+  "A busy pull completes its callback once with the documented result."
+  (let* ((owner (list 'active-owner))
+         (gdocs--sync-mutex owner)
+         (callback-count 0)
+         (callback-body :unset)
+         (callback-error :unset))
+    (gdocs-pull-locally
+     "synthetic-id"
+     (lambda (body err)
+       (cl-incf callback-count)
+       (setq callback-body body
+             callback-error err)))
+    (should (= callback-count 1))
+    (should-not callback-body)
+    (should (equal callback-error "sync busy"))
+    (should (eq gdocs--sync-mutex owner))))
+
+(ert-deftest gdocs-test-busy-pull-callback-error-preserves-owner ()
+  "A failing busy callback cannot disturb the active sync operation."
+  (let* ((owner (list 'active-owner))
+         (gdocs--sync-mutex owner)
+         (callback-count 0))
+    (gdocs-pull-locally
+     "synthetic-id"
+     (lambda (_body _err)
+       (cl-incf callback-count)
+       (error "synthetic callback failure")))
+    (should (= callback-count 1))
+    (should (eq gdocs--sync-mutex owner))))
+
+(ert-deftest gdocs-test-interactive-busy-pull-logs-warning ()
+  "An interactive busy pull retains its warning without changing ownership."
+  (let* ((owner (list 'active-owner))
+         (gdocs--sync-mutex owner)
+         logs)
+    (cl-letf (((symbol-function 'gdocs-log)
+               (lambda (level format-string &rest args)
+                 (push (cons level (apply #'format format-string args)) logs))))
+      (call-interactively #'gdocs-pull-locally))
+    (should (equal logs '((warn . "Mutex locked - skipping pull"))))
+    (should (eq gdocs--sync-mutex owner))))
+
 (ert-deftest gdocs-test-sync-auth-error-releases-owner ()
   "A synchronous authentication signal cannot strand the sync lock."
   (let ((gdocs--sync-mutex nil)
