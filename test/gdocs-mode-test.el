@@ -3881,6 +3881,129 @@ that a removed preflight guard would be observed as an unexpected success."
       (should (= (plist-get report :ot-start) 1))
       (should (= (plist-get report :ot-end) 7)))))
 
+(ert-deftest gdocs-test-omitted-list-nest-is-level-zero-everywhere ()
+  "An omitted `ls_nest' is equivalent to an explicit zero binding."
+  (let* ((body "Bound\n")
+         (definition
+          (car (gdocs--emit-list-defs
+                '(("list.default-level" . :bullet)))))
+         (explicit (gdocs--emit-list-style-op
+                    "list.default-level" 0
+                    (gdocs-test--line-end-pos body 1)))
+         (omitted (copy-tree explicit)))
+    (setcdr (assq 'sm omitted)
+            (assq-delete-all 'ls_nest (alist-get 'sm omitted)))
+    (let ((explicit-doc
+           (gdocs-dm-from-ops
+            7 "synthetic" nil body
+            (list (gdocs-test--insert-op body) definition explicit)))
+          (omitted-doc
+           (gdocs-dm-from-ops
+            7 "synthetic" nil body
+            (list (gdocs-test--insert-op body) definition omitted))))
+      (should-not (gdocs-dm-unsupported explicit-doc))
+      (should-not (gdocs-dm-unsupported omitted-doc))
+      (should (= (plist-get (car (gdocs-dm-paragraphs omitted-doc)) :nest)
+                 0))
+      (should (equal (gdocs-test--model-view explicit-doc)
+                     (gdocs-test--model-view omitted-doc))))))
+
+(ert-deftest gdocs-test-omitted-list-nest-validates-level-zero-definition ()
+  "Level-zero definition checks use the omitted binding's effective level."
+  (dolist (case '((:custom "b_gs") (:missing-level "nl_0")))
+    (let* ((body "Bound\nPlain\n")
+           (definition
+            (copy-tree
+             (car (gdocs--emit-list-defs
+                   '(("list.default-level" . :bullet))))))
+           (levels (alist-get 'le_nb (alist-get 'epm definition)))
+           (binding (gdocs--emit-list-style-op
+                     "list.default-level" 0
+                     (gdocs-test--line-end-pos body 1))))
+      (setcdr (assq 'sm binding)
+              (assq-delete-all 'ls_nest (alist-get 'sm binding)))
+      (if (eq (car case) :custom)
+          (setcdr (assq 'b_gs (cdr (assq 'nl_0 levels))) "◆")
+        (setcdr (assq 'le_nb (alist-get 'epm definition))
+                (assq-delete-all 'nl_0 levels)))
+      (let* ((ops (list (gdocs-test--insert-op body) definition binding))
+             (state (list :revision 7 :ot-body body :ot-ops ops))
+             (report
+              (cl-find (cadr case)
+                       (gdocs-dm-unsupported
+                        (gdocs-dm-from-ops 7 "synthetic" nil body ops))
+                       :key (lambda (item) (plist-get item :feature-type))
+                       :test #'equal)))
+        (should report)
+        (should (equal (list (plist-get report :ot-start)
+                             (plist-get report :ot-end))
+                       '(1 6)))
+        (should-error
+         (gdocs--push-preflight state "- Changed\nPlain\n"
+                                '(:kind :full-replace))
+         :type 'user-error)
+        (should
+         (gdocs--push-preflight
+          state "- Bound\nChanged\n"
+          '(:kind :incremental
+                  :ranges ((:ot-start 7 :ot-end 12
+                                        :insert-at 7 :delete-count 6)))))))))
+
+(ert-deftest gdocs-test-omitted-list-nest-checks-definition-cardinality ()
+  "Missing and ambiguous definitions are reported for an omitted level zero."
+  (dolist (count '(0 2))
+    (let* ((body "Bound\n")
+           (definition
+            (car (gdocs--emit-list-defs
+                  '(("list.cardinality" . :bullet)))))
+           (binding (gdocs--emit-list-style-op
+                     "list.cardinality" 0
+                     (gdocs-test--line-end-pos body 1))))
+      (setcdr (assq 'sm binding)
+              (assq-delete-all 'ls_nest (alist-get 'sm binding)))
+      (let* ((ops (append (list (gdocs-test--insert-op body))
+                          (make-list count definition)
+                          (list binding)))
+             (state (list :revision 7 :ot-body body :ot-ops ops))
+             (report
+              (cl-find "list-definition"
+                       (gdocs-dm-unsupported
+                        (gdocs-dm-from-ops 7 "synthetic" nil body ops))
+                       :key (lambda (item) (plist-get item :feature-type))
+                       :test #'equal)))
+        (should report)
+        (should (string-match-p (if (zerop count) "missing" "ambiguous")
+                                (plist-get report :explanation)))
+        (should (equal (list (plist-get report :ot-start)
+                             (plist-get report :ot-end))
+                       '(1 6)))
+        (should-error
+         (gdocs--push-preflight state "- Changed\n" '(:kind :full-replace))
+         :type 'user-error)))))
+
+(ert-deftest gdocs-test-explicit-invalid-list-nests-are-reported ()
+  "Only omission, not an explicit malformed value, defaults to level zero."
+  (dolist (nest '(-1 9 nil "0" :json-false))
+    (let* ((body "Bound\n")
+           (definition
+            (car (gdocs--emit-list-defs
+                  '(("list.invalid-level" . :bullet)))))
+           (binding (gdocs--emit-list-style-op
+                     "list.invalid-level" 0
+                     (gdocs-test--line-end-pos body 1))))
+      (setcdr (assq 'ls_nest (alist-get 'sm binding)) nest)
+      (let* ((ops (list (gdocs-test--insert-op body) definition binding))
+             (report
+              (cl-find "ls_nest"
+                       (gdocs-dm-unsupported
+                        (gdocs-dm-from-ops 7 "synthetic" nil body ops))
+                       :key (lambda (item) (plist-get item :feature-type))
+                       :test #'equal)))
+        (should report)
+        (should (equal (list (plist-get report :ot-start)
+                             (plist-get report :ot-end))
+                       '(1 6)))))))
+
 (ert-deftest gdocs-test-capability-list-explicitness-does-not-replace-semantics ()
   "Explicitness metadata cannot satisfy a missing list text-style value."
   (let* ((body "Bound\n")

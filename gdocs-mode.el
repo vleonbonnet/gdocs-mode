@@ -1478,6 +1478,16 @@ the decoder merely because they are decoded."
           (if cell (setcdr cell cur) (push (cons si cur) out)))))
     out))
 
+(defun gdocs--effective-list-nesting-level (sm)
+  "Return the effective list nesting level from style modifier SM.
+
+Google omits `ls_nest' for level zero.  Preserve an explicitly supplied
+value so malformed values remain available to capability validation."
+  (when (listp sm)
+    (if (assq 'ls_nest sm)
+        (alist-get 'ls_nest sm)
+      0)))
+
 (defun gdocs--decode-list-bindings (ops)
   "Walk list-style ops; return alist OT-POS → decoded list attributes."
   (let (out)
@@ -1487,7 +1497,7 @@ the decoder merely because they are decoded."
         (let* ((si (alist-get 'si op))
                (sm (alist-get 'sm op))
                (id (alist-get 'ls_id sm))
-               (nest (or (alist-get 'ls_nest sm) 0))
+               (nest (gdocs--effective-list-nesting-level sm))
                (text-style (alist-get 'ls_ts sm 'unset)))
           (when (stringp id)
             (push (cons si (list :list-id id :nest nest
@@ -2047,7 +2057,8 @@ not required to establish the semantic value."
                              (list :ranges nil :references nil :complete t))))
               (setq info
                     (plist-put info :references
-                               (cons (cons (alist-get 'ls_nest sm) range)
+                                (cons (cons (gdocs--effective-list-nesting-level sm)
+                                            range)
                                      (plist-get info :references))))
               (if range
                   (setq info (plist-put
@@ -2072,7 +2083,7 @@ not required to establish the semantic value."
       (when (and (equal (alist-get 'ty op) "as")
                  (equal (alist-get 'st op) "list"))
         (let* ((sm (alist-get 'sm op))
-               (nest (and (listp sm) (or (alist-get 'ls_nest sm) 0)))
+               (nest (gdocs--effective-list-nesting-level sm))
                (range (gdocs--list-binding-paragraph-range op body)))
           (when (and range (integerp nest) (<= 0 nest) (<= nest 8))
             (push (list :nest nest :range range) bindings)))))
@@ -2461,7 +2472,7 @@ report. Inline image reports are produced by
                 (dolist (report (gdocs--scan-list-text-style op sm body))
                   (push report reports))
                 (let ((id (and (listp sm) (alist-get 'ls_id sm)))
-                      (nest (and (listp sm) (alist-get 'ls_nest sm)))
+                       (nest (gdocs--effective-list-nesting-level sm))
                       (range (gdocs--list-binding-paragraph-range op body)))
                   (unless (stringp id)
                     (push (gdocs--capability-list-report
@@ -2469,10 +2480,9 @@ report. Inline image reports are produced by
                            "A remote list binding has no usable definition identifier."
                            "ls_id" range)
                           reports))
-                  (when (and nest
-                             (not (and (integerp nest)
-                                       (<= 0 nest) (<= nest 8))))
-                    (push (gdocs--capability-list-report
+                   (unless (and (integerp nest)
+                                (<= 0 nest) (<= nest 8))
+                     (push (gdocs--capability-list-report
                            :unsupported-paragraph
                            "A remote list nesting level is outside the supported range."
                            "ls_nest"
