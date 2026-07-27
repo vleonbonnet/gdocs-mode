@@ -1,5 +1,7 @@
 EMACS ?= emacs
-ROOT_DIR ?= $(CURDIR)
+ifneq ($(origin ROOT_DIR), command line)
+override ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+endif
 REQUEST_DIR ?=
 EMACS_BATCH = $(EMACS) -Q --batch -L "$(ROOT_DIR)" -L "$(ROOT_DIR)/test"
 SOURCE_FILE = $(ROOT_DIR)/gdocs-mode.el
