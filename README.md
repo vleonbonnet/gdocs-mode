@@ -316,15 +316,21 @@ These properties are maintained on the top-level node of every synced buffer:
 
 The conversion and synchronization helpers have an offline ERT suite backed
 by sanitized synthetic OT, inline-image, and comments fixtures. It never
-contacts Google, reads browser cookies, or mutates user buffers/files:
+contacts Google, reads browser cookies, or mutates user buffers/files. The
+default test target excludes the `integration` ERT tag:
 
 ```sh
 make test
 ```
 
-Production byte-compilation deliberately does not load the offline request
-shim. Install request 0.3.2 or newer yourself and pass the directory containing
-`request.el` or `request.elc` explicitly:
+Offline tests load `test/gdocs-mode-test-request.el`, a test-only shim that
+rejects network requests. It is not a bundled copy of request and cannot be
+used for production byte-compilation or opt-in integration tests.
+
+Production byte-compilation requires a real, compatible
+[`request`](https://github.com/tkf/emacs-request) package (version 0.3.2 or
+newer). Install it yourself and set `REQUEST_DIR` to the directory containing
+its `request.el` or `request.elc`:
 
 ```sh
 make byte-compile REQUEST_DIR="$HOME/.emacs.d/elpa/request-0.3.3"
@@ -340,10 +346,22 @@ compilation load the offline shim separately after the production file has
 compiled against real request.
 
 Run `make space-path-check` to repeat all three commands through a temporary
-symlink whose path contains a space. The optional
-`make integration` target only selects the
-`integration` ERT tag after explicitly setting `GDOCS_MODE_RUN_INTEGRATION=1`;
-no live credentials or live integration tests are required by this repository.
+symlink whose path contains a space.
+
+Live integration testing is opt-in only. Neither `make test` nor `make check`
+runs the `integration` ERT tag. To opt in explicitly, invoke the integration
+target with the same real request package directory:
+
+```sh
+make integration REQUEST_DIR="$HOME/.emacs.d/elpa/request-0.3.3"
+```
+
+That target requires `REQUEST_DIR`, sets `GDOCS_MODE_RUN_INTEGRATION=1`, and
+runs only tests tagged `integration`. The repository currently bundles no live
+credential tests; it contains only a gated integration-category check so future
+local live tests cannot run by default. Any such local test is responsible for
+providing its own credentials.
+
 Byte-compilation writes `gdocs-mode.elc` and `gdocs-mode-test.elc` to a fresh
 directory under `$TMPDIR` (or `/tmp`), puts that directory first on the load
 path, and removes it on success, failure, or interruption. It never writes
