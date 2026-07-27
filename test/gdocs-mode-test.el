@@ -5858,6 +5858,173 @@ that a removed preflight guard would be observed as an unexpected success."
     (should (equal (nreverse preflight-kinds)
                    '(:incremental :full-replace)))))
 
+(ert-deftest gdocs-test-save-response-revision-requires-exact-plan-revision ()
+  "Server and range metadata must each agree with the planned post-revision."
+  (let ((plan '(:post-revision 8)))
+    (dolist (response
+             '(((metadata . ((serverRevision . 8))))
+               ((revisionRanges . ((7 8))))
+               ((metadata . ((serverRevision . "8")))
+                (revisionRanges . ((7 "8"))))))
+      (should (= (gdocs--save-response-revision response plan) 8)))
+    (dolist (response
+             '(((ok . t))
+               ((metadata . ((serverRevision . 7))))
+               ((metadata . ((serverRevision . 9))))
+               ((metadata . ((serverRevision . "bad"))))
+               ((revisionRanges . ((6 7))))
+               ((revisionRanges . ((7 9))))
+               ((revisionRanges . ((7 "bad"))))
+               ((metadata . ((serverRevision . 8)))
+                (revisionRanges . ((8 9))))))
+      (should-error (gdocs--save-response-revision response plan)
+                    :type 'user-error))))
+
+(ert-deftest gdocs-test-unexpected-success-revisions-refetch-and-confirm-post-body ()
+  "Every non-exact success revision is confirmed from a fresh post-body."
+  (let ((responses
+         '(((ok . t))
+           ((metadata . ((serverRevision . 1))))
+           ((metadata . ((serverRevision . 3))))
+           ((metadata . ((serverRevision . "bad"))))
+           ((revisionRanges . ((0 1))))
+           ((revisionRanges . ((1 3))))
+           ((revisionRanges . ((1 "bad"))))
+           ((metadata . ((serverRevision . 2)))
+            (revisionRanges . ((2 3)))))))
+    (dolist (response responses)
+      (let* ((state (gdocs-test--push-state 1 "A"))
+             (committed (gdocs-test--push-state 2 "A!"))
+             (intent
+              (gdocs--make-push-intent
+               state "A!" "A"
+               (lambda (fresh-state fresh-body)
+                 (gdocs--push-insert-plan
+                  fresh-state fresh-body "!" :append))))
+             (save-count 0)
+             (fetch-count 0)
+             result callback-error)
+        (cl-letf (((symbol-function 'gdocs--save-request-async)
+                   (lambda (_doc _state _commands callback)
+                     (cl-incf save-count)
+                     (funcall callback response nil)))
+                  ((symbol-function 'gdocs--fetch-edit-state-async)
+                   (lambda (_doc callback)
+                     (cl-incf fetch-count)
+                     (funcall callback committed nil))))
+          (gdocs--run-op-result-async
+           "synthetic" state intent
+           (lambda (value err)
+             (setq result value callback-error err))))
+        (should (= save-count 1))
+        (should (= fetch-count 1))
+        (should (= (plist-get result :revision) 2))
+        (should-not callback-error)))))
+
+(ert-deftest gdocs-test-unexpected-success-pre-body-reports-uncommitted-without-replay ()
+  "A fresh pre-body after an unexpected success proves no commit and is not replayed."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         (save-count 0)
+         callback-error)
+    (cl-letf (((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (cl-incf save-count)
+                 (funcall callback
+                          '((metadata . ((serverRevision . 3)))) nil)))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback) (funcall callback state nil))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (_value err) (setq callback-error err))))
+    (should (= save-count 1))
+    (should (string-match-p "not committed" callback-error))))
+
+(ert-deftest gdocs-test-unexpected-success-unrelated-body-is-ambiguous-without-replay ()
+  "An unexpected success followed by neither planned body fails closed."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         (changed (gdocs-test--push-state 4 "AX"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         (save-count 0)
+         callback-error)
+    (cl-letf (((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc _state _commands callback)
+                 (cl-incf save-count)
+                 (funcall callback
+                          '((metadata . ((serverRevision . 3)))) nil)))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback) (funcall callback changed nil))))
+      (gdocs--run-op-result-async
+       "synthetic" state intent
+       (lambda (_value err) (setq callback-error err))))
+    (should (= save-count 1))
+    (should (string-match-p "ambiguous save outcome" callback-error))))
+
+(ert-deftest gdocs-test-unexpected-success-delays-baseline-until-post-body-confirmed ()
+  "Unexpected revision metadata cannot update the baseline before refetch."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         fetch-callback
+         callback-revision callback-error)
+    (with-temp-buffer
+      (insert ":PROPERTIES:\n:GDOC_REVISION: 1\n"
+              ":GDOC_CONTENT_HASH: old-hash\n:END:\n\nA!\n")
+      (org-mode)
+      (setq gdocs--last-synced-hash "old-baseline")
+      (cl-letf (((symbol-function 'gdocs--save-request-async)
+                 (lambda (_doc _state _commands callback)
+                   (funcall callback
+                            '((metadata . ((serverRevision . 3)))) nil)))
+                ((symbol-function 'gdocs--fetch-edit-state-async)
+                 (lambda (_doc callback) (setq fetch-callback callback))))
+        (gdocs--apply-push-async
+         "synthetic" state "A!" "A" (current-buffer)
+         (lambda (revision err)
+           (setq callback-revision revision callback-error err)))
+        (should fetch-callback)
+        (should-not callback-revision)
+        (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "1"))
+        (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                       "old-hash"))
+        (should (equal gdocs--last-synced-hash "old-baseline"))
+        (funcall fetch-callback (gdocs-test--push-state 2 "A!") nil)
+        (should (= callback-revision 2))
+        (should-not callback-error)
+        (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "2"))
+        (should-not (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                           "old-hash"))
+        (should-not (equal gdocs--last-synced-hash "old-baseline"))))))
+
+(ert-deftest gdocs-test-sync-unexpected-success-confirms-without-replay ()
+  "The synchronous path also reconciles an unexpected success exactly once."
+  (let* ((state (gdocs-test--push-state 1 "A"))
+         (committed (gdocs-test--push-state 2 "A!"))
+         (intent
+          (gdocs--make-push-intent
+           state "A!" "A"
+           (lambda (fresh-state fresh-body)
+             (gdocs--push-insert-plan fresh-state fresh-body "!" :append))))
+         (save-count 0)
+         (fetch-count 0))
+    (cl-letf (((symbol-function 'gdocs--save-request)
+               (lambda (&rest _args)
+                 (cl-incf save-count)
+                 '((revisionRanges . ((2 4))))))
+              ((symbol-function 'gdocs--fetch-edit-state)
+               (lambda (_doc)
+                 (cl-incf fetch-count)
+                 committed)))
+      (should (= (gdocs--run-op "synthetic" state intent) 2)))
+    (should (= save-count 1))
+    (should (= fetch-count 1))))
+
 ;;; Optional integration category
 
 (ert-deftest gdocs-test-integration-category-gate ()

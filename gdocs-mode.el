@@ -7384,12 +7384,14 @@ expected post-operation body is available."
       (let ((op (plist-get plan :op)))
         (and op (list op)))))
 
-(defun gdocs--push-classify-refetched-state (doc-id state plan)
+(defun gdocs--push-classify-refetched-state (doc-id state plan &optional body-only)
   "Classify a refetched STATE relative to failed PLAN.
 
 Return `:committed' when the post-operation body is visible, `:retry' when
-the exact pre-operation revision/body is still present, `:conflict' for an
-unrelated change, and `:unknown' when the state cannot be decoded."
+the pre-operation state is still present, `:conflict' for an unrelated
+change, and `:unknown' when the state cannot be decoded.  When BODY-ONLY is
+non-nil, classify an unexpected successful response solely from the fresh
+body: the post-body confirms the save and the pre-body proves it uncommitted."
   (if (eq (plist-get plan :kind) :raw)
       :unknown
     (let ((body (gdocs--push-state-body doc-id state))
@@ -7399,7 +7401,9 @@ unrelated change, and `:unknown' when the state cannot be decoded."
           (post-rev (plist-get plan :post-revision))
           (fresh-rev (and state (plist-get state :revision))))
       (cond
-       ((null body) :unknown)
+       ((or (null body) (and body-only (string= pre-body post-body))) :unknown)
+       ((and body-only (string= body post-body)) :committed)
+       ((and body-only (string= body pre-body)) :retry)
        ((and (string= body post-body)
              fresh-rev
              (if post-rev
@@ -7456,22 +7460,44 @@ an explicit retry policy such as the bounded throttle retry."
                   actual-revision expected-revision))
     t))
 
-(defun gdocs--save-response-revision (response state)
-  "Extract and validate the post-save revision from RESPONSE."
-  (let* ((meta (cdr (assq 'metadata response)))
-         (server-rev (cdr (assq 'serverRevision meta)))
-         (ranges (cdr (assq 'revisionRanges response)))
-         (range-rev (and ranges
-                         (let ((last (car (last ranges))))
-                           (and last (car (last last))))))
-         (new-rev (cond
-                   ((and server-rev range-rev) (max server-rev range-rev))
-                   (t (or range-rev server-rev))))
-         (old-rev (plist-get state :revision)))
-    (unless (and new-rev
-                 (not (gdocs--push-revisions-equal-p new-rev old-rev)))
-      (user-error "gdocs: /save returned no unambiguous new revision"))
-    new-rev))
+(defun gdocs--save-revision-value (value)
+  "Return VALUE as a non-negative integer revision, or nil."
+  (cond
+   ((and (integerp value) (>= value 0)) value)
+   ((and (stringp value) (string-match-p "\\`[0-9]+\\'" value))
+    (string-to-number value))
+   (t nil)))
+
+(defun gdocs--save-response-revision (response plan)
+  "Return PLAN's post-revision when every revision in RESPONSE matches it.
+
+Both `serverRevision' and the terminal endpoint in `revisionRanges' are
+authoritative when supplied.  Missing, malformed, disagreeing, lower, or
+higher values signal an error so the caller reconciles against fresh content."
+  (let* ((expected (gdocs--save-revision-value
+                    (plist-get plan :post-revision)))
+         (metadata-cell (and (listp response) (assq 'metadata response)))
+         (metadata (and metadata-cell (cdr metadata-cell)))
+         (server-cell (and (listp metadata)
+                           (assq 'serverRevision metadata)))
+         (ranges-cell (and (listp response)
+                           (assq 'revisionRanges response)))
+         (ranges (and ranges-cell (cdr ranges-cell)))
+         (last-range (and (listp ranges) (car (last ranges))))
+         (range-rev-cell (and (listp last-range) (car (last last-range))))
+         (server-rev (and server-cell
+                          (gdocs--save-revision-value (cdr server-cell))))
+         (range-rev (and ranges-cell
+                         (gdocs--save-revision-value range-rev-cell)))
+         (supplied (delq nil (list server-rev range-rev))))
+    (unless (and expected
+                 supplied
+                 (or (null server-cell) server-rev)
+                 (or (null ranges-cell) range-rev)
+                 (cl-every (lambda (revision) (= revision expected)) supplied))
+      (user-error "gdocs: /save revision metadata did not exactly match expected rev %S"
+                  (plist-get plan :post-revision)))
+    expected))
 
 (defun gdocs--async-throttle-error-p (err)
   "Return non-nil when async ERR has the structured throttle shape."
@@ -7481,7 +7507,7 @@ an explicit retry policy such as the bounded throttle retry."
        (plist-get err :di)))
 
 (defun gdocs--run-op-result-async-verify-save
-    (doc-id plan delay callback)
+    (doc-id plan delay callback &optional body-only)
   "Refetch after a failed save and callback with `(OUTCOME STATE ERR)'."
   (let (done verify)
     (cl-labels
@@ -7502,8 +7528,8 @@ an explicit retry policy such as the bounded throttle retry."
                                            state-err))
                          (condition-case sig
                              (finish
-                              (gdocs--push-classify-refetched-state
-                               doc-id fresh-state plan)
+                               (gdocs--push-classify-refetched-state
+                                doc-id fresh-state plan body-only)
                               fresh-state nil)
                            (error
                             (finish nil nil
@@ -7551,14 +7577,15 @@ an explicit retry policy such as the bounded throttle retry."
        (funcall callback nil (error-message-string sig)))))))
 
 (defun gdocs--run-op-result-async-reconcile
-    (doc-id intent plan callback attempt failure retryable)
+    (doc-id intent plan callback attempt failure retryable &optional body-only)
   "Reconcile a post-dispatch FAILURE against a fresh remote snapshot."
   (gdocs--run-op-result-async-verify-save
    doc-id plan (if retryable gdocs--rate-limit-retry-delay 0)
    (lambda (outcome fresh-state verify-err)
      (gdocs--run-op-result-async-handle-failure
       doc-id intent plan callback attempt failure retryable
-      outcome fresh-state verify-err))))
+      outcome fresh-state verify-err))
+   body-only))
 
 (defun gdocs--run-op-result-async-save-callback
     (doc-id state intent plan callback attempt response err)
@@ -7569,14 +7596,14 @@ an explicit retry policy such as the bounded throttle retry."
         (condition-case revision-sig
             (funcall
              callback
-             (list :revision (gdocs--save-response-revision response state)
+              (list :revision (gdocs--save-response-revision response plan)
                    :state state
                    :plan plan)
              nil)
           (error
            (gdocs--run-op-result-async-reconcile
             doc-id intent plan callback attempt
-            (error-message-string revision-sig) nil))))
+             (error-message-string revision-sig) nil t))))
        (t
         (let* ((retryable (gdocs--async-throttle-error-p err))
                (failure
@@ -8255,7 +8282,7 @@ operation."
           ;; This runs for every planned attempt, including a retry.
           (gdocs--push-preflight-plan intent current-state plan))
         (cl-labels
-            ((reconcile (failure retryable)
+             ((reconcile (failure retryable &optional body-only)
                (when retryable
                  (gdocs-log
                   'warn
@@ -8271,8 +8298,8 @@ operation."
                           "gdocs: ambiguous save outcome after %s; state refetch failed: %s"
                           (error-message-string failure)
                           (error-message-string fetch-sig))))))
-                 (pcase (gdocs--push-classify-refetched-state
-                         doc-id fresh-state plan)
+                  (pcase (gdocs--push-classify-refetched-state
+                          doc-id fresh-state plan body-only)
                    (:committed
                     (setq result
                           (list :revision (plist-get fresh-state :revision)
@@ -8294,11 +8321,10 @@ operation."
                 (condition-case revision-sig
                     (setq result
                           (list :revision
-                                (gdocs--save-response-revision
-                                 response current-state)
+                                 (gdocs--save-response-revision response plan)
                                 :state current-state
                                 :plan plan))
-                  (error (reconcile revision-sig nil))))
+                   (error (reconcile revision-sig nil t))))
             ((gdocs-save-rejected gdocs-save-post-dispatch-failed)
              (reconcile err (gdocs--throttle-error-p err)))))))
     result))
