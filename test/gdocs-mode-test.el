@@ -3723,6 +3723,105 @@ that a removed preflight guard would be observed as an unexpected success."
     (should (gdocs--push-preflight
              state "- Bullet\n1. Number\n" '(:kind :full-replace)))))
 
+(ert-deftest gdocs-test-capability-rejects-list-nesting-level-jumps ()
+  "A list level may only increase by one within a contiguous list."
+  (dolist (nests '((2) (0 2)))
+    (let* ((body (concat
+                  (mapconcat (lambda (nest) (format "Level %d\n" nest))
+                             nests "")
+                  "After\n"))
+           (definition
+            (car (gdocs--emit-list-defs '(("list.jump" . :bullet)))))
+           (bindings
+            (cl-loop for nest in nests
+                     for line from 1
+                     collect (gdocs--emit-list-style-op
+                              "list.jump" nest
+                              (gdocs-test--line-end-pos body line))))
+           (ops (append (list (gdocs-test--insert-op body) definition)
+                        bindings))
+           (doc (gdocs-dm-from-ops 7 "synthetic" nil body ops))
+           (report
+            (cl-find "list-nesting-sequence" (gdocs-dm-unsupported doc)
+                     :key (lambda (item) (plist-get item :feature-type))
+                     :test #'equal)))
+      (should report)
+      (should (equal (mapcar (lambda (paragraph)
+                               (plist-get paragraph :nest))
+                             (seq-filter
+                              (lambda (paragraph)
+                                (eq (plist-get paragraph :kind) :list))
+                              (gdocs-dm-paragraphs doc)))
+                     nests))
+      (should (plist-get report :render-directive))
+      (should (string-match-p "^#\\+gdocs_unsupported_list_nesting: "
+                              (gdocs-dm-to-org doc)))
+      (let* ((gdocs-push-backend 'ot-incremental)
+             (state (list :revision 7 :ot-body body :ot-ops ops))
+             (remote (gdocs-dm-to-org doc))
+             (local (replace-regexp-in-string "After" "Changed" remote))
+             (plan (gdocs--push-plan-for-diff state local remote)))
+        (should (eq (plist-get plan :kind) :incremental))
+        (should (gdocs--push-preflight state local plan))))))
+
+(ert-deftest gdocs-test-capability-allows-representable-list-transitions ()
+  "Canonical starts, single-level increases, and arbitrary decreases stay clean."
+  (let* ((nests '(0 1 2 0 1))
+         (body (mapconcat (lambda (nest) (format "Level %d\n" nest))
+                          nests ""))
+         (definition
+          (car (gdocs--emit-list-defs '(("list.valid" . :bullet)))))
+         (bindings
+          (cl-loop for nest in nests
+                   for line from 1
+                   collect (gdocs--emit-list-style-op
+                            "list.valid" nest
+                            (gdocs-test--line-end-pos body line))))
+         (ops (append (list (gdocs-test--insert-op body) definition)
+                      bindings)))
+    (should-not
+     (cl-find "list-nesting-sequence"
+              (gdocs-dm-unsupported
+               (gdocs-dm-from-ops 7 "synthetic" nil body ops))
+              :key (lambda (item) (plist-get item :feature-type))
+              :test #'equal))))
+
+(ert-deftest gdocs-test-capability-list-nesting-jump-push-safety ()
+  "Full and intersecting pushes fail while an unrelated range remains safe."
+  (let* ((body "Top\nDeep\nAfter\n")
+         (definition
+          (car (gdocs--emit-list-defs '(("list.jump" . :bullet)))))
+         (bindings
+          (list (gdocs--emit-list-style-op
+                 "list.jump" 0 (gdocs-test--line-end-pos body 1))
+                (gdocs--emit-list-style-op
+                 "list.jump" 2 (gdocs-test--line-end-pos body 2))))
+         (ops (append (list (gdocs-test--insert-op body) definition)
+                      bindings))
+         (state (list :revision 7 :ot-body body :ot-ops ops))
+         (unsafe '(:kind :incremental
+                         :ranges ((:ot-start 5 :ot-end 9
+                                             :insert-at 5 :delete-count 5))))
+         (safe '(:kind :incremental
+                       :ranges ((:ot-start 10 :ot-end 15
+                                           :insert-at 10 :delete-count 6)))))
+    (should-error
+     (gdocs--push-preflight state "- Top\n  - Deep\nAfter\n"
+                            '(:kind :full-replace))
+     :type 'user-error)
+    (should-error
+     (gdocs--push-preflight state "- Top\n  - Changed\nAfter\n" unsafe)
+     :type 'user-error)
+    (should
+     (gdocs--push-preflight state "- Top\n  - Deep\nChanged\n" safe))
+    (let* ((gdocs-push-backend 'ot-incremental)
+           (remote (gdocs-dm-to-org
+                    (gdocs-dm-from-ops 7 "synthetic" nil body ops)))
+           (local (replace-regexp-in-string "After" "Changed" remote))
+           (plan (gdocs--push-plan-for-diff state local remote)))
+      (should (eq (plist-get plan :kind) :incremental))
+      (should (gdocs--push-preflight state local plan)))))
+
 (ert-deftest gdocs-test-capability-bound-list-requires-canonical-fields ()
   "Missing glyph, indentation, or text style makes a bound level unsupported."
   (dolist (case '((b_gs . "b_gs")

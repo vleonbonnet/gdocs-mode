@@ -2065,6 +2065,41 @@ not required to establish the semantic value."
            when (equal nest level)
            collect range))
 
+(defun gdocs--list-nesting-sequence-reports (ops body)
+  "Report list nesting transitions that plain Org lists cannot represent."
+  (let (bindings reports previous)
+    (dolist (op ops)
+      (when (and (equal (alist-get 'ty op) "as")
+                 (equal (alist-get 'st op) "list"))
+        (let* ((sm (alist-get 'sm op))
+               (nest (and (listp sm) (or (alist-get 'ls_nest sm) 0)))
+               (range (gdocs--list-binding-paragraph-range op body)))
+          (when (and range (integerp nest) (<= 0 nest) (<= nest 8))
+            (push (list :nest nest :range range) bindings)))))
+    (dolist (binding
+             (sort bindings
+                   (lambda (a b)
+                     (< (plist-get (plist-get a :range) :ot-start)
+                        (plist-get (plist-get b :range) :ot-start)))))
+      (let* ((range (plist-get binding :range))
+             (nest (plist-get binding :nest))
+             (contiguous
+              (and previous
+                   (= (plist-get range :ot-start)
+                      (1+ (plist-get (plist-get previous :range) :ot-end)))))
+             (maximum (if contiguous
+                          (1+ (plist-get previous :nest))
+                        0)))
+        (when (> nest maximum)
+          (let ((report
+                 (gdocs--capability-list-report
+                  :unsupported-paragraph
+                  "A remote list nesting transition cannot be represented by an Org plain list."
+                  "list-nesting-sequence" range)))
+            (push (plist-put report :render-directive t) reports)))
+        (setq previous binding)))
+    (nreverse reports)))
+
 (defun gdocs--list-entity-level (levels level)
   "Return the unique LEVEL entry from LEVELS, or nil when not provable."
   (let* ((name (intern (format "nl_%d" level)))
@@ -2249,6 +2284,7 @@ report. Inline image reports are produced by
         (list-entity-counts (make-hash-table :test #'equal))
         (para-attrs (gdocs--decode-para-attrs ops))
         (list-binding-ranges (gdocs--list-entity-binding-ranges ops body)))
+    (setq reports (gdocs--list-nesting-sequence-reports ops body))
     ;; Collect attachment positions first so an unknown entity can carry a
     ;; useful range when Google supplied a `te' operation for it.
     (dolist (op ops)
@@ -3223,12 +3259,12 @@ keyword lines emitted from Title/Subtitle paragraphs."
            (string-match-p "\\`#\\+title:" line)
            (string-match-p "\\`#\\+subtitle:" line))))
 
-(defun gdocs--render-unsupported-directive (reasons)
+(defun gdocs--render-unsupported-directive (reasons &optional keyword)
   "Render structured or legacy REASONS as one visible Org directive.
 
 Only the report explanations are rendered; raw operation payloads are never
 copied into the local document."
-  (format "#+gdocs_unsupported: %s"
+  (format "#+%s: %s" (or keyword "gdocs_unsupported")
           (replace-regexp-in-string
            "[ \t\n\r]+" " "
            (string-trim
@@ -3356,14 +3392,28 @@ than to the final text, so it never appears inside a source block."
                  (plist-get (gdocs--capability-normalize report)
                             :render-directive))
                (gdocs-dm-unsupported doc)))
+             (list-nesting-reports
+              (seq-filter
+               (lambda (report)
+                 (equal (plist-get report :feature-type)
+                        "list-nesting-sequence"))
+               render-reports))
+             (other-reports
+              (seq-difference render-reports list-nesting-reports #'eq))
              (rendered (concat (string-join final "\n")
                                (if final "\n" ""))))
-        (if (and render-reports
-                 (not explicit-unsupported))
-            (concat (gdocs--render-unsupported-directive
-                     render-reports)
-                    "\n" rendered)
-          rendered)))))
+        (if explicit-unsupported
+            rendered
+          (concat
+           (when other-reports
+             (concat (gdocs--render-unsupported-directive other-reports)
+                     "\n"))
+           (when list-nesting-reports
+             (concat
+              (gdocs--render-unsupported-directive
+               list-nesting-reports "gdocs_unsupported_list_nesting")
+              "\n"))
+           rendered))))))
 
 ;;; Phase B.1 — org → doc-model parser
 ;;
@@ -6284,6 +6334,43 @@ stale buffer-local capability metadata cannot bypass policy."
               regions))))
      (t nil))))
 
+(defun gdocs--preserve-clean-list-nesting (old-doc new-doc)
+  "Keep OLD-DOC list levels when NEW-DOC's visible list content is unchanged."
+  (if (not (and old-doc
+                (cl-some
+                 (lambda (report)
+                   (equal (plist-get report :feature-type)
+                          "list-nesting-sequence"))
+                 (gdocs-dm-unsupported old-doc))))
+      new-doc
+    (let ((old (gdocs-dm-paragraphs old-doc))
+          (new (gdocs-dm-paragraphs new-doc))
+          paragraphs
+          clean)
+      (setq clean (= (length old) (length new)))
+      (while (and clean old new)
+        (let* ((old-paragraph (car old))
+               (new-paragraph (copy-tree (car new)))
+               (old-list (eq (plist-get old-paragraph :kind) :list))
+               (new-list (eq (plist-get new-paragraph :kind) :list)))
+          (when (or old-list new-list)
+            (if (and old-list new-list)
+                (progn
+                  (setq new-paragraph
+                        (plist-put new-paragraph :nest
+                                   (plist-get old-paragraph :nest)))
+                  (unless (gdocs--paragraph-equal-p
+                           old-paragraph new-paragraph)
+                    (setq clean nil)))
+              (setq clean nil)))
+          (push new-paragraph paragraphs))
+        (setq old (cdr old)
+              new (cdr new)))
+      (if clean
+          (plist-put (copy-sequence new-doc) :paragraphs
+                     (nreverse paragraphs))
+        new-doc))))
+
 (defun gdocs--incremental-needs-full-replace-p (state local-body)
   "Return non-nil when the incremental backend must replace the document."
   (let* ((ot-ops (plist-get state :ot-ops))
@@ -6292,7 +6379,8 @@ stale buffer-local capability metadata cannot bypass policy."
                         (plist-get state :revision)
                         nil (plist-get state :title)
                         (or (plist-get state :ot-body) "") ot-ops)))
-         (new-doc (gdocs-dm-from-org local-body)))
+         (new-doc (gdocs--preserve-clean-list-nesting
+                   old-doc (gdocs-dm-from-org local-body))))
     (or (null old-doc)
         (eq (plist-get (gdocs-dm-to-incremental-save-plan old-doc new-doc t)
                        :kind)
@@ -6306,7 +6394,8 @@ stale buffer-local capability metadata cannot bypass policy."
                         (plist-get state :revision)
                         nil (plist-get state :title)
                         (or (plist-get state :ot-body) "") ot-ops)))
-         (new-doc (gdocs-dm-from-org local-body)))
+         (new-doc (gdocs--preserve-clean-list-nesting
+                   old-doc (gdocs-dm-from-org local-body))))
     (if old-doc
         (gdocs-dm-to-incremental-save-plan old-doc new-doc t)
       (list :commands
@@ -7077,7 +7166,9 @@ fetched state with the high-level push intent; otherwise a successful retry
 could be mistaken for an unrelated change merely because the renderer uses a
 different Org representation."
   (gdocs--inline-markers-as-ot-placeholders
-   (car (gdocs--strip-heading-drawers (or body "")))))
+   (replace-regexp-in-string
+    "^#\\+gdocs_unsupported_list_nesting:.*\n" ""
+    (car (gdocs--strip-heading-drawers (or body ""))))))
 
 (defun gdocs--remote-org-body-from-state (doc-id state)
   "Render STATE's current OT stream as an Org body.
