@@ -151,6 +151,18 @@ Default `warn' keeps *Messages* quiet during normal pull/push; set to
 
 (defconst gdocs--export-base "https://docs.google.com/document/d/")
 
+;; Codepoints in the OT body that represent doc structure (table open/close,
+;; row, cell …). These don't appear in the plain-text view a user edits
+;; locally; the txt-export expands them into newlines/tabs in a way that
+;; isn't a 1:1 char substitution (entire structural runs collapse), so we
+;; can't translate by substitution alone. Instead we drop them when
+;; building the plain view and record their OT positions so that in-place
+;; edits stay clear of table interiors.
+(defconst gdocs--ot-structural-codepoints
+  '(#x10 #x11 #x12 #x1c)
+  "OT codepoints that mark structure (not visible plain content).
+0x10/0x11 = table open/close. 0x12 = row separator. 0x1c = cell separator.")
+
 (defvar-local gdocs--sync-timer nil
   "Idle timer for auto-sync in this buffer.")
 
@@ -4880,18 +4892,6 @@ CREATION-TIME-MS is non-nil) a `#+date:' line, ready for
 (defun gdocs--ot-body-length (ot-body)
   "Return the OT codepoint count of OT-BODY (the model chunk's `is.s')."
   (length (or ot-body "")))
-
-;; Codepoints in the OT body that represent doc structure (table open/close,
-;; row, cell …). These don't appear in the plain-text view a user edits
-;; locally; the txt-export expands them into newlines/tabs in a way that
-;; isn't a 1:1 char substitution (entire structural runs collapse), so we
-;; can't translate by substitution alone. Instead we drop them when
-;; building the plain view and record their OT positions so that in-place
-;; edits stay clear of table interiors.
-(defconst gdocs--ot-structural-codepoints
-  '(#x10 #x11 #x12 #x1c)
-  "OT codepoints that mark structure (not visible plain content).
-0x10/0x11 = table open/close. 0x12 = row separator. 0x1c = cell separator.")
 
 (defun gdocs--ot-plain-and-map (ot-body)
   "Walk OT-BODY and split it into plain text + a position map.
