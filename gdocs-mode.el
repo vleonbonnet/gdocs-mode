@@ -827,10 +827,10 @@ per op type, so we can see at a glance what fields each op carries."
 (defun gdocs--write-sensitive-diagnostic (path writer)
   "Write a sensitive diagnostic to PATH using WRITER and mode 0600.
 WRITER is called with a temporary buffer current.  The destination is
-replaced atomically, and the staging file is removed if WRITER signals."
+replaced atomically, and the staging file is removed unless writing completes."
   (let* ((path (expand-file-name path))
          (directory (file-name-directory path))
-         (staging nil))
+         staging)
     (unless (file-directory-p directory)
       (error "Diagnostic output directory does not exist: %s" directory))
     (unwind-protect
@@ -845,7 +845,6 @@ replaced atomically, and the staging file is removed if WRITER signals."
           (set-file-modes staging #o600)
           (rename-file staging path t)
           (setq staging nil)
-          (set-file-modes path #o600)
           path)
       (when (and staging (file-exists-p staging))
         (ignore-errors (delete-file staging))))))
@@ -870,41 +869,42 @@ caller's `gdocs-auth-function' is used."
          (attr-keys (gdocs--recon-attribute-keys ops))
          (generated-out (null out-file))
          (generated-summary (null summary-file))
-         out summary-out)
-    (condition-case signal-data
-        (progn
-          (setq out (or out-file
-                        (make-temp-file "gdocs-recon-" nil ".eld")))
-          (setq summary-out
-                (or summary-file
-                    (make-temp-file "gdocs-recon-summary-" nil ".eld")))
-          (gdocs--write-sensitive-diagnostic
-           out
-           (lambda ()
-             (let ((print-length nil)
-                   (print-level nil))
-               (pp `(:revision ,revision :n-ops ,(length ops) :ops ,ops)
-                   (current-buffer)))))
-          (gdocs--write-sensitive-diagnostic
-           summary-out
-           (lambda ()
-             (let ((print-length nil) (print-level nil))
-               (pp `(:revision ,revision
-                               :n-ops ,(length ops)
-                               :type-counts ,type-counts
-                               :attr-keys ,attr-keys)
-                   (current-buffer)))))
-          (message
-           "gdocs-recon: sensitive dumps persist until deleted; dump=%s summary=%s"
-           out summary-out)
-          (list :revision revision :n-ops (length ops)
-                :type-counts type-counts :dump out :summary summary-out))
-      (error
-       (when (and generated-out out (file-exists-p out))
-         (ignore-errors (delete-file out)))
-       (when (and generated-summary summary-out (file-exists-p summary-out))
-         (ignore-errors (delete-file summary-out)))
-       (signal (car signal-data) (cdr signal-data))))))
+         out summary-out completed)
+    (unwind-protect
+        (prog1
+            (progn
+              (setq out (or out-file
+                            (make-temp-file "gdocs-recon-" nil ".eld")))
+              (setq summary-out
+                    (or summary-file
+                        (make-temp-file "gdocs-recon-summary-" nil ".eld")))
+              (gdocs--write-sensitive-diagnostic
+               out
+               (lambda ()
+                 (let ((print-length nil)
+                       (print-level nil))
+                   (pp `(:revision ,revision :n-ops ,(length ops) :ops ,ops)
+                       (current-buffer)))))
+              (gdocs--write-sensitive-diagnostic
+               summary-out
+               (lambda ()
+                 (let ((print-length nil) (print-level nil))
+                   (pp `(:revision ,revision
+                                   :n-ops ,(length ops)
+                                   :type-counts ,type-counts
+                                   :attr-keys ,attr-keys)
+                       (current-buffer)))))
+              (message
+               "gdocs-recon: sensitive dumps persist until deleted; dump=%s summary=%s"
+               out summary-out)
+              (list :revision revision :n-ops (length ops)
+                    :type-counts type-counts :dump out :summary summary-out))
+          (setq completed t))
+      (unless completed
+        (when (and generated-out out (file-exists-p out))
+          (ignore-errors (delete-file out)))
+        (when (and generated-summary summary-out (file-exists-p summary-out))
+          (ignore-errors (delete-file summary-out)))))))
 
 (defun gdocs--fetch-edit-page-sync (doc-id)
   "Synchronous fetch of /edit page for recon. Bypasses the async paths."
@@ -9180,75 +9180,78 @@ without logging raw content."
          (single (gdocs--diff-single-region remote-body local-stripped))
          (paras (gdocs--diff-paragraphs remote-body local-stripped))
          (locate (and single
-                       (gdocs--locate-edit-in-ot
-                        ot-body remote-body
-                        (plist-get single :start)
-                        (plist-get single :rem-end))))
+                      (gdocs--locate-edit-in-ot
+                       ot-body remote-body
+                       (plist-get single :start)
+                       (plist-get single :rem-end))))
          (generated-out (null out-file))
-         (out (or out-file
-                  (make-temp-file "gdocs-push-debug-" nil ".txt"))))
-    (condition-case signal-data
-        (gdocs--write-sensitive-diagnostic
-         out
-         (lambda ()
-      (insert (format "doc-id: %s\n" doc-id))
-      (insert (format "local-rev: %s\n" local-rev))
-      (insert (format "remote-rev: %s\n" remote-rev))
-      (insert (format "local-body length: %d\n" (length local-body)))
-      (insert (format "remote-body length: %d\n" (length remote-body)))
-      (insert (format "ot-body length: %d\n" (length (or ot-body ""))))
-      (insert (format "plain (ot minus structural) length: %d\n" (length (or plain ""))))
-      (insert (format "stripped-remote length: %d\n" (length stripped-remote)))
-      (insert (format "stripped-remote == plain? %S\n"
-                      (and plain (string= stripped-remote plain))))
-      (insert (format "diff-single-region: %S\n" single))
-      (insert (format "diff-paragraphs count: %d\n" (length paras)))
-      (insert (format "locate result: %S\n" locate))
-      (insert (format "unsupported capability summary: %s\n"
-                      (if (length> capability-summary 0)
-                          capability-summary
-                        "none")))
-      (insert (format "unsupported capability details (sanitized): %S\n"
-                      capability-details))
-      (insert "\n=== local-body ===\n")
-      (insert local-body)
-      (insert "\n=== remote-body ===\n")
-      (insert remote-body)
-      (insert "\n=== local-stripped (after strip-heading-drawers) ===\n")
-      (insert local-stripped)
-      (insert "\n=== ot-body (raw, structural codepoints visible) ===\n")
-      (prin1 (or ot-body "") (current-buffer))
-      (insert "\n=== plain (ot minus structural) ===\n")
-      (insert (or plain ""))
-      (insert "\n=== stripped-remote ===\n")
-      (insert stripped-remote)
-      (when (and plain (not (string= stripped-remote plain)))
-        (insert "\n=== first divergence between stripped-remote and plain ===\n")
-        (let* ((n (min (length stripped-remote) (length plain)))
-               (i 0))
-          (while (and (< i n)
-                      (= (aref stripped-remote i) (aref plain i)))
-            (cl-incf i))
-          (insert (format "diverge at index %d of %d/%d\n"
-                          i (length stripped-remote) (length plain)))
-          (insert (format "stripped-remote[%d-30..%d+30]: %S\n"
-                          i i
-                          (substring stripped-remote
-                                     (max 0 (- i 30))
-                                     (min (length stripped-remote) (+ i 30)))))
-          (insert (format "plain          [%d-30..%d+30]: %S\n"
-                          i i
-                          (substring plain
-                                     (max 0 (- i 30))
-                                      (min (length plain) (+ i 30)))))))))
-      (error
-       (when (and generated-out (file-exists-p out))
-         (ignore-errors (delete-file out)))
-       (signal (car signal-data) (cdr signal-data))))
-    (message
-     "gdocs-debug-push-state: sensitive dump persists until deleted: %s"
-     out)
-    out))
+         out completed)
+    (unwind-protect
+        (prog1
+            (progn
+              (setq out (or out-file
+                            (make-temp-file "gdocs-push-debug-" nil ".txt")))
+              (gdocs--write-sensitive-diagnostic
+               out
+               (lambda ()
+                 (insert (format "doc-id: %s\n" doc-id))
+                 (insert (format "local-rev: %s\n" local-rev))
+                 (insert (format "remote-rev: %s\n" remote-rev))
+                 (insert (format "local-body length: %d\n" (length local-body)))
+                 (insert (format "remote-body length: %d\n" (length remote-body)))
+                 (insert (format "ot-body length: %d\n" (length (or ot-body ""))))
+                 (insert (format "plain (ot minus structural) length: %d\n" (length (or plain ""))))
+                 (insert (format "stripped-remote length: %d\n" (length stripped-remote)))
+                 (insert (format "stripped-remote == plain? %S\n"
+                                 (and plain (string= stripped-remote plain))))
+                 (insert (format "diff-single-region: %S\n" single))
+                 (insert (format "diff-paragraphs count: %d\n" (length paras)))
+                 (insert (format "locate result: %S\n" locate))
+                 (insert (format "unsupported capability summary: %s\n"
+                                 (if (length> capability-summary 0)
+                                     capability-summary
+                                   "none")))
+                 (insert (format "unsupported capability details (sanitized): %S\n"
+                                 capability-details))
+                 (insert "\n=== local-body ===\n")
+                 (insert local-body)
+                 (insert "\n=== remote-body ===\n")
+                 (insert remote-body)
+                 (insert "\n=== local-stripped (after strip-heading-drawers) ===\n")
+                 (insert local-stripped)
+                 (insert "\n=== ot-body (raw, structural codepoints visible) ===\n")
+                 (prin1 (or ot-body "") (current-buffer))
+                 (insert "\n=== plain (ot minus structural) ===\n")
+                 (insert (or plain ""))
+                 (insert "\n=== stripped-remote ===\n")
+                 (insert stripped-remote)
+                 (when (and plain (not (string= stripped-remote plain)))
+                   (insert "\n=== first divergence between stripped-remote and plain ===\n")
+                   (let* ((n (min (length stripped-remote) (length plain)))
+                          (i 0))
+                     (while (and (< i n)
+                                 (= (aref stripped-remote i) (aref plain i)))
+                       (cl-incf i))
+                     (insert (format "diverge at index %d of %d/%d\n"
+                                     i (length stripped-remote) (length plain)))
+                     (insert (format "stripped-remote[%d-30..%d+30]: %S\n"
+                                     i i
+                                     (substring stripped-remote
+                                                (max 0 (- i 30))
+                                                (min (length stripped-remote) (+ i 30)))))
+                     (insert (format "plain          [%d-30..%d+30]: %S\n"
+                                     i i
+                                     (substring plain
+                                                (max 0 (- i 30))
+                                                (min (length plain) (+ i 30)))))))))
+              (message
+               "gdocs-debug-push-state: sensitive dump persists until deleted: %s"
+               out)
+              out)
+          (setq completed t))
+      (unless completed
+        (when (and generated-out out (file-exists-p out))
+          (ignore-errors (delete-file out)))))))
 
 
 ;;; Public command — open

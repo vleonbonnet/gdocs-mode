@@ -556,6 +556,142 @@
            (directory-files directory nil directory-files-no-dot-files-regexp)))
       (delete-directory directory t))))
 
+(ert-deftest gdocs-test-sensitive-diagnostic-preserves-target-on-quit ()
+  "Interrupted staging never replaces an explicit preexisting target."
+  (dolist (stage '(writer mode rename))
+    (let* ((directory (make-temp-file "gdocs-diagnostic-quit-" t))
+           (target (expand-file-name "explicit.eld" directory))
+           (set-modes (symbol-function 'set-file-modes))
+           (rename (symbol-function 'rename-file)))
+      (unwind-protect
+          (progn
+            (with-temp-file target (insert "original"))
+            (condition-case nil
+                (cl-letf (((symbol-function 'set-file-modes)
+                           (lambda (&rest args)
+                             (if (eq stage 'mode)
+                                 (keyboard-quit)
+                               (apply set-modes args))))
+                          ((symbol-function 'rename-file)
+                           (lambda (&rest args)
+                             (if (eq stage 'rename)
+                                 (keyboard-quit)
+                               (apply rename args)))))
+                  (gdocs--write-sensitive-diagnostic
+                   target
+                   (lambda ()
+                     (insert "replacement")
+                     (when (eq stage 'writer)
+                       (keyboard-quit))))
+                  (ert-fail "Expected diagnostic write to quit"))
+              (quit nil))
+            (with-temp-buffer
+              (insert-file-contents target)
+              (should (equal (buffer-string) "original")))
+            (should
+             (equal (directory-files
+                     directory nil directory-files-no-dot-files-regexp)
+                    '("explicit.eld"))))
+        (delete-directory directory t)))))
+
+(ert-deftest gdocs-test-recon-dump-cleans-generated-files-on-quit-at-each-write ()
+  "A quit in either companion write removes every generated artifact."
+  (dolist (quit-at '(1 2))
+    (let* ((directory (make-temp-file "gdocs-recon-quit-" t))
+           (temporary-file-directory (file-name-as-directory directory))
+           (html (gdocs-test--html-for-ops
+                  3 (list (gdocs-test--insert-op "Sensitive body\n"))))
+           (writer (symbol-function 'gdocs--write-sensitive-diagnostic))
+           (writes 0))
+      (unwind-protect
+          (progn
+            (condition-case nil
+                (cl-letf (((symbol-function 'gdocs--fetch-edit-page-sync)
+                           (lambda (_doc-id) html))
+                          ((symbol-function 'gdocs--write-sensitive-diagnostic)
+                           (lambda (path callback)
+                             (cl-incf writes)
+                             (funcall
+                              writer path
+                              (lambda ()
+                                (funcall callback)
+                                (when (= writes quit-at)
+                                  (keyboard-quit)))))))
+                  (gdocs-recon-dump "synthetic-id")
+                  (ert-fail "Expected recon dump to quit"))
+              (quit nil))
+            (should (= writes quit-at))
+            (should-not
+             (directory-files directory nil
+                              directory-files-no-dot-files-regexp)))
+        (delete-directory directory t)))))
+
+(ert-deftest gdocs-test-recon-dump-cleans-generated-files-on-nonlocal-exit ()
+  "A nonlocal exit after one write removes both generated companions."
+  (let* ((directory (make-temp-file "gdocs-recon-nonlocal-" t))
+         (temporary-file-directory (file-name-as-directory directory))
+         (html (gdocs-test--html-for-ops
+                3 (list (gdocs-test--insert-op "Sensitive body\n"))))
+         (writer (symbol-function 'gdocs--write-sensitive-diagnostic))
+         (writes 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gdocs--fetch-edit-page-sync)
+                   (lambda (_doc-id) html))
+                  ((symbol-function 'gdocs--write-sensitive-diagnostic)
+                   (lambda (path callback)
+                     (if (= (cl-incf writes) 2)
+                         (throw 'gdocs-test-stop :stopped)
+                       (funcall writer path callback)))))
+          (should
+           (eq (catch 'gdocs-test-stop
+                 (gdocs-recon-dump "synthetic-id")
+                 :completed)
+               :stopped))
+          (should-not
+           (directory-files directory nil directory-files-no-dot-files-regexp)))
+      (delete-directory directory t))))
+
+(ert-deftest gdocs-test-recon-dump-explicit-targets-commit-independently ()
+  "Completed explicit output persists while interrupted output stays old."
+  (let* ((directory (make-temp-file "gdocs-recon-explicit-quit-" t))
+         (dump (expand-file-name "dump.eld" directory))
+         (summary (expand-file-name "summary.eld" directory))
+         (html (gdocs-test--html-for-ops
+                3 (list (gdocs-test--insert-op "Sensitive body\n"))))
+         (writer (symbol-function 'gdocs--write-sensitive-diagnostic))
+         (writes 0))
+    (unwind-protect
+        (progn
+          (with-temp-file dump (insert "old dump"))
+          (with-temp-file summary (insert "old summary"))
+          (condition-case nil
+              (cl-letf (((symbol-function 'gdocs--fetch-edit-page-sync)
+                         (lambda (_doc-id) html))
+                        ((symbol-function 'gdocs--write-sensitive-diagnostic)
+                         (lambda (path callback)
+                           (cl-incf writes)
+                           (funcall
+                            writer path
+                            (lambda ()
+                              (funcall callback)
+                              (when (= writes 2)
+                                (keyboard-quit)))))))
+                (gdocs-recon-dump "synthetic-id" dump summary)
+                (ert-fail "Expected summary write to quit"))
+            (quit nil))
+          (with-temp-buffer
+            (insert-file-contents dump)
+            (should (string-match-p "Sensitive body" (buffer-string))))
+          (with-temp-buffer
+            (insert-file-contents summary)
+            (should (equal (buffer-string) "old summary")))
+          (should
+           (equal (sort (directory-files
+                         directory nil directory-files-no-dot-files-regexp)
+                        #'string<)
+                  '("dump.eld" "summary.eld"))))
+      (delete-directory directory t))))
+
 (defun gdocs-test--push-state (revision remote-body &optional ot-body)
   "Build a small push state with an independently configurable OT body."
   (let ((ot-body (or ot-body remote-body)))
@@ -5149,6 +5285,36 @@ that a removed preflight guard would be observed as an unexpected success."
       (dolist (path outputs)
         (when (and path (file-exists-p path))
           (delete-file path))))))
+
+(ert-deftest gdocs-test-debug-push-cleans-generated-file-on-quit ()
+  "An interrupted push diagnostic leaves no generated destination or staging file."
+  (let* ((directory (make-temp-file "gdocs-debug-quit-" t))
+         (temporary-file-directory (file-name-as-directory directory))
+         (body "Sensitive debug body\n")
+         (html (gdocs-test--html-for-ops
+                7 (list (gdocs-test--insert-op body))))
+         (writer (symbol-function 'gdocs--write-sensitive-diagnostic)))
+    (unwind-protect
+        (with-temp-buffer
+          (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_REVISION: 7\n:END:\n\n"
+                  body)
+          (org-mode)
+          (condition-case nil
+              (cl-letf (((symbol-function 'gdocs--fetch-edit-page-sync)
+                         (lambda (_doc-id) html))
+                        ((symbol-function 'gdocs--write-sensitive-diagnostic)
+                         (lambda (path callback)
+                           (funcall
+                            writer path
+                            (lambda ()
+                              (funcall callback)
+                              (keyboard-quit))))))
+                (gdocs-debug-push-state "synthetic-id")
+                (ert-fail "Expected push diagnostic to quit"))
+            (quit nil))
+          (should-not
+           (directory-files directory nil directory-files-no-dot-files-regexp)))
+      (delete-directory directory t))))
 
 (ert-deftest gdocs-test-local-image-marker-cannot-recreate-an-image ()
   "A local remote-object marker is not silently emitted as plain text."
