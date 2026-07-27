@@ -1600,7 +1600,8 @@ not make an unchanged object look changed."
 The preservation policy accepts integer/float representation differences, but
 does not use a tolerance and does not treat missing/non-numeric dimensions as
 preserved metadata."
-  (and (numberp a) (numberp b)
+  (and (gdocs--valid-inline-object-dimension-p a)
+       (gdocs--valid-inline-object-dimension-p b)
        (= (float a) (float b))))
 
 (defun gdocs--inline-object-identity (object)
@@ -2991,11 +2992,27 @@ than the reverse (which org would treat as opaque).")
 (defvar gdocs--render-link-description nil
   "Non-nil while rendering the description of one logical Org link.")
 
+(defun gdocs--valid-inline-object-dimension-p (value)
+  "Return non-nil when VALUE is representable as a positive finite dimension."
+  (and (numberp value)
+       (> value 0)
+       (condition-case nil
+           (let ((as-float (float value)))
+             (and (= as-float as-float)
+                  (< as-float 1.0e+INF)))
+         (arithmetic-error nil))))
+
 (defun gdocs--inline-object-number (value)
   "Format inline-object dimension VALUE for an Org placeholder."
-  (if (numberp value)
-      (format "%.6g" value)
-    "unknown"))
+  (unless (gdocs--valid-inline-object-dimension-p value)
+    (user-error "gdocs: inline-object dimensions must be positive and finite"))
+  (if (integerp value)
+      (number-to-string value)
+    (let* ((float-output-format nil)
+           (printed (prin1-to-string value)))
+      (if (string-match "\\`\\([0-9]+\\)\\.0\\'" printed)
+          (match-string 1 printed)
+        printed))))
 
 (defun gdocs--inline-object-spec (object)
   "Return the unambiguous, remote-marked Org payload for OBJECT."
@@ -3445,9 +3462,11 @@ than to the final text, so it never appears inside a source block."
 (defun gdocs--inline-object-dimension (token)
   "Parse an inline-object dimension TOKEN, or return nil."
   (when (and (stringp token)
-             (string-match-p "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" token))
+              (string-match-p
+               "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\(?:[eE][+-]?[0-9]+\\)?\\'"
+               token))
     (let ((dimension (string-to-number token)))
-      (and (> dimension 0) dimension))))
+      (and (gdocs--valid-inline-object-dimension-p dimension) dimension))))
 
 (defun gdocs--parse-inline-object-spec (value)
   "Parse the payload of a `gdocs_inline_object' Org placeholder.

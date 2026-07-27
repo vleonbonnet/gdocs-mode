@@ -1060,6 +1060,45 @@ END is the inclusive final OT position."
                         (list :inline-object same-object)
                         (gdocs-dm-make-run "After")))))))
 
+(ert-deftest gdocs-test-inline-object-dimensions-round-trip-exactly ()
+  "Dimension rendering is shortest while preserving exact comparison identity."
+  (dolist (case '((1 "1")
+                  (1.0 "1")
+                  (1.2345678901234567 "1.2345678901234567")
+                  (1.0e-20 "1e-20")
+                  (1.0e+20 "1e+20")))
+    (let* ((value (car case))
+           (rendered (gdocs--inline-object-number value))
+           (parsed (gdocs--inline-object-dimension rendered)))
+      (should (equal rendered (cadr case)))
+      (should (gdocs--inline-object-dimension-equal-p value parsed)))))
+
+(ert-deftest gdocs-test-inline-object-render-parse-preserves-identity ()
+  "Rendering and parsing preserve high-precision inline-object identity."
+  (dolist (dimensions '((1 . 2)
+                        (1.2345678901234567 . 9.876543210987654)
+                        (1.0e-20 . 1.0e+20)))
+    (let* ((object (list :kind :inline-object
+                         :entity-id "kix.precise"
+                         :object-kind :image
+                         :content-id "precise-content"
+                         :width (car dimensions)
+                         :height (cdr dimensions)))
+           (rendered (gdocs--inline-object-spec object))
+           (parsed (gdocs--parse-inline-object-spec rendered)))
+      (should parsed)
+      (should (gdocs--capability-object-equal-p object parsed)))))
+
+(ert-deftest gdocs-test-inline-object-dimensions-reject-invalid-values ()
+  "Rendering rejects non-finite and non-positive dimensions."
+  (dolist (value (list nil "1" 0 -1 -0.0
+                       (read "0.0e+NaN")
+                       (read "1.0e+INF")
+                       (read "-1.0e+INF")))
+    (should-error (gdocs--inline-object-number value) :type 'user-error))
+  (dolist (token '("0" "-1" "NaN" "1.0e+INF" "1e400"))
+    (should-not (gdocs--inline-object-dimension token))))
+
 (ert-deftest gdocs-test-inline-images-use-te-positions-not-entity-order ()
   "Multiple images are sorted by OT position, not ae or te order."
   (let* ((fixture (gdocs-test--inline-case "multiple-images-not-entity-order"))
@@ -6149,6 +6188,23 @@ that a removed preflight guard would be observed as an unexpected success."
                 "synthetic" state local 'ot-incremental)))
     (should (eq (plist-get plan :kind) :incremental))
     (should (plist-get plan :ranges))
+    (should (gdocs--push-preflight state local plan))))
+
+(ert-deftest gdocs-test-precise-inline-object-allows-unrelated-image-push ()
+  "A precise dimension survives rendering so unrelated push preflight passes."
+  (let* ((object '(:kind :inline-object
+                          :entity-id "kix.precise"
+                          :object-kind :image
+                          :content-id "precise-content"
+                          :width 1.2345678901234567
+                          :height 1.0e-20
+                          :ot-position 2))
+         (state (list :ot-body "Before\n*\n"
+                      :inline-objects (list object)))
+         (local (concat "Changed\n" (gdocs--render-inline-object object) "\n"))
+         (plan '(:kind :incremental
+                       :ranges ((:ot-start 1 :ot-end 1
+                                           :insert-at 1 :delete-count 1)))))
     (should (gdocs--push-preflight state local plan))))
 
 (ert-deftest gdocs-test-fresh-ot-retry-reclassifies-concurrent-fallback ()
