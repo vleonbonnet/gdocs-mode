@@ -1624,15 +1624,104 @@ END is the inclusive final OT position."
              (regexp-quote
               (concat "crlf\\linebreak{}"
                       gdocs--org-table-newline-qualifier
+                      gdocs--org-table-boundary-qualifier " "
                       "cr\\linebreak{}"
                       gdocs--org-table-newline-qualifier
+                      gdocs--org-table-boundary-qualifier " "
                       "lf\\linebreak{}"
                       gdocs--org-table-newline-qualifier
+                      gdocs--org-table-boundary-qualifier " "
                       "end"))
              org))
     (should (equal (gdocs-test--cell-view cell)
                    (list (list normalized nil nil))))
     (should (equal org (gdocs-dm-to-org round-tripped)))))
+
+(ert-deftest gdocs-test-table-boundary-crlf-has-deterministic-style-owner ()
+  "A boundary LF keeps only styles shared by its two source characters."
+  (let* ((runs (list (gdocs-dm-make-run "bold\r" '(:bold))
+                     (gdocs-dm-make-run "\nplain")
+                     (gdocs-dm-make-run "both\r" '(:italic :bold))
+                     (gdocs-dm-make-run "\nend" '(:italic :underline))))
+         (normalized (gdocs--normalize-table-cell-runs runs)))
+    (should (equal (mapcar #'gdocs-test--run-view normalized)
+                   '(("bold" (:bold) nil)
+                     ("\n" nil nil)
+                     ("plain" nil nil)
+                     ("both" (:bold :italic) nil)
+                     ("\n" (:italic) nil)
+                     ("end" (:italic :underline) nil))))
+    (should (equal (mapcar #'gdocs-test--run-view runs)
+                   '(("bold\r" (:bold) nil)
+                     ("\nplain" nil nil)
+                     ("both\r" (:bold :italic) nil)
+                     ("\nend" (:italic :underline) nil))))))
+
+(ert-deftest gdocs-test-table-boundary-crlf-preserves-unrelated-links ()
+  "A boundary newline keeps only a destination shared by CR and LF."
+  (let* ((runs (list (gdocs-dm-make-run "linked\r" nil "https://a.example")
+                     (gdocs-dm-make-run "\nplain")
+                     (gdocs-dm-make-run "left\r")
+                     (gdocs-dm-make-run "\nright" nil "https://b.example")))
+         (normalized (gdocs--normalize-table-cell-runs runs)))
+    (should (equal (mapcar #'gdocs-test--run-view normalized)
+                   '(("linked" nil "https://a.example")
+                     ("\n" nil nil)
+                     ("plain" nil nil)
+                     ("left" nil nil)
+                     ("\n" nil nil)
+                     ("right" nil "https://b.example"))))))
+
+(ert-deftest gdocs-test-table-boundary-crlf-preserves-unrelated-styles ()
+  "Differently styled runs retain their metadata around a boundary newline."
+  (let* ((runs (list (gdocs-dm-make-run "before\r" '(:italic :underline))
+                     (gdocs-dm-make-run "\nafter" '(:bold :strike))))
+         (normalized (gdocs--normalize-table-cell-runs runs)))
+    (should (equal (mapcar #'gdocs-test--run-view normalized)
+                   '(("before" (:italic :underline) nil)
+                     ("\n" nil nil)
+                     ("after" (:bold :strike) nil))))))
+
+(ert-deftest gdocs-test-table-boundary-newlines-normalize-as-ordered-stream ()
+  "Mixed internal and boundary newlines normalize without crossing objects."
+  (let* ((object '(:kind :inline-object :entity-id "object"))
+         (runs (list (gdocs-dm-make-run "a\r\nb\r")
+                     (gdocs-dm-make-run "")
+                     (gdocs-dm-make-run "\nc\rd\n" '(:strike)
+                                        "https://example.test")
+                     (list :inline-object object)
+                     (gdocs-dm-make-run "\ne")))
+         (normalized (gdocs--normalize-table-cell-runs runs)))
+    (should (equal (mapcar (lambda (run) (plist-get run :text)) normalized)
+                   '("a\nb" "" "\n" "c\nd\n" nil "\ne")))
+    (should (equal (gdocs-test--run-view (nth 3 normalized))
+                   '("c\nd\n" (:strike) "https://example.test")))
+    (should (eq (plist-get (nth 4 normalized) :inline-object) object))))
+
+(ert-deftest gdocs-test-table-boundary-crlf-round-trips-with-metadata ()
+  "Boundary CRLF and sentinel-shaped content round-trip cycle-stably."
+  (let* ((sentinel gdocs--org-table-escape-sentinel)
+         (runs
+          (list
+           (gdocs-dm-make-run "bold\r" '(:bold))
+           (gdocs-dm-make-run (concat "\nplain " sentinel " | "))
+           (gdocs-dm-make-run "linked\r" nil "https://a.example")
+           (gdocs-dm-make-run "\nstyled" '(:italic))))
+         (table
+          (list :kind :table :cols 1
+                :rows (list (list (list runs)))))
+         (doc (gdocs-dm-make-doc :paragraphs (list table)))
+         (org (gdocs-dm-to-org doc))
+         (round-trip (gdocs-dm-from-org org))
+         (cell (caar (plist-get (car (gdocs-dm-paragraphs round-trip))
+                                  :rows))))
+    (should (equal (gdocs-test--cell-view cell)
+                   `(("bold" (:bold) nil)
+                     (,(concat "\nplain " sentinel " | ") nil nil)
+                     ("linked" nil "https://a.example")
+                     ("\n" nil nil)
+                     ("styled" (:italic) nil))))
+    (should (equal org (gdocs-dm-to-org round-trip)))))
 
 (ert-deftest gdocs-test-table-unsentinelled-escape-forms-stay-literal ()
   "User-written escape-shaped text is not decoded as table structure."
@@ -1647,7 +1736,8 @@ END is the inclusive final OT position."
   (let* ((sentinel gdocs--org-table-escape-sentinel)
          (text (concat "slashes \\\\ braces {x}; literal \\linebreak{} and "
                        "\\vert{}; sentinel " sentinel "; sentinel-like "
-                       sentinel "p/" sentinel "n; collisions \\vert{}"
+                       sentinel "p/" sentinel "n/" sentinel
+                       "b ; collisions \\vert{}"
                        sentinel "p and \\linebreak{}" sentinel
                        "n; generated | and\nnewline"))
          (doc (gdocs-dm-make-doc

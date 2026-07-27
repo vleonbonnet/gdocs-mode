@@ -2971,14 +2971,17 @@ Order here matters only for emit-stability of nested wrappers.")
 (defconst gdocs--org-table-escape-sentinel (string #x2063)
   "Renderer-only sentinel for reversible Org table cell escapes.
 
-The table encoding is `\\vert{} Sp' for a pipe, `\\linebreak{} Sn' for a
-newline, and `SS' for a literal sentinel, where S is this character.")
+The table encoding is `\\vert{} Sp' for a pipe, `\\linebreak{} Sn Sb ' for
+a newline, and `SS' for a literal sentinel, where S is this character.")
 
 (defconst gdocs--org-table-pipe-qualifier
   (concat gdocs--org-table-escape-sentinel "p"))
 
 (defconst gdocs--org-table-newline-qualifier
   (concat gdocs--org-table-escape-sentinel "n"))
+
+(defconst gdocs--org-table-boundary-qualifier
+  (concat gdocs--org-table-escape-sentinel "b"))
 
 (defun gdocs--escape-org-inline (text &optional escape-special)
   "Normalize TEXT for safe inline Org emission.
@@ -3186,6 +3189,54 @@ adjacent runs that share a style are wrapped by a single emphasis pair rather
 than per-run pairs."
   (gdocs--render-runs-by-link runs))
 
+(defun gdocs--normalize-table-cell-runs (runs)
+  "Normalize newlines in table RUNS without flattening run metadata.
+
+Every CR becomes LF.  For a CR and LF split across adjacent textual runs, the
+pair becomes a separate LF run carrying only styles and a link shared by both
+source characters.  Inline objects interrupt adjacency."
+  (let (reversed
+        previous-cell
+        previous-run
+        previous-ended-in-cr)
+    (dolist (run runs)
+      (let ((copy (copy-sequence run)))
+        (let ((text (plist-get run :text)))
+          (if (stringp text)
+              (progn
+                (let ((normalized-text
+                       (replace-regexp-in-string "\r\n?" "\n" text t t)))
+                  (when (and previous-cell
+                             previous-ended-in-cr
+                             (string-prefix-p "\n" text))
+                    (let* ((previous (car previous-cell))
+                           (previous-text (plist-get previous :text))
+                           (styles
+                            (seq-filter
+                             (lambda (style)
+                               (memq style (plist-get run :styles)))
+                             (plist-get previous-run :styles)))
+                           (link
+                            (and (equal (plist-get previous-run :link)
+                                        (plist-get run :link))
+                                 (plist-get run :link))))
+                      (setcar previous-cell
+                              (plist-put previous :text
+                                         (substring previous-text 0 -1)))
+                      (push (gdocs-dm-make-run "\n" styles link) reversed))
+                    (setq normalized-text (substring normalized-text 1)))
+                  (setq copy (plist-put copy :text normalized-text)))
+                (push copy reversed)
+                (unless (string-empty-p text)
+                  (setq previous-cell reversed
+                        previous-run run
+                        previous-ended-in-cr (string-suffix-p "\r" text))))
+            (push copy reversed)
+            (setq previous-cell nil
+                  previous-run nil
+                  previous-ended-in-cr nil)))))
+    (nreverse reversed)))
+
 (defun gdocs--escape-org-table-cell-markup (text)
   "Escape table delimiters in rendered cell TEXT.
 
@@ -3194,25 +3245,25 @@ emitted verbatim inside a cell.  Sentinel-qualified `\\vert{}' and
 `\\linebreak{}' constructs survive Org parsing and distinguish renderer
 escapes from identical literal text.  This is deliberately applied after
 inline rendering so pipes in link descriptions and style runs are protected
-without changing run boundaries.  CRLF and lone CR are normalized to one LF
-before escaping."
-  (let ((text (replace-regexp-in-string "\r\n?" "\n" (or text "") t t)))
-    (mapconcat
-     (lambda (char)
-       (cond
-        ((= char (string-to-char gdocs--org-table-escape-sentinel))
-         (concat gdocs--org-table-escape-sentinel
-                 gdocs--org-table-escape-sentinel))
-        ((= char 124) (concat "\\vert{}" gdocs--org-table-pipe-qualifier))
-        ((= char 10)
-         (concat "\\linebreak{}" gdocs--org-table-newline-qualifier))
-        (t (string char))))
-     (string-to-list text) "")))
+without changing run boundaries."
+  (mapconcat
+   (lambda (char)
+     (cond
+      ((= char (string-to-char gdocs--org-table-escape-sentinel))
+       (concat gdocs--org-table-escape-sentinel
+               gdocs--org-table-escape-sentinel))
+      ((= char 124) (concat "\\vert{}" gdocs--org-table-pipe-qualifier))
+      ((= char 10)
+       (concat "\\linebreak{}" gdocs--org-table-newline-qualifier
+               gdocs--org-table-boundary-qualifier " "))
+      (t (string char))))
+   (string-to-list (or text "")) ""))
 
 (defun gdocs--render-table-cell (cell)
   "Render one table CELL while keeping its content in one Org row."
   (gdocs--escape-org-table-cell-markup
-   (gdocs--render-runs (gdocs--table-cell-runs cell))))
+   (gdocs--render-runs
+    (gdocs--normalize-table-cell-runs (gdocs--table-cell-runs cell)))))
 
 (defun gdocs--render-runs-styled (runs already-wrapped)
   "Inner driver for `gdocs--render-runs'.
@@ -3612,6 +3663,15 @@ a different document-model value."
                 (string-to-char gdocs--org-table-escape-sentinel)))
         (push gdocs--org-table-escape-sentinel out)
         (setq i (+ i 2)))
+       ((and (<= (+ i (length gdocs--org-table-boundary-qualifier) 1) n)
+             (string= gdocs--org-table-boundary-qualifier
+                      (substring text i
+                                 (+ i (length
+                                       gdocs--org-table-boundary-qualifier))))
+             (= (aref text (+ i (length
+                                 gdocs--org-table-boundary-qualifier)))
+                ?\s))
+        (setq i (+ i (length gdocs--org-table-boundary-qualifier) 1)))
        ((or (and (<= (+ i (length gdocs--org-table-pipe-qualifier)) n)
                  (string= gdocs--org-table-pipe-qualifier
                           (substring text i
