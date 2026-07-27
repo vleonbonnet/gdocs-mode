@@ -2219,7 +2219,46 @@ END is the inclusive final OT position."
        "coverage\n"
        (list (cons anchor (cons 1 8)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-      "[[https://example.com][*coverage*]][fn:gdocs-comment-1]\n"))))
+       "[[https://example.com][*coverage*]][fn:gdocs-comment-1]\n"))))
+
+(ert-deftest gdocs-test-comment-visible-link-description-decodes-renderer-escapes ()
+  "Comment matching sees the OT characters represented by renderer escapes."
+  (let* ((text (concat "_[]" (string ?\\) "*/+=~"))
+         (target "https://example.com/_[]\\*/+=~")
+         (doc (gdocs-dm-make-doc
+               :paragraphs
+               (list (list :kind :para
+                           :runs (list (gdocs-dm-make-run text nil target))))))
+         (org (gdocs-dm-to-org doc))
+         (visible+map (gdocs--org-visible-and-map org))
+         (visible (car visible+map))
+         (map (cdr visible+map)))
+    (should (equal visible (concat text "\n")))
+    (should (= (length visible) (length map)))
+    (dotimes (index (length text))
+      (should (= (aref visible index)
+                 (aref org (aref map index)))))))
+
+(ert-deftest gdocs-test-comment-visible-projection-decodes-only-known-link-escapes ()
+  "Projection leaves user escapes outside labels and unknown label escapes alone."
+  (let* ((org "outside \\* [[hidden\\*][label\\q]]\n")
+         (visible (car (gdocs--org-visible-and-map org))))
+    (should (equal visible "outside \\* label\\q\n"))))
+
+(ert-deftest gdocs-test-comment-inline-anchor-after-escaped-styled-link-label ()
+  "A ref for an escaped styled label lands after the complete link."
+  (let* ((text "A_[]\\*")
+         (target "https://example.com/A_[]\\*")
+         (runs (list (gdocs-dm-make-run text '(:bold) target)))
+         (org (gdocs--render-runs runs))
+         (anchor "kix.escaped-styled-label"))
+    (should
+     (equal
+      (gdocs--inline-comment-refs
+       (concat org "\n") (concat text "\n")
+       (list (cons anchor (cons 1 (length text))))
+       (list (list 1 :text "synthetic" :anchor anchor)))
+      (concat org "[fn:gdocs-comment-1]\n")))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-after-bare-link ()
   "A bare URL anchor gets its ref after the complete bare link."
