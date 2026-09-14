@@ -1126,7 +1126,7 @@ END is the inclusive final OT position."
                    "BeforeAfter"))
     (should-error (gdocs-dm-to-ot doc) :type 'user-error)))
 
-(defun gdocs-test--chip-def-op (type id label)
+(defun gdocs-test--chip-def-op (type id label &optional seconds)
   "Construct the date/person chip `ae' definition op for TYPE/ID/LABEL."
   (list
    `(,(cons 'ty "ae") ,(cons 'et type) ,(cons 'id id) ,(cons 'law t)
@@ -1137,7 +1137,8 @@ END is the inclusive final OT position."
                                   (cons 'dfie_ts
                                         (list (cons 'tv
                                                     (list (cons 'tv_s
-                                                                1790251200.0)
+                                                                (or seconds
+                                                                    1790251200.0))
                                                           (cons 'tv_n 0))))))))
               (list (cons 'per_n label)
                     (cons 'per_e "person@example.com")))))))
@@ -1147,15 +1148,15 @@ END is the inclusive final OT position."
   `(,(cons 'ty "te") ,(cons 'id id) ,(cons 'spi spi)))
 
 (ert-deftest gdocs-test-date-and-person-chips-decode-and-render ()
-  "Date/person chip attachments become readable, explicit Org markers."
+  "Date/person chip attachments become Org links showing the payload."
   (let* ((body (concat "On " (string gdocs--ot-chip-codepoint) " with "
                        (string gdocs--ot-chip-codepoint) "\n"))
          (ops (append (list (gdocs-test--insert-op body))
                       (gdocs-test--chip-def-op
-                       "date" "kix.chip-date" "Sep 24, 2026")
+                       "date" "kix.chip-date" "Sep 24, 2026" 1790251200)
                       (list (gdocs-test--chip-attach-op "kix.chip-date" 4))
                       (gdocs-test--chip-def-op
-                       "person" "kix.chip-person" "Valentin Leon")
+                       "person" "kix.chip-person" "Valentin Leon" nil)
                       (list (gdocs-test--chip-attach-op "kix.chip-person" 11))))
          (doc (gdocs-dm-from-ops nil nil nil body ops))
          (org (gdocs-dm-to-org doc))
@@ -1164,14 +1165,17 @@ END is the inclusive final OT position."
     (should (eq (plist-get (car objects) :kind) :inline-object))
     (should (eq (plist-get (car objects) :object-kind) :chip-date))
     (should (equal (plist-get (car objects) :entity-id) "kix.chip-date"))
-    (should (equal (plist-get (car objects) :label) "Sep 24, 2026"))
+    (should (equal (plist-get (car objects) :chip-value) "2026-09-24"))
     (should (eq (plist-get (nth 1 objects) :object-kind) :chip-person))
-    (should (equal (plist-get (nth 1 objects) :label) "Valentin Leon"))
+    (should (equal (plist-get (nth 1 objects) :chip-value)
+                   "Valentin Leon"))
     (should-not (string-match-p (string gdocs--ot-chip-codepoint) org))
     (should (string-match-p
-             "@@gdocs-inline-object:date kix.chip-date Sep 24, 2026@@" org))
+             "\\[\\[gdocs-chip:date:kix.chip-date\\]\\[2026-09-24 Thu\\]\\]"
+             org))
     (should (string-match-p
-             "@@gdocs-inline-object:person kix.chip-person Valentin Leon@@" org))
+             "\\[\\[gdocs-chip:person:kix.chip-person\\]\\[Valentin Leon\\]\\]"
+             org))
     (should (equal org (gdocs-dm-to-org (gdocs-dm-from-org org))))))
 
 (ert-deftest gdocs-test-chips-in-table-cells-render-and-round-trip ()
@@ -1182,7 +1186,7 @@ END is the inclusive final OT position."
                             "Limited pilot"))))
          (ops (append (list (gdocs-test--insert-op body))
                       (gdocs-test--chip-def-op
-                       "date" "kix.chip-cell" "Sep 24, 2026")
+                       "date" "kix.chip-cell" "Sep 24, 2026" 1790251200)
                       (list (gdocs-test--chip-attach-op "kix.chip-cell" 22))))
          (doc (gdocs-dm-from-ops nil nil nil body ops))
          (org (gdocs-dm-to-org doc))
@@ -1190,7 +1194,8 @@ END is the inclusive final OT position."
     (should (eq (plist-get (car (gdocs-dm-paragraphs doc)) :kind) :table))
     (should-not (string-match-p (string gdocs--ot-chip-codepoint) org))
     (should (string-match-p
-             "@@gdocs-inline-object:date kix.chip-cell Sep 24, 2026@@" org))
+             "\\[\\[gdocs-chip:date:kix.chip-cell\\]\\[2026-09-24 Thu\\]\\]"
+             org))
     (should-not (seq-some
                  (lambda (report)
                    (string-match-p
@@ -1208,13 +1213,13 @@ END is the inclusive final OT position."
   (let* ((body (concat "Date: " (string gdocs--ot-chip-codepoint) " here\n"))
          (ops (append (list (gdocs-test--insert-op body))
                       (gdocs-test--chip-def-op
-                       "date" "kix.chip-one" "Sep 24, 2026")
+                       "date" "kix.chip-one" "Sep 24, 2026" 1790251200)
                       (list (gdocs-test--chip-attach-op "kix.chip-one" 7))))
          (state (list :revision 5 :ot-body body :ot-ops ops))
          (rendered
           (gdocs-dm-to-org (gdocs-dm-from-ops 5 "synthetic" nil body ops))))
     (should (string-match-p
-             "@@gdocs-inline-object:date kix.chip-one Sep 24, 2026@@"
+             "\\[\\[gdocs-chip:date:kix.chip-one\\]\\[2026-09-24 Thu\\]\\]"
              rendered))
     (should (gdocs--push-preflight state rendered '(:kind :noop)))
     (should (gdocs--push-preflight
@@ -1234,13 +1239,13 @@ END is the inclusive final OT position."
   (let* ((body (concat "Date: " (string gdocs--ot-chip-codepoint) " here\n"))
          (ops (append (list (gdocs-test--insert-op body))
                       (gdocs-test--chip-def-op
-                       "date" "kix.chip-one" "Sep 24, 2026")
+                       "date" "kix.chip-one" "Sep 24, 2026" 1790251200)
                       (list (gdocs-test--chip-attach-op "kix.chip-one" 7))))
          (state (list :revision 5 :ot-body body :ot-ops ops))
          (rendered
           (gdocs-dm-to-org (gdocs-dm-from-ops 5 "synthetic" nil body ops)))
          (edited
-          (replace-regexp-in-string "Sep 24, 2026" "Sep 25, 2026" rendered)))
+          (replace-regexp-in-string "2026-09-24" "2026-09-25" rendered)))
     (should-error (gdocs--push-preflight state edited '(:kind :noop))
                   :type 'user-error)))
 

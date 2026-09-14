@@ -1614,44 +1614,172 @@ that association is made by its separate `te' operation."
 Date and person chips occupy exactly one OT position, just like the
 image `*' placeholder, and carry no visible text of their own.")
 
+(defconst gdocs--chip-link-prefix "gdocs-chip"
+  "Org link protocol used to render date/person chips locally.
+
+The full syntax is `[[gdocs-chip:date ENTITY][DATE]]' and
+`[[gdocs-chip:person ENTITY][NAME]]'.  Org displays only the
+description (with `org-date' face for date chips), keeping the remote
+identity in the hidden link path.")
+
 (defun gdocs--valid-chip-label-p (label)
   "Return non-nil when LABEL can be embedded in a chip placeholder."
   (and (stringp label)
        (not (string-empty-p label))
        (not (string-match-p "[[:cntrl:]]" label))))
 
+(defun gdocs--chip-date-parse (text)
+  "Parse date-chip display TEXT into (YEAR MONTH DAY), or nil.
+Accepts Org date syntax (`2026-08-31', with or without a weekday) and
+the Google label format (`Aug 31, 2026')."
+  (let ((parsed (parse-time-string (string-trim (or text "")))))
+    (and (nth 3 parsed) (nth 4 parsed) (nth 5 parsed)
+         (list (nth 5 parsed) (nth 4 parsed) (nth 3 parsed)))))
+
+(defun gdocs--chip-date-ymd (seconds label)
+  "Return a date chip's (YEAR MONTH DAY) from its epoch or label.
+SECONDS is the chip's `dfie_ts' epoch; Google encodes the chip date as
+noon UTC so the calendar date is timezone-safe.  LABEL is parsed as a
+fallback for older payloads."
+  (or (and (numberp seconds)
+           (let ((decoded (decode-time seconds "UTC")))
+             (list (nth 5 decoded) (nth 4 decoded) (nth 3 decoded))))
+      (gdocs--chip-date-parse label)))
+
+(defun gdocs--chip-date-display (object)
+  "Return the Org display text for date chip OBJECT."
+  (or (and (plist-get object :ymd)
+           (format-time-string
+            "%Y-%m-%d %a"
+            (encode-time 0 0 0
+                         (nth 2 (plist-get object :ymd))
+                         (nth 1 (plist-get object :ymd))
+                         (nth 0 (plist-get object :ymd)))))
+      (plist-get object :label)))
+
 (defun gdocs--chip-entity-object (op)
   "Decode a date/person chip `ae' entity definition OP into an object plist.
 
-The Google-supplied display text becomes the chip's stable label: it is
-both what Org shows and part of the object identity.  The timestamp
-payload, e-mail address, and other `epm' metadata are deliberately not
-retained; a changed label is reported as a changed object rather than
-silently rewritten."
+The chip's semantic payload becomes its stable `:chip-value' (the
+calendar date for date chips, the contact name for person chips), which
+is what push matching compares; `:label' retains Google's display text
+for the Org rendering.  A changed semantic value is reported as a
+changed object rather than silently rewritten."
   (let* ((type (alist-get 'et op))
          (epm (alist-get 'epm op))
          (label (if (equal type "date")
                     (alist-get 'dfie_dt (alist-get 'dat_df epm))
-                  (alist-get 'per_n epm))))
+                  (alist-get 'per_n epm)))
+         (seconds (and (equal type "date")
+                       (alist-get 'tv_s
+                                  (alist-get 'tv
+                                             (alist-get 'dfie_ts epm)))))
+         (ymd (and (equal type "date")
+                   (gdocs--chip-date-ymd seconds label))))
     (when (and (gdocs--valid-chip-label-p label)
-               (stringp (alist-get 'id op)))
+               (stringp (alist-get 'id op))
+               (or (not (equal type "date")) ymd))
       (list :kind :inline-object
             :object-kind (if (equal type "date") :chip-date :chip-person)
             :entity-id (alist-get 'id op)
-            :label label))))
+            :label label
+            :ymd ymd
+            :chip-value (if (equal type "date")
+                            (format "%04d-%02d-%02d"
+                                    (nth 0 ymd) (nth 1 ymd) (nth 2 ymd))
+                          label)))))
+
+(defun gdocs--chip-object-from-link (el props)
+  "Build a chip object from an Org chip link EL with link PROPS, or nil.
+Accepts both the registered-protocol parse (path already stripped) and
+the fuzzy fallback (full path kept).  A date description that does not
+parse returns nil so the marker fails closed."
+  (when (and (consp el) (eq (car el) 'link) (listp props))
+    (let* ((type (plist-get props :type))
+           (path (plist-get props :path))
+           (full (cond
+                  ((and (stringp type)
+                        (equal type gdocs--chip-link-prefix))
+                   path)
+                  ((and (stringp path)
+                        (string-prefix-p
+                         (concat gdocs--chip-link-prefix ":") path))
+                   (substring path
+                              (1+ (length gdocs--chip-link-prefix)))))))
+      (when (and (stringp full)
+                 (string-match
+                  "\\`\\(date\\|person\\):\\([^[:space:]]+\\)\\'" full))
+        (let* ((kind (match-string 1 full))
+               (entity-id (match-string 2 full))
+               (begin (org-element-property :contents-begin el))
+               (end (org-element-property :contents-end el))
+               (desc (and begin end
+                          (buffer-substring-no-properties begin end))))
+          (when (gdocs--valid-chip-label-p desc)
+            (if (equal kind "date")
+                (let ((ymd (gdocs--chip-date-parse desc)))
+                  (and ymd
+                       (list :kind :inline-object
+                             :object-kind :chip-date
+                             :entity-id entity-id
+                             :label desc
+                             :ymd ymd
+                             :chip-value (format "%04d-%02d-%02d"
+                                                 (nth 0 ymd)
+                                                 (nth 1 ymd)
+                                                 (nth 2 ymd)))))
+              (and (gdocs--valid-inline-object-id-p entity-id)
+                   (list :kind :inline-object
+                         :object-kind :chip-person
+                         :entity-id entity-id
+                         :label desc
+                         :ymd nil
+                         :chip-value desc)))))))))
+
+(defun gdocs--chip-org-link (object)
+  "Render chip OBJECT as an Org link; the description is what Org shows."
+  (pcase (plist-get object :object-kind)
+    (:chip-date
+     (format "[[%s:date:%s][%s]]"
+             gdocs--chip-link-prefix
+             (plist-get object :entity-id)
+             (gdocs--chip-date-display object)))
+    (:chip-person
+     (format "[[%s:person:%s][%s]]"
+             gdocs--chip-link-prefix
+             (plist-get object :entity-id)
+             (or (plist-get object :label) "")))
+    (_ (user-error "gdocs: invalid inline-object marker metadata"))))
+
+(defun gdocs--chip-link-face (path)
+  "Return the Org face for a chip link with PATH.
+Date chips render with the `org-date' face so they look like ordinary
+Org timestamps; person chips use the ordinary link face."
+  (if (string-prefix-p "person:" path) 'org-link 'org-date))
+
+(org-link-set-parameters
+ gdocs--chip-link-prefix
+ :follow #'gdocs--chip-link-follow
+ :face #'gdocs--chip-link-face)
+
+(defun gdocs--chip-link-follow (path _arg)
+  "Follow handler for chip links: chips are pull-only remote objects."
+  (user-error
+   "gdocs: remote chip %s is pull-only; edit it in Google Docs and pull" path))
 
 (defun gdocs--inline-object-is-image-p (object)
   "Return non-nil when inline OBJECT is an image placeholder."
   (eq (plist-get object :object-kind) :image))
 
 (defconst gdocs--inline-object-identity-keys
-  '(:entity-id :kind :object-kind :content-id :width :height :label)
+  '(:entity-id :kind :object-kind :content-id :width :height :chip-value)
   "Stable fields that identify an inline object for comparison.
 
 OT positions, decoder-only vectors, and source metadata are deliberately not
 part of this identity.  Width and height remain part of the identity because
 changing either changes the rendered object and cannot be preserved by a text
-only incremental edit.  A chip's label participates for the same reason.")
+only incremental edit.  A chip's `:chip-value' (calendar date or contact
+name) participates for the same reason; its display label does not.")
 
 (defun gdocs--inline-object-canonical-value (key value)
   "Normalize VALUE for stable inline-object identity KEY.
@@ -2852,7 +2980,7 @@ text without inline markup."
          (out (list :kind kind :runs runs)))
     (when inline-object
       (dolist (key '(:entity-id :object-kind :content-id :width :height
-                                :label :ot-position))
+                                :label :ymd :chip-value :ot-position))
         (when (plist-member inline-object key)
           (setq out (plist-put out key (plist-get inline-object key))))))
     (when (and (eq kind :heading) heading)
@@ -3166,47 +3294,38 @@ directly inside the markers) is already guaranteed by trimming."
 (defun gdocs--inline-object-spec (object)
   "Return the unambiguous, remote-marked Org payload for OBJECT.
 
-The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT' for
-images and `date|person ENTITY LABEL' for smart chips."
+Images use the stable syntax `image ENTITY WIDTHxHEIGHT
+content-id=CONTENT'.  Chips render as Org chip links instead; see
+`gdocs--chip-org-link'."
   (unless (and (listp object)
                (eq (plist-get object :kind) :inline-object)
                (gdocs--valid-inline-object-id-p
                 (plist-get object :entity-id)))
     (user-error "gdocs: invalid inline-object marker metadata"))
-  (pcase (plist-get object :object-kind)
-    (:image
-     (unless (gdocs--valid-inline-object-id-p
-              (plist-get object :content-id))
-       (user-error "gdocs: invalid inline-object marker metadata"))
-     (format "image %s %sx%s content-id=%s"
-             (plist-get object :entity-id)
-             (gdocs--inline-object-number (plist-get object :width))
-             (gdocs--inline-object-number (plist-get object :height))
-             (plist-get object :content-id)))
-    (:chip-date
-     (unless (gdocs--valid-chip-label-p (plist-get object :label))
-       (user-error "gdocs: invalid inline-object marker metadata"))
-     (format "date %s %s"
-             (plist-get object :entity-id)
-             (plist-get object :label)))
-    (:chip-person
-     (unless (gdocs--valid-chip-label-p (plist-get object :label))
-       (user-error "gdocs: invalid inline-object marker metadata"))
-     (format "person %s %s"
-             (plist-get object :entity-id)
-             (plist-get object :label)))
-    (_ (user-error "gdocs: invalid inline-object marker metadata"))))
+  (unless (eq (plist-get object :object-kind) :image)
+    (user-error "gdocs: invalid inline-object marker metadata"))
+  (unless (gdocs--valid-inline-object-id-p
+           (plist-get object :content-id))
+    (user-error "gdocs: invalid inline-object marker metadata"))
+  (format "image %s %sx%s content-id=%s"
+          (plist-get object :entity-id)
+          (gdocs--inline-object-number (plist-get object :width))
+          (gdocs--inline-object-number (plist-get object :height))
+          (plist-get object :content-id)))
 
 (defun gdocs--render-inline-object (object &optional embedded)
-  "Render OBJECT as an explicit Org remote-object placeholder.
+  "Render OBJECT as an explicit remote-object placeholder.
 
-Standalone objects use a custom Org keyword.  EMBEDDED objects use an Org
-export snippet so the marker remains unambiguous even when the Google object
-shares a paragraph with ordinary text."
-  (let ((spec (gdocs--inline-object-spec object)))
-    (if embedded
-        (format "@@gdocs-inline-object:%s@@" spec)
-      (format "#+gdocs_inline_object: %s" spec))))
+Images use a custom Org keyword when standalone and an Org export
+snippet when EMBEDDED in prose, so the marker remains unambiguous even
+when sharing a paragraph with ordinary text.  Chips render as Org chip
+links in both shapes; Org hides the link path and shows the description."
+  (if (gdocs--inline-object-is-image-p object)
+      (let ((spec (gdocs--inline-object-spec object)))
+        (if embedded
+            (format "@@gdocs-inline-object:%s@@" spec)
+          (format "#+gdocs_inline_object: %s" spec)))
+    (gdocs--chip-org-link object)))
 
 (defun gdocs--render-run-text (run &optional no-link escape-special)
   "Render the textual payload of RUN — escape + optional link wrapping.
@@ -3489,11 +3608,20 @@ is the syntax-aware leading column computed from the parent item marker."
               (format "%d. " (or ordinal 1))
             "- ")))
 
+(defun gdocs--org-display-width (text)
+  "Display width of TEXT as Org renders it, hiding link targets.
+Chip links render as only their description, so column alignment uses
+the visible width rather than the raw marker length."
+  (string-width
+   (replace-regexp-in-string
+    "\\[\\[\\([^][]*\\)\\]\\[\\([^][]*\\)\\]\\]" "\\2"
+    (or text ""))))
+
 (defun gdocs--render-table-para (para)
   "Render a :kind=:table paragraph to an org-mode table.
 
 Rows are padded to a common column count and cells are padded with
-spaces so every row shares the same column widths — the shape
+spaces so every row shares the same display widths — the shape
 `org-table-align' would produce.  Alignment is deterministic, so an
 unchanged table keeps its byte-exact rendering across pulls."
   (let* ((rows (plist-get para :rows))
@@ -3509,7 +3637,8 @@ unchanged table keeps its byte-exact rendering across pulls."
           (cl-loop for col below ncols
                    collect (apply #'max 0
                                   (mapcar (lambda (row)
-                                            (string-width (nth col row)))
+                                            (gdocs--org-display-width
+                                             (nth col row)))
                                           padded)))))
     (string-join
      (mapcar (lambda (row)
@@ -3519,7 +3648,9 @@ unchanged table keeps its byte-exact rendering across pulls."
                         (cl-mapcar
                          (lambda (cell width)
                            (concat cell
-                                   (make-string (- width (string-width cell))
+                                   (make-string (- width
+                                                   (gdocs--org-display-width
+                                                    cell))
                                                 ?\s)))
                          row widths)
                         " | ")
@@ -3770,10 +3901,10 @@ than to the final text, so it never appears inside a source block."
 (defun gdocs--parse-inline-object-spec (value)
   "Parse the payload of a `gdocs_inline_object' Org placeholder.
 
-The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT'
-for images, `date ENTITY LABEL' for date chips, and `person ENTITY
-LABEL' for person chips.  LABEL is the remainder of the payload and may
-contain spaces."
+The stable image syntax is `image ENTITY WIDTHxHEIGHT
+content-id=CONTENT'.  The date/person payload forms (`date ENTITY
+LABEL', `person ENTITY LABEL') are still accepted for buffers pulled by
+older builds; current pulls render chips as Org chip links instead."
   (let* ((valid-payload (and (stringp value)
                              (not (seq-some
                                    (lambda (char)
@@ -3815,13 +3946,22 @@ contain spaces."
       ((or "date" "person")
        (when (and (>= (length fields) 3)
                   (gdocs--valid-inline-object-id-p (nth 1 fields)))
-         (let ((label (string-join (nthcdr 2 fields) " ")))
-           (when (gdocs--valid-chip-label-p label)
+         (let* ((label (string-join (nthcdr 2 fields) " "))
+                (ymd (and (equal (car fields) "date")
+                          (gdocs--chip-date-parse label))))
+           (when (and (gdocs--valid-chip-label-p label)
+                      (or (not (equal (car fields) "date")) ymd))
              (list :kind :inline-object
                    :entity-id (nth 1 fields)
                    :object-kind (if (equal (car fields) "date")
                                     :chip-date :chip-person)
-                   :label label))))))))
+                   :label label
+                   :ymd ymd
+                   :chip-value (if ymd
+                                   (format "%04d-%02d-%02d"
+                                           (nth 0 ymd) (nth 1 ymd)
+                                           (nth 2 ymd))
+                                 label)))))))))
 
 (defun gdocs--unescape-org-inline
     (text &optional link-description table-cell)
@@ -4013,33 +4153,46 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                          (or text "") inherited-styles inherited-link)))
               (list (plist-put run :inline-object-malformed t)))))))
        ((eq type 'link)
-        (let* ((path (plist-get props :path))
-               (kind (plist-get props :type))
-               (path (if table-cell
-                         (gdocs--unescape-org-table-markup path)
-                       path))
-               (url (if (member kind '("https" "http" "mailto" "ftp"))
-                        (format "%s:%s" kind path)
-                      path))
-               (runs (if contents
-                         (cl-mapcan
-                          (lambda (c)
-                            (gdocs--element-runs c inherited-styles url
-                                                 table-cell visible-fallback))
-                          contents)
-                       ;; Bare link with no description.
-                       (list (gdocs-dm-make-run (or url path)
-                                                inherited-styles url))))
-               ;; Org attaches whitespace after a link to the link's
-               ;; `:post-blank' property.  It belongs to the surrounding
-               ;; style/link context, not to the link destination.
-               (post-blank (org-element-property :post-blank el)))
-          (if (and (integerp post-blank) (> post-blank 0))
-              (append runs
-                      (list (gdocs-dm-make-run
-                             (make-string post-blank ?\s)
-                             inherited-styles inherited-link)))
-            runs)))
+        (let ((chip (gdocs--chip-object-from-link el props)))
+          (if chip
+              ;; A remote chip rendered as an Org chip link becomes a
+              ;; first-class object run again; Org attaches any trailing
+              ;; whitespace to the link as `:post-blank', so re-emit it.
+              (let ((runs (list (list :inline-object chip)))
+                    (post-blank (org-element-property :post-blank el)))
+                (if (and (integerp post-blank) (> post-blank 0))
+                    (append runs
+                            (list (gdocs-dm-make-run
+                                   (make-string post-blank ?\s)
+                                   inherited-styles inherited-link)))
+                  runs))
+            (let* ((path (plist-get props :path))
+                   (kind (plist-get props :type))
+                   (path (if table-cell
+                             (gdocs--unescape-org-table-markup path)
+                           path))
+                   (url (if (member kind '("https" "http" "mailto" "ftp"))
+                            (format "%s:%s" kind path)
+                          path))
+                   (runs (if contents
+                             (cl-mapcan
+                              (lambda (c)
+                                (gdocs--element-runs c inherited-styles url
+                                                     table-cell visible-fallback))
+                              contents)
+                           ;; Bare link with no description.
+                           (list (gdocs-dm-make-run (or url path)
+                                                    inherited-styles url))))
+                   ;; Org attaches whitespace after a link to the link's
+                   ;; `:post-blank' property.  It belongs to the surrounding
+                   ;; style/link context, not to the link destination.
+                   (post-blank (org-element-property :post-blank el)))
+              (if (and (integerp post-blank) (> post-blank 0))
+                  (append runs
+                          (list (gdocs-dm-make-run
+                                 (make-string post-blank ?\s)
+                                 inherited-styles inherited-link)))
+                runs)))))
        ((eq type 'plain-text)
         (when (stringp props)
           (list (gdocs-dm-make-run
@@ -4993,7 +5146,8 @@ comparison; decoder-only inline-object metadata does not."
                          (numberp (plist-get object :height))))
                    ((memq (plist-get object :object-kind)
                           '(:chip-date :chip-person))
-                    (gdocs--valid-chip-label-p (plist-get object :label)))
+                    (gdocs--valid-chip-label-p
+                     (plist-get object :chip-value)))
                    (t nil)))
            (and text-present
                 (stringp (plist-get run :text))
@@ -6465,12 +6619,14 @@ metadata are ignored."
                      (plist-get a :width) (plist-get b :width))
                     (gdocs--inline-object-dimension-equal-p
                      (plist-get a :height) (plist-get b :height))))
-           ;; Chips carry a label instead of image metadata.
-           (let ((label-a (plist-get a :label))
-                 (label-b (plist-get b :label)))
-             (and (gdocs--valid-chip-label-p label-a)
-                  (gdocs--valid-chip-label-p label-b)
-                  (equal label-a label-b)))))))
+           ;; Chips carry a semantic value (calendar date or contact
+           ;; name) instead of image metadata; display formatting is
+           ;; deliberately not compared.
+           (let ((value-a (plist-get a :chip-value))
+                 (value-b (plist-get b :chip-value)))
+             (and (gdocs--valid-chip-label-p value-a)
+                  (gdocs--valid-chip-label-p value-b)
+                  (equal value-a value-b)))))))
 
 (defun gdocs--capability-object-matches-p (object remote-objects)
   "Return non-nil when OBJECT has exactly one matching remote object.
@@ -6538,7 +6694,7 @@ body is never rewritten."
     (org-mode)
     (let ((tree (org-element-parse-buffer))
           replacements)
-      (org-element-map tree '(keyword export-snippet)
+      (org-element-map tree '(keyword export-snippet link)
         (lambda (element)
           (let* ((type (car element))
                  (key (org-element-property :key element))
@@ -6552,21 +6708,25 @@ body is never rewritten."
                  (embedded (and (eq type 'export-snippet)
                                 (string= (downcase (format "%s" backend))
                                          "gdocs-inline-object")
-                                (not (gdocs--org-element-escaped-p element)))))
-            (let ((parsed (and (or standalone embedded)
-                               (gdocs--parse-inline-object-spec value))))
-              (when parsed
-                (let ((begin (org-element-property :begin element))
-                      (end (org-element-property :end element)))
-                  (when embedded
-                    (setq end (- end (or (org-element-property :post-blank element)
-                                         0))))
-                  (when (and standalone (> end begin)
-                             (= (char-before end) ?\n))
-                    (cl-decf end))
-                  (push (list begin end
-                              (gdocs--inline-marker-ot-char parsed))
-                        replacements)))))))
+                                (not (gdocs--org-element-escaped-p element))))
+                 (parsed (or (and (or standalone embedded)
+                                  (gdocs--parse-inline-object-spec value))
+                             (and (eq type 'link)
+                                  (gdocs--chip-object-from-link
+                                   element (and (consp (cdr element))
+                                                (cadr element)))))))
+            (when parsed
+              (let ((begin (org-element-property :begin element))
+                    (end (org-element-property :end element)))
+                (when (or embedded (eq type 'link))
+                  (setq end (- end (or (org-element-property :post-blank element)
+                                       0))))
+                (when (and standalone (> end begin)
+                           (= (char-before end) ?\n))
+                  (cl-decf end))
+                (push (list begin end
+                            (gdocs--inline-marker-ot-char parsed))
+                      replacements))))))
       (dolist (range (sort replacements
                            (lambda (a b) (> (car a) (car b)))))
         (delete-region (car range) (cadr range))

@@ -20,11 +20,13 @@ Remote images are represented by explicit remote-object placeholders: standalone
 images use `#+gdocs_inline_object:` and images embedded in prose use  
 `@@gdocs-inline-object:image ENTITY WIDTHxHEIGHT content-id=CONTENT@@`; the  
 image bytes are not downloaded.  
-Date and person smart chips are decoded the same way and rendered as readable  
-placeholders, for example `@@gdocs-inline-object:date ENTITY Sep 24, 2026@@`;  
-the Google-supplied display text is kept as part of the chip's identity, so an  
-edited chip marker is refused on push instead of silently rewritten.  Rendered  
-tables pad their cells so every row shares column widths, and emphasis markers  
+Date and person smart chips are decoded the same way and rendered as Org chip  
+links whose hidden target carries the remote identity, for example  
+`[[gdocs-chip:date ENTITY][2026-09-24 Thu]]`; the description shows the  
+payload (an Org-style date or the contact name) with the `org-date` face on  
+date chips. The semantic value behind the link is what push matching compares, so  
+a reformatted description that parses to the same calendar date still matches. Rendered  
+tables pad their cells so every row shares the same display widths, and emphasis markers  
 are placed so Org actually parses the result (boundary whitespace moves  
 outside the markers; emphasis that Org could not parse is dropped rather than  
 emitted as literal markup).  
@@ -160,16 +162,13 @@ deletion, movement, duplication, metadata changes, and ambiguous
 entity-to-placeholder associations remain refused.
 
 Date and person smart chips follow the same policy with `date`/`person` object  
-kinds and the Google-supplied label as the editable-identity field:
-
-```org
-Before @@gdocs-inline-object:date kix.example Sep 24, 2026@@ after
-Owner: @@gdocs-inline-object:person kix.example Jane Doe@@, team.
-```
-
-Chips are pull-only like images: an unchanged chip is preserved by incremental  
+kinds. They render as Org chip links such as  
+`[[gdocs-chip:date:kix.example][2026-09-24 Thu]]` and  
+`[[gdocs-chip:person:kix.example][Jane Doe]]`; Org hides the target and shows  
+only the description. The chip's semantic value (calendar date or contact name)  
+is the editable-identity field: an unchanged chip is preserved by incremental  
 edits that do not touch it, while creating, deleting, moving, or editing a chip  
-marker is refused before any `/save`.
+is refused before any `/save`.
 
 ## Requirements
 
