@@ -1126,6 +1126,168 @@ END is the inclusive final OT position."
                    "BeforeAfter"))
     (should-error (gdocs-dm-to-ot doc) :type 'user-error)))
 
+(defun gdocs-test--chip-def-op (type id label)
+  "Construct the date/person chip `ae' definition op for TYPE/ID/LABEL."
+  (list
+   `(,(cons 'ty "ae") ,(cons 'et type) ,(cons 'id id) ,(cons 'law t)
+     ,(cons 'epm
+            (if (equal type "date")
+                (list (cons 'dat_df
+                            (list (cons 'dfie_dt label)
+                                  (cons 'dfie_ts
+                                        (list (cons 'tv
+                                                    (list (cons 'tv_s
+                                                                1790251200.0)
+                                                          (cons 'tv_n 0))))))))
+              (list (cons 'per_n label)
+                    (cons 'per_e "person@example.com")))))))
+
+(defun gdocs-test--chip-attach-op (id spi)
+  "Construct a chip `te' attachment op for ID at one-based SPI."
+  `(,(cons 'ty "te") ,(cons 'id id) ,(cons 'spi spi)))
+
+(ert-deftest gdocs-test-date-and-person-chips-decode-and-render ()
+  "Date/person chip attachments become readable, explicit Org markers."
+  (let* ((body (concat "On " (string gdocs--ot-chip-codepoint) " with "
+                       (string gdocs--ot-chip-codepoint) "\n"))
+         (ops (append (list (gdocs-test--insert-op body))
+                      (gdocs-test--chip-def-op
+                       "date" "kix.chip-date" "Sep 24, 2026")
+                      (list (gdocs-test--chip-attach-op "kix.chip-date" 4))
+                      (gdocs-test--chip-def-op
+                       "person" "kix.chip-person" "Valentin Leon")
+                      (list (gdocs-test--chip-attach-op "kix.chip-person" 11))))
+         (doc (gdocs-dm-from-ops nil nil nil body ops))
+         (org (gdocs-dm-to-org doc))
+         (objects (gdocs-dm-inline-objects doc)))
+    (should (= (length objects) 2))
+    (should (eq (plist-get (car objects) :kind) :inline-object))
+    (should (eq (plist-get (car objects) :object-kind) :chip-date))
+    (should (equal (plist-get (car objects) :entity-id) "kix.chip-date"))
+    (should (equal (plist-get (car objects) :label) "Sep 24, 2026"))
+    (should (eq (plist-get (nth 1 objects) :object-kind) :chip-person))
+    (should (equal (plist-get (nth 1 objects) :label) "Valentin Leon"))
+    (should-not (string-match-p (string gdocs--ot-chip-codepoint) org))
+    (should (string-match-p
+             "@@gdocs-inline-object:date kix.chip-date Sep 24, 2026@@" org))
+    (should (string-match-p
+             "@@gdocs-inline-object:person kix.chip-person Valentin Leon@@" org))
+    (should (equal org (gdocs-dm-to-org (gdocs-dm-from-org org))))))
+
+(ert-deftest gdocs-test-chips-in-table-cells-render-and-round-trip ()
+  "A date chip inside a table cell renders readably without false reports."
+  (let* ((body (gdocs-test--table-body
+                (list (list "Date" "Milestone")
+                      (list (string gdocs--ot-chip-codepoint)
+                            "Limited pilot"))))
+         (ops (append (list (gdocs-test--insert-op body))
+                      (gdocs-test--chip-def-op
+                       "date" "kix.chip-cell" "Sep 24, 2026")
+                      (list (gdocs-test--chip-attach-op "kix.chip-cell" 22))))
+         (doc (gdocs-dm-from-ops nil nil nil body ops))
+         (org (gdocs-dm-to-org doc))
+         (reports (gdocs-dm-unsupported doc)))
+    (should (eq (plist-get (car (gdocs-dm-paragraphs doc)) :kind) :table))
+    (should-not (string-match-p (string gdocs--ot-chip-codepoint) org))
+    (should (string-match-p
+             "@@gdocs-inline-object:date kix.chip-cell Sep 24, 2026@@" org))
+    (should-not (seq-some
+                 (lambda (report)
+                   (string-match-p
+                    "no matching definition"
+                    (or (plist-get report :explanation) "")))
+                 reports))
+    (should (string-match-p
+             "\\`1 remote chip"
+             (gdocs--capability-summary reports)))
+    (should (= (length (gdocs-dm-inline-objects (gdocs-dm-from-org org)))
+               1))))
+
+(ert-deftest gdocs-test-chip-preflight-allows-untouched-incremental-edit ()
+  "An incremental edit away from an unchanged chip is provable."
+  (let* ((body (concat "Date: " (string gdocs--ot-chip-codepoint) " here\n"))
+         (ops (append (list (gdocs-test--insert-op body))
+                      (gdocs-test--chip-def-op
+                       "date" "kix.chip-one" "Sep 24, 2026")
+                      (list (gdocs-test--chip-attach-op "kix.chip-one" 7))))
+         (state (list :revision 5 :ot-body body :ot-ops ops))
+         (rendered
+          (gdocs-dm-to-org (gdocs-dm-from-ops 5 "synthetic" nil body ops))))
+    (should (string-match-p
+             "@@gdocs-inline-object:date kix.chip-one Sep 24, 2026@@"
+             rendered))
+    (should (gdocs--push-preflight state rendered '(:kind :noop)))
+    (should (gdocs--push-preflight
+             state rendered
+             '(:kind :incremental
+                     :ranges ((:ot-start 30 :ot-end 34 :insert-at 30
+                                         :delete-count 5)))))
+    (should-error
+     (gdocs--push-preflight
+      state rendered
+      '(:kind :incremental
+              :ranges ((:ot-start 6 :ot-end 45 :insert-at 6 :delete-count 40))))
+     :type 'user-error)))
+
+(ert-deftest gdocs-test-changed-chip-label-is-refused ()
+  "A locally edited chip marker cannot be silently rewritten remotely."
+  (let* ((body (concat "Date: " (string gdocs--ot-chip-codepoint) " here\n"))
+         (ops (append (list (gdocs-test--insert-op body))
+                      (gdocs-test--chip-def-op
+                       "date" "kix.chip-one" "Sep 24, 2026")
+                      (list (gdocs-test--chip-attach-op "kix.chip-one" 7))))
+         (state (list :revision 5 :ot-body body :ot-ops ops))
+         (rendered
+          (gdocs-dm-to-org (gdocs-dm-from-ops 5 "synthetic" nil body ops)))
+         (edited
+          (replace-regexp-in-string "Sep 24, 2026" "Sep 25, 2026" rendered)))
+    (should-error (gdocs--push-preflight state edited '(:kind :noop))
+                  :type 'user-error)))
+
+(ert-deftest gdocs-test-render-emphasis-moves-boundary-whitespace-outside ()
+  "Whitespace at a styled-span boundary lands outside the Org markers."
+  (let* ((rendered (gdocs--render-runs
+                    '((:text "Pilot target: " :styles (:bold))
+                      (:text "Secateur"))))
+         (contents
+          (with-temp-buffer
+            (let ((org-inhibit-startup t)) (insert rendered "\n"))
+            (org-mode)
+            (let ((bold (car (org-element-map (org-element-parse-buffer)
+                                 'bold #'identity))))
+              (and bold
+                   (buffer-substring-no-properties
+                    (org-element-property :contents-begin bold)
+                    (org-element-property :contents-end bold)))))))
+    (should (equal rendered "*Pilot target:* Secateur"))
+    (should (equal contents "Pilot target:"))))
+
+(ert-deftest gdocs-test-render-emphasis-drops-unparseable-markers ()
+  "Mid-word or whitespace-only styled groups keep text but emit no markers."
+  (should (equal (gdocs--render-runs
+                  '((:text "abc") (:text "def" :styles (:bold))
+                    (:text "ghi")))
+                 "abcdefghi"))
+  (should (equal (gdocs--render-runs
+                  '((:text "x ") (:text " " :styles (:bold)) (:text "y")))
+                 "x  y"))
+  (should (equal (gdocs--render-runs
+                  '((:text "Start ") (:text " bold" :styles (:bold))))
+                 "Start  *bold*")))
+
+(ert-deftest gdocs-test-render-table-aligns-columns ()
+  "Rendered tables pad cells so every row shares column widths."
+  (should (equal (gdocs-dm-to-org (gdocs-dm-from-org
+                                   "| A | Long cell |\n| B | C |\n"))
+                 "| A | Long cell |\n| B | C         |\n")))
+
+(ert-deftest gdocs-test-unsupported-directive-groups-identical-reasons ()
+  "Repeated identical explanations collapse into one counted entry."
+  (should (equal (gdocs--render-unsupported-directive
+                  (list "Same reason." "Same reason." "Same reason."
+                        "Other reason."))
+                 "#+gdocs_unsupported: Same reason. (x3); Other reason.")))
+
 (ert-deftest gdocs-test-inline-object-equality-uses-stable-identity ()
   "Inline-object equality ignores OT metadata but preserves object shape."
   (let* ((object '(:kind :inline-object
@@ -1664,8 +1826,8 @@ END is the inclusive final OT position."
          (first (mapcar #'gdocs-test--cell-view (car rows)))
          (mixed (gdocs-test--cell-view (car (cadr rows)))))
     (should (equal (mapcar (lambda (cell)
-                            (mapconcat #'car cell ""))
-                          first)
+                             (mapconcat #'car cell ""))
+                           first)
                    '("<2026-07-23 Thu>"
                      "[fn:note]"
                      "$x^2$"
@@ -1718,7 +1880,7 @@ END is the inclusive final OT position."
                                                (gdocs-dm-make-run text)))))))))
          (round-tripped (gdocs-dm-from-org (gdocs-dm-to-org doc)))
          (cell (caar (plist-get (car (gdocs-dm-paragraphs round-tripped))
-                                  :rows)))
+                                :rows)))
          (runs (gdocs-test--cell-view cell)))
     (should (equal runs (list (list text nil nil))))))
 
@@ -1752,7 +1914,7 @@ END is the inclusive final OT position."
          (org (gdocs-dm-to-org doc))
          (round-tripped (gdocs-dm-from-org org))
          (cell (caar (plist-get (car (gdocs-dm-paragraphs round-tripped))
-                                  :rows))))
+                                :rows))))
     (should (equal (gdocs--render-runs
                     (list (gdocs-dm-make-run text)))
                    text))
@@ -1850,7 +2012,7 @@ END is the inclusive final OT position."
          (org (gdocs-dm-to-org doc))
          (round-trip (gdocs-dm-from-org org))
          (cell (caar (plist-get (car (gdocs-dm-paragraphs round-trip))
-                                  :rows))))
+                                :rows))))
     (should (equal (gdocs-test--cell-view cell)
                    `(("bold" (:bold) nil)
                      (,(concat "\nplain " sentinel " | ") nil nil)
@@ -2030,7 +2192,7 @@ END is the inclusive final OT position."
     (should (equal ot-body "Linked title\nAn italic subtitle with code\n"))
     (should (string-prefix-p
              "#+title: [[https://title.example][*Linked title*]]"
-              rendered))))
+             rendered))))
 
 (ert-deftest gdocs-test-title-and-subtitle-preserve-unsupported-inline-leaves ()
   "Visible unsupported inline constructs remain in body keywords."
@@ -2445,7 +2607,7 @@ END is the inclusive final OT position."
        "coverage\n"
        (list (cons anchor (cons 1 8)))
        (list (list 1 :text "synthetic" :anchor anchor)))
-       "[[https://example.com][*coverage*]][fn:gdocs-comment-1]\n"))))
+      "[[https://example.com][*coverage*]][fn:gdocs-comment-1]\n"))))
 
 (ert-deftest gdocs-test-comment-visible-link-description-decodes-renderer-escapes ()
   "Comment matching sees the OT characters represented by renderer escapes."
@@ -3113,8 +3275,8 @@ END is the inclusive final OT position."
                    (list (list (list (or first-run
                                          (gdocs-dm-make-run "one"))))
                          (list (list (gdocs-dm-make-run
-                                     "two" '(:bold)
-                                     "https://example.test"))))
+                                      "two" '(:bold)
+                                      "https://example.test"))))
                    (list (list (list (gdocs-dm-make-run "three")))
                          (list (list (list :inline-object
                                            (or object-value object)))))))))
@@ -4198,7 +4360,7 @@ that a removed preflight guard would be observed as an unexpected success."
           state "- Bound\nChanged\n"
           '(:kind :incremental
                   :ranges ((:ot-start 7 :ot-end 12
-                                        :insert-at 7 :delete-count 6)))))))))
+                                      :insert-at 7 :delete-count 6)))))))))
 
 (ert-deftest gdocs-test-capability-bound-list-requires-referenced-level ()
   "Every level named by a list binding must exist in its definition."
@@ -4288,7 +4450,7 @@ that a removed preflight guard would be observed as an unexpected success."
           state "- Bound\nChanged\n"
           '(:kind :incremental
                   :ranges ((:ot-start 7 :ot-end 12
-                                        :insert-at 7 :delete-count 6)))))))))
+                                      :insert-at 7 :delete-count 6)))))))))
 
 (ert-deftest gdocs-test-omitted-list-nest-checks-definition-cardinality ()
   "Missing and ambiguous definitions are reported for an omitted level zero."
@@ -4732,7 +4894,7 @@ that a removed preflight guard would be observed as an unexpected success."
        ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Drive title\n:GDOC_REVISION: 2\n:END:\n\nRemote\n"))
     (should (eq (gdocs--sync-state) 'clean))
     (should (equal gdocs--last-synced-hash
-                    (gdocs--top-property-value "GDOC_CONTENT_HASH")))))
+                   (gdocs--top-property-value "GDOC_CONTENT_HASH")))))
 
 (defun gdocs-test--run-guarded-pull (before-completion)
   "Run a synthetic pull, invoking BEFORE-COMPLETION while it is pending."
@@ -4794,17 +4956,17 @@ that a removed preflight guard would be observed as an unexpected success."
                 (insert "Delayed edit\n")
                 (setq point-after-edit (point)
                       content-after-edit (buffer-string))))))
-      (should (= (length results) 1))
-      (should (string-match-p "pull conflict.*local body changed"
-                              (or (cadar results) "")))
-      (should (equal (buffer-string) content-after-edit))
-      (should (= (point) point-after-edit))
-      (should (equal (gdocs--top-property-value "GDOC_REVISION") "1"))
-      (should (equal gdocs--last-synced-hash baseline))
-      (should (equal (gdocs--top-property-value "GDOC_CONTENT_HASH")
-                     persisted-baseline))
-      (should (eq (gdocs--sync-state) 'dirty))
-      (should (equal gdocs--auto-sync-conflict-revision 2))))))
+        (should (= (length results) 1))
+        (should (string-match-p "pull conflict.*local body changed"
+                                (or (cadar results) "")))
+        (should (equal (buffer-string) content-after-edit))
+        (should (= (point) point-after-edit))
+        (should (equal (gdocs--top-property-value "GDOC_REVISION") "1"))
+        (should (equal gdocs--last-synced-hash baseline))
+        (should (equal (gdocs--top-property-value "GDOC_CONTENT_HASH")
+                       persisted-baseline))
+        (should (eq (gdocs--sync-state) 'dirty))
+        (should (equal gdocs--auto-sync-conflict-revision 2))))))
 
 (ert-deftest gdocs-test-guarded-pull-aborts-after-local-revision-change ()
   "A revision metadata change during fetch prevents every pull mutation."
@@ -4817,12 +4979,12 @@ that a removed preflight guard would be observed as an unexpected success."
               (lambda ()
                 (gdocs--put-top-property "GDOC_REVISION" "9")
                 (setq content-after-change (buffer-string))))))
-      (should (= (length results) 1))
-      (should (string-match-p "pull conflict.*local revision changed"
-                              (or (cadar results) "")))
-      (should (equal (buffer-string) content-after-change))
-      (should (equal (gdocs--top-property-value "GDOC_REVISION") "9"))
-      (should-not gdocs--last-synced-hash)))))
+        (should (= (length results) 1))
+        (should (string-match-p "pull conflict.*local revision changed"
+                                (or (cadar results) "")))
+        (should (equal (buffer-string) content-after-change))
+        (should (equal (gdocs--top-property-value "GDOC_REVISION") "9"))
+        (should-not gdocs--last-synced-hash)))))
 
 (ert-deftest gdocs-test-guarded-pull-allows-unrelated-metadata-change ()
   "Metadata other than revision is not part of the guarded local body."
@@ -6258,7 +6420,7 @@ that a removed preflight guard would be observed as an unexpected success."
                    (lambda (_doc callback)
                      (funcall callback
                               '(:revision 7 :token "token" :ouid "ouid"
-                                :ot-body "same\n" :ot-ops nil)
+                                          :ot-body "same\n" :ot-ops nil)
                               "synthetic-html" nil)))
                   ((symbol-function 'gdocs--ot-remote-org-body)
                    (lambda (&rest _args) "same\n"))
@@ -6267,8 +6429,8 @@ that a removed preflight guard would be observed as an unexpected success."
                   ((symbol-function 'gdocs--apply-push-async)
                    (lambda (&rest _args) (cl-incf apply-count))))
           (gdocs--push-remotely-async-1
-            "synthetic-id" (current-buffer) "6" local-body
-            gdocs--sync-mutex))
+           "synthetic-id" (current-buffer) "6" local-body
+           gdocs--sync-mutex))
         (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "7"))
         (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
                        expected-hash))
@@ -6299,7 +6461,7 @@ that a removed preflight guard would be observed as an unexpected success."
         (insert "later\n")
         (funcall fetch-callback
                  '(:revision 7 :token "token" :ouid "ouid"
-                   :ot-body "same\n" :ot-ops nil)
+                             :ot-body "same\n" :ot-ops nil)
                  "synthetic-html" nil))
       (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "7"))
       (should (eq (gdocs--sync-state) 'dirty)))
@@ -6525,12 +6687,12 @@ that a removed preflight guard would be observed as an unexpected success."
 (ert-deftest gdocs-test-precise-inline-object-allows-unrelated-image-push ()
   "A precise dimension survives rendering so unrelated push preflight passes."
   (let* ((object '(:kind :inline-object
-                          :entity-id "kix.precise"
-                          :object-kind :image
-                          :content-id "precise-content"
-                          :width 1.2345678901234567
-                          :height 1.0e-20
-                          :ot-position 2))
+                         :entity-id "kix.precise"
+                         :object-kind :image
+                         :content-id "precise-content"
+                         :width 1.2345678901234567
+                         :height 1.0e-20
+                         :ot-position 2))
          (state (list :ot-body "Before\n*\n"
                       :inline-objects (list object)))
          (local (concat "Changed\n" (gdocs--render-inline-object object) "\n"))

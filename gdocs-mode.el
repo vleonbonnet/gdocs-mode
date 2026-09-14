@@ -353,7 +353,7 @@ discard."
   (and char
        (or (eq char ?\s)
            (eq char ?\t)
-            (eq (get-char-code-property char 'general-category) 'Zs))))
+           (eq (get-char-code-property char 'general-category) 'Zs))))
 
 (defconst gdocs--org-link-description-sentinel (string #x200b)
   "Invisible separator used to keep Org subscript/LaTeX syntax literal.")
@@ -383,30 +383,30 @@ a link's `:end'; subtract its `:post-blank' to find the closing delimiter."
             link-end)
         (while (and element (not link-end))
           (when (eq (org-element-type element) 'link)
-             (let* ((begin (org-element-property :begin element))
-                    (end (org-element-property :end element))
-                    (post-blank (org-element-property :post-blank element))
-                    (closing-end
-                     (and (integerp end)
-                          (- end (if (and (integerp post-blank)
-                                          (> post-blank 0))
-                                     post-blank
-                                   0))))
+            (let* ((begin (org-element-property :begin element))
+                   (end (org-element-property :end element))
+                   (post-blank (org-element-property :post-blank element))
+                   (closing-end
+                    (and (integerp end)
+                         (- end (if (and (integerp post-blank)
+                                         (> post-blank 0))
+                                    post-blank
+                                  0))))
                    (contents-begin (org-element-property
                                     :contents-begin element))
                    (contents-end (org-element-property :contents-end element)))
-               (when (and (integerp begin)
-                          (integerp closing-end)
-                          (<= begin position)
-                          (< position closing-end)
-                          (if (and (integerp contents-begin)
-                                   (integerp contents-end))
-                              (and (<= contents-begin position)
+              (when (and (integerp begin)
+                         (integerp closing-end)
+                         (<= begin position)
+                         (< position closing-end)
+                         (if (and (integerp contents-begin)
+                                  (integerp contents-end))
+                             (and (<= contents-begin position)
                                   (<= position contents-end))
-                            ;; A bare link has no description; its target is
-                            ;; the visible text and must be kept whole.
-                            t))
-                 (setq link-end closing-end))))
+                           ;; A bare link has no description; its target is
+                           ;; the visible text and must be kept whole.
+                           t))
+                (setq link-end closing-end))))
           (setq element (org-element-property :parent element)))
         link-end)
     (error nil)))
@@ -436,36 +436,36 @@ prefixes, drawers, and title keyword prefixes are not."
              (- (org-element-property :end element)
                 (or (org-element-property :post-blank element) 0)))
            (hide-inline-delimiters (element)
-              (let ((begin (org-element-property :begin element))
-                    (end (closing-end element)))
-                (hide begin (1+ begin))
-                (hide (1- end) end)))
-            (hide-renderer-link-description-escapes (element)
-              (let ((from (org-element-property :contents-begin element))
-                    (end (org-element-property :contents-end element))
-                    (sentinel (string-to-char
-                               gdocs--org-link-description-sentinel)))
-                (when (and (integerp from) (integerp end))
-                  (setq from (1- from)
-                        end (1- end))
-                  (while (< from end)
-                    (cond
-                     ((and (< (+ from 2) end)
-                           (= (aref org-body from) sentinel)
-                           (memq (aref org-body (1+ from)) '(?_ ?\\ ?\[ ?\]))
-                           (= (aref org-body (+ from 2)) sentinel))
-                      (aset visible from nil)
-                      (aset visible (+ from 2) nil)
-                      (cl-incf from 3))
-                     ((and (< (1+ from) end)
-                           (= (aref org-body from) ?\\)
-                           (memq (aref org-body (1+ from))
-                                 '(?* ?/ ?+ ?= ?~)))
-                      (aset visible from nil)
-                      (cl-incf from 2))
-                     (t
-                      (cl-incf from)))))))
-            (hide-line-around-value (element value)
+             (let ((begin (org-element-property :begin element))
+                   (end (closing-end element)))
+               (hide begin (1+ begin))
+               (hide (1- end) end)))
+           (hide-renderer-link-description-escapes (element)
+             (let ((from (org-element-property :contents-begin element))
+                   (end (org-element-property :contents-end element))
+                   (sentinel (string-to-char
+                              gdocs--org-link-description-sentinel)))
+               (when (and (integerp from) (integerp end))
+                 (setq from (1- from)
+                       end (1- end))
+                 (while (< from end)
+                   (cond
+                    ((and (< (+ from 2) end)
+                          (= (aref org-body from) sentinel)
+                          (memq (aref org-body (1+ from)) '(?_ ?\\ ?\[ ?\]))
+                          (= (aref org-body (+ from 2)) sentinel))
+                     (aset visible from nil)
+                     (aset visible (+ from 2) nil)
+                     (cl-incf from 3))
+                    ((and (< (1+ from) end)
+                          (= (aref org-body from) ?\\)
+                          (memq (aref org-body (1+ from))
+                                '(?* ?/ ?+ ?= ?~)))
+                     (aset visible from nil)
+                     (cl-incf from 2))
+                    (t
+                     (cl-incf from)))))))
+           (hide-line-around-value (element value)
              (let* ((begin (org-element-property :begin element))
                     (line-end (save-excursion
                                 (goto-char begin)
@@ -509,13 +509,13 @@ prefixes, drawers, and title keyword prefixes are not."
                ((and (integerp contents-begin) (integerp contents-end))
                 (hide begin contents-begin)
                 (hide contents-end end))
-                ((and (<= (+ begin 4) end)
-                      (string= (buffer-substring-no-properties begin (1+ begin))
-                               "[[")
+               ((and (<= (+ begin 4) end)
+                     (string= (buffer-substring-no-properties begin (1+ begin))
+                              "[[")
                      (string= (buffer-substring-no-properties (- end 2) end)
                               "]]"))
-                 (hide begin (+ begin 2))
-                 (hide (- end 2) end)))
+                (hide begin (+ begin 2))
+                (hide (- end 2) end)))
               (hide-renderer-link-description-escapes element))))
         (let ((text (make-string size 0))
               (map (make-vector size 0))
@@ -967,7 +967,9 @@ caller's `gdocs-auth-function' is used."
      ("te" . :entity-attachment))
     (:entity
      ("list" . :recognized)
-     ("inline" . :recognized-not-editable))
+     ("inline" . :recognized-not-editable)
+     ("date" . :recognized-not-editable)
+     ("person" . :recognized-not-editable))
     (:attribute
      ("text" . :recognized)
      ("link" . :recognized)
@@ -1102,6 +1104,7 @@ no Org inline marker."
   "Return a concise, user-facing label for capability KIND."
   (or (cdr (assq kind
                  '((:inline-image . "inline image")
+                   (:remote-chip . "remote chip")
                    (:unknown-entity . "unknown entity")
                    (:unknown-feature . "unknown feature")
                    (:unsupported-style . "unsupported style")
@@ -1116,6 +1119,7 @@ no Org inline marker."
   "Return the plural label for capability KIND."
   (pcase kind
     (:inline-image "inline images")
+    (:remote-chip "remote chips")
     (:unknown-entity "unknown entities")
     (:unknown-feature "unknown features")
     (:unsupported-style "unsupported styles")
@@ -1604,14 +1608,50 @@ that association is made by its separate `te' operation."
             :width (and (numberp width) width)
             :height (and (numberp height) height)))))
 
+(defconst gdocs--ot-chip-codepoint #xe909
+  "OT codepoint Google uses as the placeholder for a smart chip.
+
+Date and person chips occupy exactly one OT position, just like the
+image `*' placeholder, and carry no visible text of their own.")
+
+(defun gdocs--valid-chip-label-p (label)
+  "Return non-nil when LABEL can be embedded in a chip placeholder."
+  (and (stringp label)
+       (not (string-empty-p label))
+       (not (string-match-p "[[:cntrl:]]" label))))
+
+(defun gdocs--chip-entity-object (op)
+  "Decode a date/person chip `ae' entity definition OP into an object plist.
+
+The Google-supplied display text becomes the chip's stable label: it is
+both what Org shows and part of the object identity.  The timestamp
+payload, e-mail address, and other `epm' metadata are deliberately not
+retained; a changed label is reported as a changed object rather than
+silently rewritten."
+  (let* ((type (alist-get 'et op))
+         (epm (alist-get 'epm op))
+         (label (if (equal type "date")
+                    (alist-get 'dfie_dt (alist-get 'dat_df epm))
+                  (alist-get 'per_n epm))))
+    (when (and (gdocs--valid-chip-label-p label)
+               (stringp (alist-get 'id op)))
+      (list :kind :inline-object
+            :object-kind (if (equal type "date") :chip-date :chip-person)
+            :entity-id (alist-get 'id op)
+            :label label))))
+
+(defun gdocs--inline-object-is-image-p (object)
+  "Return non-nil when inline OBJECT is an image placeholder."
+  (eq (plist-get object :object-kind) :image))
+
 (defconst gdocs--inline-object-identity-keys
-  '(:entity-id :kind :object-kind :content-id :width :height)
+  '(:entity-id :kind :object-kind :content-id :width :height :label)
   "Stable fields that identify an inline object for comparison.
 
 OT positions, decoder-only vectors, and source metadata are deliberately not
 part of this identity.  Width and height remain part of the identity because
 changing either changes the rendered object and cannot be preserved by a text
-only incremental edit.")
+only incremental edit.  A chip's label participates for the same reason.")
 
 (defun gdocs--inline-object-canonical-value (key value)
   "Normalize VALUE for stable inline-object identity KEY.
@@ -1647,11 +1687,12 @@ otherwise untouched object."
                            key (plist-get object key))))))
 
 (defun gdocs--decode-inline-objects (ops body)
-  "Decode inline image entities in OPS against OT BODY.
+  "Decode inline image and smart-chip entities in OPS against OT BODY.
 
-An `ae et=\"inline\"' operation defines an entity.  Its `te' operation
-contains the authoritative one-based `spi' position and matching entity
-ID; `body[spi - 1]' must be the literal `*' placeholder.  Entity or
+An `ae' operation whose entity type is \"inline\" (image), \"date\", or
+\"person\" defines an entity.  Its `te' operation contains the
+authoritative one-based `spi' position and matching entity ID;
+`body[spi - 1]' must be the entity's placeholder codepoint.  Entity or
 operation order is deliberately ignored.  The result is a plist with
 `:objects', a position-indexed `:object-vector', and structured
 `:unsupported' capability reports."
@@ -1663,29 +1704,33 @@ operation order is deliberately ignored.  The result is a plist with
       (when (listp op)
         (cond
          ((and (equal (alist-get 'ty op) "ae")
-               (equal (alist-get 'et op) "inline"))
+               (member (alist-get 'et op) '("inline" "date" "person")))
           (let* ((id (alist-get 'id op))
-                 (object (gdocs--inline-image-object-from-ae op)))
+                 (kind (if (equal (alist-get 'et op) "inline")
+                           :inline-image :remote-chip))
+                 (object (if (equal (alist-get 'et op) "inline")
+                             (gdocs--inline-image-object-from-ae op)
+                           (gdocs--chip-entity-object op))))
             (cond
              ((not (stringp id))
               (push (gdocs--capability-report
-                     :inline-image
-                     "An inline image entity has no usable identifier."
+                     kind
+                     "A remote entity definition has no usable identifier."
                      :refuse-push t :render-directive t)
                     reports))
              ((gethash id definitions)
               (push (gdocs--capability-report
-                     :inline-image
-                     "An inline image entity is defined more than once."
+                     kind
+                     "A remote entity definition is supplied more than once."
                      :entity-id id
                      :refuse-push t :render-directive t)
                     reports))
-             (object (puthash id object definitions))
+             (object (puthash id (cons (alist-get 'et op) object) definitions))
              (t
-              (puthash id :unsupported definitions)
+              (puthash id (cons (alist-get 'et op) :unsupported) definitions)
               (push (gdocs--capability-report
-                     :inline-image
-                     "An inline image has metadata the decoder cannot preserve."
+                     kind
+                     "A remote entity has metadata the decoder cannot preserve."
                      :entity-id id
                      :refuse-push t :render-directive t)
                     reports)))))
@@ -1700,49 +1745,52 @@ operation order is deliberately ignored.  The result is a plist with
         (let* ((id (nth 0 attachment))
                (spi (nth 1 attachment))
                (definition (and (stringp id) (gethash id definitions)))
-               (object (and (listp definition) definition)))
+               (type (car-safe definition))
+               (object (and (consp definition) (cdr definition)))
+               (kind (if (equal type "inline") :inline-image :remote-chip))
+               (placeholder (if (equal type "inline")
+                                ?* gdocs--ot-chip-codepoint)))
           (cond
            ((not (stringp id))
             (push (gdocs--capability-report
                    :inline-image
-                   "An inline image attachment has no usable identifier."
+                   "A remote entity attachment has no usable identifier."
                    :refuse-push t :render-directive t)
                   reports))
            ((null definition)
             (push (gdocs--capability-report
                    :unknown-entity
-                   "An inline entity attachment has no matching definition."
-                   :entity-type "inline"
+                   "A remote entity attachment has no matching definition."
                    :entity-id id
                    :refuse-push t :render-directive t)
                   reports))
-           ((eq definition :unsupported)
+           ((eq object :unsupported)
             ;; The malformed definition already contributed the detailed
             ;; reason above; retain this attachment as unsupported too.
             (push (gdocs--capability-report
-                   :inline-image
-                   "An inline image attachment cannot be decoded."
+                   kind
+                   "A remote entity attachment cannot be decoded."
                    :entity-id id
                    :refuse-push t :render-directive t)
                   reports))
            ((not (integerp spi))
             (push (gdocs--capability-report
-                   :inline-image
-                   "An inline image attachment has no usable OT position."
+                   kind
+                   "A remote entity attachment has no usable OT position."
                    :entity-id id
                    :refuse-push t :render-directive t)
                   reports))
            ((or (< spi 1) (> spi body-len))
             (push (gdocs--capability-report
-                   :inline-image
-                   "An inline image attachment has an out-of-range OT position."
+                   kind
+                   "A remote entity attachment has an out-of-range OT position."
                    :entity-id id
                    :refuse-push t :render-directive t)
                   reports))
-           ((/= (aref body (1- spi)) ?*)
+           ((/= (aref body (1- spi)) placeholder)
             (push (gdocs--capability-report
-                   :inline-image
-                   "An inline image attachment is not attached to its placeholder."
+                   kind
+                   "A remote entity attachment is not attached to its placeholder."
                    :entity-id id
                    :ot-start spi :ot-end spi
                    :preserve-untouched t :refuse-push nil
@@ -1750,15 +1798,15 @@ operation order is deliberately ignored.  The result is a plist with
                   reports))
            ((gethash id seen-ids)
             (push (gdocs--capability-report
-                   :inline-image
-                   "An inline image entity is attached more than once."
+                   kind
+                   "A remote entity is attached more than once."
                    :entity-id id
                    :refuse-push t :render-directive t)
                   reports))
            ((gethash spi seen-positions)
             (push (gdocs--capability-report
-                   :inline-image
-                   "An inline image placeholder has multiple attached entities."
+                   kind
+                   "A remote entity placeholder has multiple attached entities."
                    :ot-start spi :ot-end spi
                    :preserve-untouched t :refuse-push nil
                    :push-policy :allow-if-untouched :render-directive t)
@@ -1769,8 +1817,11 @@ operation order is deliberately ignored.  The result is a plist with
             (puthash spi t seen-positions)
             (aset object-vector (1- spi) object)
             (push (gdocs--capability-report
-                   :inline-image
-                   "Inline images are pull-only; the current OT encoder can preserve one only when it is left untouched."
+                   kind
+                   (if (equal type "inline")
+                       "Inline images are pull-only; the current OT encoder can preserve one only when it is left untouched."
+                     (format "Remote %s chips are pull-only; the current OT encoder can preserve one only when it is left untouched."
+                             (if (equal type "date") "date" "person")))
                    :entity-id id
                    :ot-start spi :ot-end spi
                    :preserve-untouched t :refuse-push nil
@@ -1783,10 +1834,11 @@ operation order is deliberately ignored.  The result is a plist with
       (maphash
        (lambda (id definition)
          (unless (gethash id seen-ids)
-           (unless (eq definition :unsupported)
+           (unless (eq (cdr definition) :unsupported)
              (push (gdocs--capability-report
-                    :inline-image
-                    "An inline image has no unambiguous OT attachment."
+                    (if (equal (car definition) "inline")
+                        :inline-image :remote-chip)
+                    "A remote entity has no unambiguous OT attachment."
                     :entity-id id
                     :refuse-push t :render-directive t)
                    reports))))
@@ -2049,7 +2101,7 @@ not required to establish the semantic value."
                 (pcase key
                   ('b_gt (memq value '(9 13)))
                   ('b_gs (equal value (if numbered ""
-                                       (aref bullet-glyphs level))))
+                                        (aref bullet-glyphs level))))
                   ('b_gf (equal value (format "%%%d%s" level
                                               (if numbered "." ""))))
                   ('b_ifl (gdocs--capability-number-equal-p
@@ -2087,8 +2139,8 @@ not required to establish the semantic value."
                              (list :ranges nil :references nil :complete t))))
               (setq info
                     (plist-put info :references
-                                (cons (cons (gdocs--effective-list-nesting-level sm)
-                                            range)
+                               (cons (cons (gdocs--effective-list-nesting-level sm)
+                                           range)
                                      (plist-get info :references))))
               (if range
                   (setq info (plist-put
@@ -2451,6 +2503,9 @@ report. Inline image reports are produced by
                   nil))
                ;; Inline definitions are validated by the image decoder.
                ((equal entity-type "inline") nil)
+               ;; Date/person chip definitions are validated by the same
+               ;; decoder; its pull-only report covers them.
+               ((member entity-type '("date" "person")) nil)
                ((eq entity-class :recognized-not-editable)
                 (push (gdocs--capability-report
                        :unsupported-entity
@@ -2502,7 +2557,7 @@ report. Inline image reports are produced by
                 (dolist (report (gdocs--scan-list-text-style op sm body))
                   (push report reports))
                 (let ((id (and (listp sm) (alist-get 'ls_id sm)))
-                       (nest (gdocs--effective-list-nesting-level sm))
+                      (nest (gdocs--effective-list-nesting-level sm))
                       (range (gdocs--list-binding-paragraph-range op body)))
                   (unless (stringp id)
                     (push (gdocs--capability-list-report
@@ -2510,9 +2565,9 @@ report. Inline image reports are produced by
                            "A remote list binding has no usable definition identifier."
                            "ls_id" range)
                           reports))
-                   (unless (and (integerp nest)
-                                (<= 0 nest) (<= nest 8))
-                     (push (gdocs--capability-list-report
+                  (unless (and (integerp nest)
+                               (<= 0 nest) (<= nest 8))
+                    (push (gdocs--capability-list-report
                            :unsupported-paragraph
                            "A remote list nesting level is outside the supported range."
                            "ls_nest"
@@ -2797,7 +2852,7 @@ text without inline markup."
          (out (list :kind kind :runs runs)))
     (when inline-object
       (dolist (key '(:entity-id :object-kind :content-id :width :height
-                                :ot-position))
+                                :label :ot-position))
         (when (plist-member inline-object key)
           (setq out (plist-put out key (plist-get inline-object key))))))
     (when (and (eq kind :heading) heading)
@@ -3018,6 +3073,61 @@ Non-atomic styles (bold/italic/underline/strike) wrap atomic
 verbatim/code so that `*=foo=*' parses as bold-around-verbatim rather
 than the reverse (which org would treat as opaque).")
 
+(defun gdocs--split-inline-space (text)
+  "Split TEXT into (LEADING CORE TRAILING) whitespace components.
+CORE is TEXT without its leading/trailing whitespace; either component
+may be the empty string but CORE and TEXT only differ by whitespace."
+  (let ((leading "") (core (or text "")) (trailing ""))
+    (when (string-match "\\`[ \t\n\r]+" core)
+      (setq leading (match-string 0 core)
+            core (substring core (match-end 0))))
+    (when (string-match "[ \t\n\r]+\\'" core)
+      (setq trailing (match-string 0 core)
+            core (substring core 0 (match-beginning 0))))
+    (list leading core trailing)))
+
+(defun gdocs--emphasis-pre-char-ok-p (char)
+  "Non-nil when CHAR may precede an Org emphasis opener.
+CHAR nil means the marker would start the line, which is allowed.
+Uses `org-emphasis-regexp-components' so user customization applies."
+  (or (null char)
+      (string-match-p
+       (concat "\\`[" (nth 0 org-emphasis-regexp-components) "]")
+       (char-to-string char))))
+
+(defun gdocs--emphasis-post-char-ok-p (char)
+  "Non-nil when CHAR may follow an Org emphasis closer.
+CHAR nil means the marker would end the line, which is allowed.
+Uses `org-emphasis-regexp-components' so user customization applies."
+  (or (null char)
+      (string-match-p
+       (concat "\\`[" (nth 1 org-emphasis-regexp-components) "]")
+       (char-to-string char))))
+
+(defun gdocs--wrap-emphasis-inner (inner key)
+  "Wrap the styled text INNER in KEY's Org marker when that parses.
+
+Whitespace at the group boundary is moved outside the markers so that a
+span covering trailing text whitespace renders as `*text* ' rather than
+the unparsable `*text *'.  Markers are dropped (keeping every character)
+when Org could not parse the emphasis: an empty core, a core spanning a
+line break, or a boundary character outside Org's emphasis pre/post
+classes — typically a style that starts or ends mid-word."
+  (pcase-let* ((`(,leading ,core ,trailing)
+                (gdocs--split-inline-space inner))
+               (mk (cdr (assq key gdocs--org-style-markers))))
+    (cond
+     ((or (string-empty-p core) (string-match-p "[\n\r]" core))
+      inner)
+     (t (concat leading mk core mk trailing)))))
+
+(defun gdocs--emphasis-boundaries-ok-p (previous-char next-char)
+  "Non-nil when Org emphasis parses between PREVIOUS-CHAR and NEXT-CHAR.
+Either char may be nil for the line edge.  The border rule (no whitespace
+directly inside the markers) is already guaranteed by trimming."
+  (and (gdocs--emphasis-pre-char-ok-p previous-char)
+       (gdocs--emphasis-post-char-ok-p next-char)))
+
 (defvar gdocs--render-link-description nil
   "Non-nil while rendering the description of one logical Org link.")
 
@@ -3054,20 +3164,38 @@ than the reverse (which org would treat as opaque).")
         printed))))
 
 (defun gdocs--inline-object-spec (object)
-  "Return the unambiguous, remote-marked Org payload for OBJECT."
+  "Return the unambiguous, remote-marked Org payload for OBJECT.
+
+The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT' for
+images and `date|person ENTITY LABEL' for smart chips."
   (unless (and (listp object)
                (eq (plist-get object :kind) :inline-object)
-               (eq (plist-get object :object-kind) :image)
                (gdocs--valid-inline-object-id-p
-                (plist-get object :entity-id))
-               (gdocs--valid-inline-object-id-p
-                (plist-get object :content-id)))
+                (plist-get object :entity-id)))
     (user-error "gdocs: invalid inline-object marker metadata"))
-  (format "image %s %sx%s content-id=%s"
-          (plist-get object :entity-id)
-          (gdocs--inline-object-number (plist-get object :width))
-          (gdocs--inline-object-number (plist-get object :height))
-          (plist-get object :content-id)))
+  (pcase (plist-get object :object-kind)
+    (:image
+     (unless (gdocs--valid-inline-object-id-p
+              (plist-get object :content-id))
+       (user-error "gdocs: invalid inline-object marker metadata"))
+     (format "image %s %sx%s content-id=%s"
+             (plist-get object :entity-id)
+             (gdocs--inline-object-number (plist-get object :width))
+             (gdocs--inline-object-number (plist-get object :height))
+             (plist-get object :content-id)))
+    (:chip-date
+     (unless (gdocs--valid-chip-label-p (plist-get object :label))
+       (user-error "gdocs: invalid inline-object marker metadata"))
+     (format "date %s %s"
+             (plist-get object :entity-id)
+             (plist-get object :label)))
+    (:chip-person
+     (unless (gdocs--valid-chip-label-p (plist-get object :label))
+       (user-error "gdocs: invalid inline-object marker metadata"))
+     (format "person %s %s"
+             (plist-get object :entity-id)
+             (plist-get object :label)))
+    (_ (user-error "gdocs: invalid inline-object marker metadata"))))
 
 (defun gdocs--render-inline-object (object &optional embedded)
   "Render OBJECT as an explicit Org remote-object placeholder.
@@ -3152,12 +3280,11 @@ boundary first."
         ;; Keep a style that spans a link boundary outside the link.  This
         ;; both preserves the original formatting and avoids Org treating a
         ;; style marker immediately following a closing bracket as literal.
-        (let ((marker (cdr (assq common-style gdocs--org-style-markers)))
-              (inner (gdocs--render-runs-by-link
+        (let ((inner (gdocs--render-runs-by-link
                       (mapcar (lambda (run)
                                 (gdocs--run-without-style run common-style))
                               runs))))
-          (format "%s%s%s" marker inner marker))
+          (gdocs--wrap-emphasis-inner inner common-style))
       (let ((groups nil)
             (current nil)
             (current-link :gdocs-no-link))
@@ -3281,7 +3408,11 @@ emitted; we won't re-emit them inside."
                runs "")))
 
 (defun gdocs--render-runs-split-on (key runs already-wrapped)
-  "Group RUNS by whether each carries KEY; wrap KEY-bearing groups."
+  "Group RUNS by whether each carries KEY; wrap KEY-bearing groups.
+
+Group text is rendered first so the wrap decision can use the rendered
+neighboring characters.  See `gdocs--wrap-emphasis-inner' for the
+whitespace and boundary policy."
   (let ((groups nil) (cur nil) (cur-has 'unset))
     (dolist (r runs)
       (let ((has (and (memq key (plist-get r :styles)) t)))
@@ -3294,20 +3425,54 @@ emitted; we won't re-emit them inside."
           (push (cons cur-has (nreverse cur)) groups)
           (setq cur (list r) cur-has has)))))
     (when cur (push (cons cur-has (nreverse cur)) groups))
-    (mapconcat
-     (lambda (g)
-       (let* ((has-key (car g))
-              (group-runs (cdr g))
-              (inner
-               (gdocs--render-runs-styled
-                group-runs
-                (if has-key (cons key already-wrapped) already-wrapped))))
-         (if (and has-key
-                  (not (string-empty-p (string-trim inner))))
-             (let ((mk (cdr (assq key gdocs--org-style-markers))))
-               (format "%s%s%s" mk inner mk))
-           inner)))
-     (nreverse groups) "")))
+    (setq groups (nreverse groups))
+    (let* ((rendered
+            (mapcar
+             (lambda (g)
+               (let* ((has-key (car g))
+                      (group-runs (cdr g))
+                      (inner
+                       (gdocs--render-runs-styled
+                        group-runs
+                        (if has-key (cons key already-wrapped) already-wrapped))))
+                 (cons has-key inner)))
+             groups))
+           (out nil))
+      (cl-loop for tail on rendered
+               for index from 0
+               do (let* ((has-key (car (car tail)))
+                         (inner (cdr (car tail)))
+                         (previous (and (> index 0)
+                                        (cdr (nth (1- index) rendered))))
+                         (next (cadr tail))
+                         (previous-char
+                          (and previous (length> previous 0)
+                               (aref previous (1- (length previous)))))
+                         (next-char
+                          (and next
+                               (let ((text (cdr next)))
+                                 (and (length> text 0) (aref text 0))))))
+                    (if (and has-key
+                             (not (string-empty-p (string-trim inner))))
+                        (pcase-let* ((`(,leading ,core ,trailing)
+                                      (gdocs--split-inline-space inner))
+                                     ;; Whitespace moved outside the markers
+                                     ;; is the effective boundary character
+                                     ;; the parser will see.
+                                     (effective-previous
+                                      (if (length> leading 0) ?\s previous-char))
+                                     (effective-next
+                                      (if (length> trailing 0) ?\s next-char)))
+                          (if (or (string-empty-p core)
+                                  (string-match-p "[\n\r]" core)
+                                  (not (gdocs--emphasis-boundaries-ok-p
+                                        effective-previous effective-next)))
+                              (push (concat leading core trailing) out)
+                            (let ((mk (cdr (assq key gdocs--org-style-markers))))
+                              (push (concat leading mk core mk trailing)
+                                    out))))
+                      (push inner out))))
+      (apply #'concat (nreverse out)))))
 
 (defun gdocs--render-heading-stars (level)
   "Return N stars for heading LEVEL (1..5). Levels >5 are clamped to 5."
@@ -3325,18 +3490,42 @@ is the syntax-aware leading column computed from the parent item marker."
             "- ")))
 
 (defun gdocs--render-table-para (para)
-  "Render a :kind=:table paragraph to an org-mode table."
+  "Render a :kind=:table paragraph to an org-mode table.
+
+Rows are padded to a common column count and cells are padded with
+spaces so every row shares the same column widths — the shape
+`org-table-align' would produce.  Alignment is deterministic, so an
+unchanged table keeps its byte-exact rendering across pulls."
   (let* ((rows (plist-get para :rows))
-         (lines
-          (mapcar
-           (lambda (row)
-             (concat "| "
-                     (mapconcat
-                      #'gdocs--render-table-cell
-                      row " | ")
-                     " |"))
-           rows)))
-    (string-join lines "\n")))
+         (rendered
+          (mapcar (lambda (row) (mapcar #'gdocs--render-table-cell row))
+                  rows))
+         (ncols (apply #'max 0 (mapcar #'length rendered)))
+         (padded
+          (mapcar (lambda (row)
+                    (append row (make-list (- ncols (length row)) "")))
+                  rendered))
+         (widths
+          (cl-loop for col below ncols
+                   collect (apply #'max 0
+                                  (mapcar (lambda (row)
+                                            (string-width (nth col row)))
+                                          padded)))))
+    (string-join
+     (mapcar (lambda (row)
+               (concat "| "
+                       (mapconcat
+                        #'identity
+                        (cl-mapcar
+                         (lambda (cell width)
+                           (concat cell
+                                   (make-string (- width (string-width cell))
+                                                ?\s)))
+                         row widths)
+                        " | ")
+                       " |"))
+             padded)
+     "\n")))
 
 (defun gdocs--render-paragraph-line (para &optional ordinal list-indent)
   "Render PARA to its org line (no trailing newline).
@@ -3385,18 +3574,33 @@ keyword lines emitted from Title/Subtitle paragraphs."
   "Render structured or legacy REASONS as one visible Org directive.
 
 Only the report explanations are rendered; raw operation payloads are never
-copied into the local document."
+copied into the local document.  Identical explanations are grouped with a
+repeat count instead of being repeated once per occurrence."
   (format "#+%s: %s" (or keyword "gdocs_unsupported")
           (replace-regexp-in-string
            "[ \t\n\r]+" " "
            (string-trim
             (string-join
-             (mapcar (lambda (reason)
-                       (if (stringp reason)
-                           reason
-                         (or (plist-get reason :explanation)
-                             "unsupported content")))
-                     reasons)
+             (let ((counts (make-hash-table :test #'equal))
+                   (order nil))
+               (dolist (reason reasons)
+                 (let ((explanation
+                        (if (stringp reason)
+                            reason
+                          (or (plist-get reason :explanation)
+                              "unsupported content"))))
+                   (unless (gethash explanation counts)
+                     (push explanation order))
+                   (puthash explanation
+                            (1+ (gethash explanation counts 0))
+                            counts)))
+               (mapcar
+                (lambda (explanation)
+                  (let ((count (gethash explanation counts)))
+                    (if (= count 1)
+                        explanation
+                      (format "%s (x%d)" explanation count))))
+                (nreverse order)))
              "; ")))))
 
 (defun gdocs-dm-to-org (doc)
@@ -3557,16 +3761,19 @@ than to the final text, so it never appears inside a source block."
 (defun gdocs--inline-object-dimension (token)
   "Parse an inline-object dimension TOKEN, or return nil."
   (when (and (stringp token)
-              (string-match-p
-               "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\(?:[eE][+-]?[0-9]+\\)?\\'"
-               token))
+             (string-match-p
+              "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\(?:[eE][+-]?[0-9]+\\)?\\'"
+              token))
     (let ((dimension (string-to-number token)))
       (and (gdocs--valid-inline-object-dimension-p dimension) dimension))))
 
 (defun gdocs--parse-inline-object-spec (value)
   "Parse the payload of a `gdocs_inline_object' Org placeholder.
 
-The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT'."
+The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT'
+for images, `date ENTITY LABEL' for date chips, and `person ENTITY
+LABEL' for person chips.  LABEL is the remainder of the payload and may
+contain spaces."
   (let* ((valid-payload (and (stringp value)
                              (not (seq-some
                                    (lambda (char)
@@ -3576,33 +3783,45 @@ The stable syntax is `image ENTITY WIDTHxHEIGHT content-id=CONTENT'."
                                    value))))
          (fields (and valid-payload
                       (split-string (string-trim value)
-                                    "[ \t]+" t)))
-         (dimensions (nth 2 fields))
-         (content-field (nth 3 fields))
-         (content-id (and (stringp content-field)
-                          (string-prefix-p "content-id=" content-field)
-                          (substring content-field (length "content-id="))))
-         (width-token nil)
-         (height-token nil))
-    (when (and (= (length fields) 4)
-               (equal (car fields) "image")
-               (stringp (nth 1 fields))
-               (not (string-empty-p (nth 1 fields)))
-               (stringp dimensions)
-               (string-match
-                "\\`\\([^x]+\\)x\\([^x]+\\)\\'" dimensions))
-      (setq width-token (match-string 1 dimensions)
-            height-token (match-string 2 dimensions))
-      (when (and (gdocs--inline-object-dimension width-token)
-                  (gdocs--inline-object-dimension height-token)
-                  (gdocs--valid-inline-object-id-p (nth 1 fields))
-                  (gdocs--valid-inline-object-id-p content-id))
-        (list :kind :inline-object
-              :entity-id (nth 1 fields)
-              :object-kind :image
-              :content-id content-id
-              :width (gdocs--inline-object-dimension width-token)
-              :height (gdocs--inline-object-dimension height-token))))))
+                                    "[ \t]+" t))))
+    (pcase (car fields)
+      ("image"
+       (let* ((dimensions (nth 2 fields))
+              (content-field (nth 3 fields))
+              (content-id (and (stringp content-field)
+                               (string-prefix-p "content-id=" content-field)
+                               (substring content-field
+                                          (length "content-id="))))
+              (width-token nil)
+              (height-token nil))
+         (when (and (= (length fields) 4)
+                    (stringp (nth 1 fields))
+                    (not (string-empty-p (nth 1 fields)))
+                    (stringp dimensions)
+                    (string-match
+                     "\\`\\([^x]+\\)x\\([^x]+\\)\\'" dimensions))
+           (setq width-token (match-string 1 dimensions)
+                 height-token (match-string 2 dimensions))
+           (when (and (gdocs--inline-object-dimension width-token)
+                      (gdocs--inline-object-dimension height-token)
+                      (gdocs--valid-inline-object-id-p (nth 1 fields))
+                      (gdocs--valid-inline-object-id-p content-id))
+             (list :kind :inline-object
+                   :entity-id (nth 1 fields)
+                   :object-kind :image
+                   :content-id content-id
+                   :width (gdocs--inline-object-dimension width-token)
+                   :height (gdocs--inline-object-dimension height-token))))))
+      ((or "date" "person")
+       (when (and (>= (length fields) 3)
+                  (gdocs--valid-inline-object-id-p (nth 1 fields)))
+         (let ((label (string-join (nthcdr 2 fields) " ")))
+           (when (gdocs--valid-chip-label-p label)
+             (list :kind :inline-object
+                   :entity-id (nth 1 fields)
+                   :object-kind (if (equal (car fields) "date")
+                                    :chip-date :chip-person)
+                   :label label))))))))
 
 (defun gdocs--unescape-org-inline
     (text &optional link-description table-cell)
@@ -3624,12 +3843,12 @@ a different document-model value."
       (let ((char (aref text i)))
         (cond
          ((and link-description
-                (= char #x200b))
+               (= char #x200b))
           (cl-incf i))
          ((and (or (not table-cell) link-description)
-                (= char ?\\)
-                (< (1+ i) n)
-                (memq (aref text (1+ i)) gdocs--org-inline-escape-chars))
+               (= char ?\\)
+               (< (1+ i) n)
+               (memq (aref text (1+ i)) gdocs--org-inline-escape-chars))
           (push (aref text (1+ i)) out)
           (setq i (+ i 2)))
          (t
@@ -3759,29 +3978,40 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
            (contents (cddr el))
            (style (cdr (assq type gdocs--org-element-styles))))
       (cond
-        ((and (eq type 'export-snippet)
-               (string= (downcase (format "%s"
-                                          (or (plist-get props :backend)
-                                              (plist-get props :back-end))))
-                        "gdocs-inline-object"))
-          (let ((object (and (not (gdocs--org-element-escaped-p el))
-                             (gdocs--parse-inline-object-spec
-                              (plist-get props :value)))))
-            (cond
-             (object (list (list :inline-object object)))
-             ((gdocs--org-element-escaped-p el)
-              (let ((text (gdocs--org-element-visible-text
-                           el inherited-link table-cell)))
-                (when text
-                  (list (gdocs-dm-make-run
-                         text inherited-styles inherited-link)))))
-             (t
-              (let* ((text (and visible-fallback
-                                (gdocs--org-element-visible-text
-                                 el inherited-link table-cell)))
-                     (run (gdocs-dm-make-run
-                           (or text "") inherited-styles inherited-link)))
-                (list (plist-put run :inline-object-malformed t)))))))
+       ((and (eq type 'export-snippet)
+             (string= (downcase (format "%s"
+                                        (or (plist-get props :backend)
+                                            (plist-get props :back-end))))
+                      "gdocs-inline-object"))
+        (let ((object (and (not (gdocs--org-element-escaped-p el))
+                           (gdocs--parse-inline-object-spec
+                            (plist-get props :value)))))
+          (cond
+           (object
+            ;; Org attaches the whitespace after the closing `@@' to the
+            ;; snippet as `:post-blank'.  Like the link branch below, it
+            ;; belongs to the surrounding text, so re-emit it as a run.
+            (let ((runs (list (list :inline-object object)))
+                  (post-blank (org-element-property :post-blank el)))
+              (if (and (integerp post-blank) (> post-blank 0))
+                  (append runs
+                          (list (gdocs-dm-make-run
+                                 (make-string post-blank ?\s)
+                                 inherited-styles inherited-link)))
+                runs)))
+           ((gdocs--org-element-escaped-p el)
+            (let ((text (gdocs--org-element-visible-text
+                         el inherited-link table-cell)))
+              (when text
+                (list (gdocs-dm-make-run
+                       text inherited-styles inherited-link)))))
+           (t
+            (let* ((text (and visible-fallback
+                              (gdocs--org-element-visible-text
+                               el inherited-link table-cell)))
+                   (run (gdocs-dm-make-run
+                         (or text "") inherited-styles inherited-link)))
+              (list (plist-put run :inline-object-malformed t)))))))
        ((eq type 'link)
         (let* ((path (plist-get props :path))
                (kind (plist-get props :type))
@@ -3816,43 +4046,43 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                  (gdocs--unescape-org-inline
                   props (and inherited-link t) table-cell)
                  inherited-styles inherited-link))))
-        ((eq type 'entity)
-          (let* ((text (or (and table-cell
-                                (gdocs--org-table-escape-value el))
-                           (and visible-fallback
-                                (gdocs--org-element-visible-text
-                                 el inherited-link table-cell))
-                           (and table-cell
-                                (or (plist-get props :utf-8)
-                                    (plist-get props :ascii)))))
-                (runs (when (stringp text)
-                        (list (gdocs-dm-make-run
-                               text inherited-styles inherited-link))))
-                (post-blank (org-element-property :post-blank el)))
-            (if (and table-cell runs (not visible-fallback)
-                     (integerp post-blank) (> post-blank 0))
-               (append runs
+       ((eq type 'entity)
+        (let* ((text (or (and table-cell
+                              (gdocs--org-table-escape-value el))
+                         (and visible-fallback
+                              (gdocs--org-element-visible-text
+                               el inherited-link table-cell))
+                         (and table-cell
+                              (or (plist-get props :utf-8)
+                                  (plist-get props :ascii)))))
+               (runs (when (stringp text)
                        (list (gdocs-dm-make-run
-                              (make-string post-blank ?\s)
+                              text inherited-styles inherited-link))))
+               (post-blank (org-element-property :post-blank el)))
+          (if (and table-cell runs (not visible-fallback)
+                   (integerp post-blank) (> post-blank 0))
+              (append runs
+                      (list (gdocs-dm-make-run
+                             (make-string post-blank ?\s)
                              inherited-styles inherited-link)))
             runs)))
-        ((eq type 'latex-fragment)
-          (let* ((text (or (and table-cell
-                                (gdocs--org-table-escape-value el))
-                           (and visible-fallback
-                                (gdocs--org-element-visible-text
-                                 el inherited-link table-cell))
-                           (and table-cell (plist-get props :value))))
-                 (runs (when (stringp text)
-                         (list (gdocs-dm-make-run
-                                text
-                                inherited-styles inherited-link))))
-                (post-blank (org-element-property :post-blank el)))
-            (if (and table-cell runs (not visible-fallback)
-                     (integerp post-blank) (> post-blank 0))
-               (append runs
+       ((eq type 'latex-fragment)
+        (let* ((text (or (and table-cell
+                              (gdocs--org-table-escape-value el))
+                         (and visible-fallback
+                              (gdocs--org-element-visible-text
+                               el inherited-link table-cell))
+                         (and table-cell (plist-get props :value))))
+               (runs (when (stringp text)
                        (list (gdocs-dm-make-run
-                              (make-string post-blank ?\s)
+                              text
+                              inherited-styles inherited-link))))
+               (post-blank (org-element-property :post-blank el)))
+          (if (and table-cell runs (not visible-fallback)
+                   (integerp post-blank) (> post-blank 0))
+              (append runs
+                      (list (gdocs-dm-make-run
+                             (make-string post-blank ?\s)
                              inherited-styles inherited-link)))
             runs)))
        (style
@@ -3885,28 +4115,28 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                              (make-string post-blank ?\s)
                              inherited-styles inherited-link)))
             runs)))
-        (t
-          (if (and contents (not (and table-cell visible-fallback)))
-              (cl-mapcan
-              (lambda (c)
-                (gdocs--element-runs c inherited-styles inherited-link
-                                     table-cell visible-fallback))
-              contents)
-           (let ((text (and visible-fallback
-                            (gdocs--org-element-visible-text
-                             el inherited-link table-cell))))
-             (when text
-               (list (gdocs-dm-make-run
-                      text inherited-styles inherited-link)))))))))))
+       (t
+        (if (and contents (not (and table-cell visible-fallback)))
+            (cl-mapcan
+             (lambda (c)
+               (gdocs--element-runs c inherited-styles inherited-link
+                                    table-cell visible-fallback))
+             contents)
+          (let ((text (and visible-fallback
+                           (gdocs--org-element-visible-text
+                            el inherited-link table-cell))))
+            (when text
+              (list (gdocs-dm-make-run
+                     text inherited-styles inherited-link)))))))))))
 
 (defun gdocs--paragraph-content-runs (par &optional visible-fallback)
   "Return the runs of an org `paragraph' element PAR, trimming the
 trailing newline that org-element keeps at the end of each paragraph.
 VISIBLE-FALLBACK is passed to `gdocs--element-runs'."
   (let ((runs (cl-mapcan
-                (lambda (c)
-                  (gdocs--element-runs c nil nil nil visible-fallback))
-                (cddr par))))
+               (lambda (c)
+                 (gdocs--element-runs c nil nil nil visible-fallback))
+               (cddr par))))
     ;; Strip a single trailing newline from the last run if present.
     (when runs
       (let* ((tail (last runs))
@@ -3928,10 +4158,10 @@ VISIBLE-FALLBACK is passed to `gdocs--element-runs'."
                   runs))
     ;; Drop empty runs.
     (seq-remove (lambda (r)
-                   (and (not (plist-get r :inline-object))
-                        (not (plist-get r :inline-object-malformed))
-                        (string-empty-p (or (plist-get r :text) ""))))
-                 runs)))
+                  (and (not (plist-get r :inline-object))
+                       (not (plist-get r :inline-object-malformed))
+                       (string-empty-p (or (plist-get r :text) ""))))
+                runs)))
 
 (defun gdocs--org-inline-content-runs (text &optional visible-fallback)
   "Parse TEXT as inline Org content and return its doc-model runs.
@@ -3968,9 +4198,9 @@ visible content."
                             (and (consp element)
                                  (eq (car element) 'paragraph)))
                           (cddr section))))
-                    (runs (and paragraph
-                               (gdocs--paragraph-content-runs
-                                paragraph visible-fallback)))
+                   (runs (and paragraph
+                              (gdocs--paragraph-content-runs
+                               paragraph visible-fallback)))
                    (first (car runs))
                    (first-text (and first (plist-get first :text))))
               (if (and (stringp first-text)
@@ -3981,11 +4211,11 @@ visible content."
                                 first-text (length sentinel)))
                     (setq runs (cons trimmed (cdr runs)))
                     (or (seq-remove
-                          (lambda (run)
-                            (and (not (plist-get run :inline-object))
-                                 (not (plist-get run :inline-object-malformed))
-                                 (string-empty-p
-                                  (or (plist-get run :text) ""))))
+                         (lambda (run)
+                           (and (not (plist-get run :inline-object))
+                                (not (plist-get run :inline-object-malformed))
+                                (string-empty-p
+                                 (or (plist-get run :text) ""))))
                          runs)
                         fallback))
                 fallback)))
@@ -4062,12 +4292,12 @@ entities and post-blank whitespace."
     (dolist (run runs (nreverse out))
       (let ((previous (car out)))
         (if (and previous
-                  (not (plist-get previous :inline-object))
-                  (not (plist-get run :inline-object))
-                  (not (plist-get previous :inline-object-malformed))
-                  (not (plist-get run :inline-object-malformed))
-                  (equal (plist-get previous :styles)
-                         (plist-get run :styles))
+                 (not (plist-get previous :inline-object))
+                 (not (plist-get run :inline-object))
+                 (not (plist-get previous :inline-object-malformed))
+                 (not (plist-get run :inline-object-malformed))
+                 (equal (plist-get previous :styles)
+                        (plist-get run :styles))
                  (equal (plist-get previous :link)
                         (plist-get run :link)))
             (setcar out
@@ -4117,11 +4347,11 @@ empty run list rather than disappearing from its row."
           (setcar (nthcdr last-index runs)
                   (plist-put (copy-sequence last-run) :text last-text)))))
     (gdocs--coalesce-table-cell-runs
-      (seq-remove (lambda (run)
-                    (and (not (plist-get run :inline-object))
-                         (not (plist-get run :inline-object-malformed))
-                         (string-empty-p (or (plist-get run :text) ""))))
-                  runs))))
+     (seq-remove (lambda (run)
+                   (and (not (plist-get run :inline-object))
+                        (not (plist-get run :inline-object-malformed))
+                        (string-empty-p (or (plist-get run :text) ""))))
+                 runs))))
 
 (defun gdocs--src-block-paragraphs (sb)
   "Split a src-block's :value into a list of :code paragraphs."
@@ -4235,8 +4465,8 @@ Each cell becomes (RUNS) — one element holding a list of runs."
                        (gdocs--trim-table-cell-runs
                         (cl-mapcan
                          (lambda (content)
-                            (gdocs--element-runs content nil nil t t))
-                          (cddr sub)))))
+                           (gdocs--element-runs content nil nil t t))
+                         (cddr sub)))))
                   (push (list runs) cells))))
             (let ((row (nreverse cells)))
               (setq max-cols (max max-cols (length row)))
@@ -4311,20 +4541,20 @@ caller can distinguish meaningful blank lines from heading padding."
        (cond
         ((member key '("title" "subtitle"))
          (let ((para (list :kind (if (equal key "title") :title :subtitle)
-                            :runs (gdocs--org-inline-content-runs val t))))
+                           :runs (gdocs--org-inline-content-runs val t))))
            (list (if source-spans
                      (gdocs--org-annotate-paragraph
                       para (gdocs--org-element-line-number el)
                       (gdocs--org-element-last-line-number el))
                    para))))
-         ((equal key "gdocs_inline_object")
-          (let* ((object (gdocs--parse-inline-object-spec val))
-                 (para (or object
-                           (list :kind :unsupported
-                                 :runs nil
-                                 :inline-object-malformed t
-                                 :unsupported-reason
-                                 "malformed gdocs_inline_object placeholder"))))
+        ((equal key "gdocs_inline_object")
+         (let* ((object (gdocs--parse-inline-object-spec val))
+                (para (or object
+                          (list :kind :unsupported
+                                :runs nil
+                                :inline-object-malformed t
+                                :unsupported-reason
+                                "malformed gdocs_inline_object placeholder"))))
            (list (if source-spans
                      (gdocs--org-annotate-paragraph
                       para (gdocs--org-element-line-number el)
@@ -4658,7 +4888,7 @@ The caller is responsible for `ds' (clear old body) and `is' (insert
 BODY at position 1)."
   (when (gdocs--doc-has-inline-object-p doc)
     (user-error
-     "gdocs: inline image placeholders are remote-only; image OT operations are not supported"))
+     "gdocs: remote object placeholders (inline images and chips) are remote-only; their OT creation operations are not supported"))
   (when (gdocs-dm-unsupported doc)
     (user-error "gdocs: document contains unsupported content: %s"
                 (or (plist-get (gdocs--capability-normalize
@@ -4735,11 +4965,11 @@ comparison; decoder-only inline-object metadata does not."
               (identity2 (and o2 (gdocs--inline-object-identity o2))))
           (and identity1 identity2 (equal identity1 identity2)))
       (and (equal (plist-get r1 :text) (plist-get r2 :text))
-            (equal (sort (copy-sequence (plist-get r1 :styles))
-                         :lessp #'string<)
-                   (sort (copy-sequence (plist-get r2 :styles))
-                         :lessp #'string<))
-            (equal (plist-get r1 :link) (plist-get r2 :link))))))
+           (equal (sort (copy-sequence (plist-get r1 :styles))
+                        :lessp #'string<)
+                  (sort (copy-sequence (plist-get r2 :styles))
+                        :lessp #'string<))
+           (equal (plist-get r1 :link) (plist-get r2 :link))))))
 
 (defun gdocs--table-run-valid-for-equality-p (run)
   "Return non-nil when RUN has a well-formed equality representation."
@@ -4756,9 +4986,15 @@ comparison; decoder-only inline-object metadata does not."
                   (eq (plist-get object :kind) :inline-object)
                   (stringp (plist-get object :entity-id))
                   (symbolp (plist-get object :object-kind))
-                  (stringp (plist-get object :content-id))
-                  (numberp (plist-get object :width))
-                  (numberp (plist-get object :height)))
+                  (cond
+                   ((eq (plist-get object :object-kind) :image)
+                    (and (stringp (plist-get object :content-id))
+                         (numberp (plist-get object :width))
+                         (numberp (plist-get object :height))))
+                   ((memq (plist-get object :object-kind)
+                          '(:chip-date :chip-person))
+                    (gdocs--valid-chip-label-p (plist-get object :label)))
+                   (t nil)))
            (and text-present
                 (stringp (plist-get run :text))
                 (or (null styles)
@@ -4882,12 +5118,12 @@ rendered docs.  Malformed tables are never equal."
                   (plist-get p2 :level)))
          (equal (plist-get p1 :nest) (plist-get p2 :nest))
          (equal (plist-get p1 :glyph) (plist-get p2 :glyph))
-          (if (eq kind :table)
-              (gdocs--table-equal-p p1 p2)
-            (let ((r1 (gdocs--paragraph-runs-for-equality p1))
-                  (r2 (gdocs--paragraph-runs-for-equality p2)))
-              (and (= (length r1) (length r2))
-                   (cl-every #'gdocs--run-text-equal-p r1 r2)))))))
+         (if (eq kind :table)
+             (gdocs--table-equal-p p1 p2)
+           (let ((r1 (gdocs--paragraph-runs-for-equality p1))
+                 (r2 (gdocs--paragraph-runs-for-equality p2)))
+             (and (= (length r1) (length r2))
+                  (cl-every #'gdocs--run-text-equal-p r1 r2)))))))
 
 (defun gdocs--paragraphs-common-prefix (a b)
   (let ((n 0))
@@ -4908,13 +5144,13 @@ rendered docs.  Malformed tables are never equal."
                     (list :kind :para :runs (list (gdocs-dm-make-run "*")))
                   (cl-labels
                       ((sanitize-runs
-                        (runs)
-                        (mapcar
-                         (lambda (run)
-                           (if (plist-get run :inline-object)
-                               (gdocs-dm-make-run "*")
-                             run))
-                         runs)))
+                         (runs)
+                         (mapcar
+                          (lambda (run)
+                            (if (plist-get run :inline-object)
+                                (gdocs-dm-make-run "*")
+                              run))
+                          runs)))
                     (if (eq (plist-get copy :kind) :table)
                         (setq copy
                               (plist-put
@@ -4965,7 +5201,7 @@ fallback plan omits commands that would re-encode unsupported local entities."
                              (- (length new-paras) suf))))
     (cond
      ((and (null old-mid) (null new-mid))
-       '(:commands nil :kind :noop :ranges nil))
+      '(:commands nil :kind :noop :ranges nil))
      ((cl-some (lambda (p)
                  (or (memq (plist-get p :kind)
                            '(:list :table :inline-object))
@@ -4973,12 +5209,12 @@ fallback plan omits commands that would re-encode unsupported local entities."
                                 (plist-get run :inline-object))
                               (plist-get p :runs))))
                (append old-mid new-mid))
-       (list :commands
-             (and (not classify-only)
-                  (gdocs-dm-to-save-commands
-                   (gdocs--paragraphs-ot-length old-paras) new-doc))
-             :kind :full-replace
-             :ranges nil))
+      (list :commands
+            (and (not classify-only)
+                 (gdocs-dm-to-save-commands
+                  (gdocs--paragraphs-ot-length old-paras) new-doc))
+            :kind :full-replace
+            :ranges nil))
      (t
       (let* ((old-pre-len (gdocs--paragraphs-ot-length
                            (cl-subseq old-paras 0 pre)))
@@ -5000,15 +5236,15 @@ fallback plan omits commands that would re-encode unsupported local entities."
           (push `((ty . "is") (ibi . ,(1+ old-pre-len))
                   (s . ,mid-body))
                 cmds))
-         (list :commands (append (nreverse cmds) shifted-ops)
-               :kind :incremental
-               :ranges
-               (list (list :ot-start (1+ old-pre-len)
-                           :ot-end (if (> old-mid-len 0)
-                                       (+ old-pre-len old-mid-len)
-                                     (1+ old-pre-len))
-                           :insert-at (1+ old-pre-len)
-                           :delete-count old-mid-len))))))))
+        (list :commands (append (nreverse cmds) shifted-ops)
+              :kind :incremental
+              :ranges
+              (list (list :ot-start (1+ old-pre-len)
+                          :ot-end (if (> old-mid-len 0)
+                                      (+ old-pre-len old-mid-len)
+                                    (1+ old-pre-len))
+                          :insert-at (1+ old-pre-len)
+                          :delete-count old-mid-len))))))))
 
 (defun gdocs-dm-to-incremental-save-commands (old-doc new-doc)
   "Return OT commands for the paragraph-level diff from OLD-DOC to NEW-DOC.
@@ -5519,69 +5755,69 @@ modelChunk we need for the op stream. Comments live in the cookie-auth
   (let ((snapshot (gdocs--capture-pull-snapshot buf))
         (done nil))
     (cl-labels ((finish
-                 (body err)
+                  (body err)
                   (unless done
                     (setq done t)
                     (gdocs--sync-release owner)
                     (when err (gdocs-log 'warn "Pull %s: %s" doc-id err))
-                   (funcall cb body err))))
-    (gdocs--fetch-edit-page-async
-     doc-id
-     (lambda (state edit-html err)
-       (cond
-         (err (finish nil err))
-         (t
-          (condition-case setup-sig
-              (gdocs--fetch-docdetails-async
-               doc-id state
-               (lambda (details details-err)
-                 (when details-err
-                   (gdocs-log 'debug "docdetails fetch failed for %s: %s"
-                              doc-id details-err))
-                 (condition-case sig
-                     (let* ((creation-time-ms
-                             (and (listp details)
-                                  (alist-get 'CREATION_TIME details)))
-                            (built (gdocs--ot-decode-pipeline
-                                    doc-id edit-html state creation-time-ms))
-                            (title (car built))
-                            (body (cdr built))
-                            (parsed (gdocs--parse-model-chunk-full edit-html))
-                            (anchor-map (gdocs--decode-doco-anchors
-                                         (plist-get parsed :ops)))
-                            (ot-body (plist-get state :ot-body)))
-                       (gdocs--docos-sync-raw-async
-                        doc-id state
-                        (lambda (raw _docos-err)
-                          (condition-case sig2
-                              (let* ((comments
-                                      (and raw
-                                           (gdocs--parse-docos-sync-response raw)))
-                                     (_namespace-available
-                                      (and comments
-                                           (gdocs--assert-comment-footnote-namespace-available
-                                            body)))
-                                     (body-with-refs
-                                      (if (and comments ot-body)
-                                          (gdocs--inline-comment-refs
-                                           body ot-body anchor-map comments)
-                                        body))
-                                     (final
-                                      (if comments
-                                          (concat
-                                           (string-trim-right body-with-refs)
-                                           "\n\n"
-                                           (gdocs--render-comments-section
-                                            comments))
-                                        body-with-refs)))
-                                (gdocs--apply-pull-into-buffer
-                                 doc-id buf title final snapshot
-                                 (plist-get state :revision))
-                                (finish final nil))
-                            (error
-                             (finish nil (error-message-string sig2)))))))
-                   (error (finish nil (error-message-string sig))))))
-            (error (finish nil (error-message-string setup-sig)))))))))))
+                    (funcall cb body err))))
+      (gdocs--fetch-edit-page-async
+       doc-id
+       (lambda (state edit-html err)
+         (cond
+          (err (finish nil err))
+          (t
+           (condition-case setup-sig
+               (gdocs--fetch-docdetails-async
+                doc-id state
+                (lambda (details details-err)
+                  (when details-err
+                    (gdocs-log 'debug "docdetails fetch failed for %s: %s"
+                               doc-id details-err))
+                  (condition-case sig
+                      (let* ((creation-time-ms
+                              (and (listp details)
+                                   (alist-get 'CREATION_TIME details)))
+                             (built (gdocs--ot-decode-pipeline
+                                     doc-id edit-html state creation-time-ms))
+                             (title (car built))
+                             (body (cdr built))
+                             (parsed (gdocs--parse-model-chunk-full edit-html))
+                             (anchor-map (gdocs--decode-doco-anchors
+                                          (plist-get parsed :ops)))
+                             (ot-body (plist-get state :ot-body)))
+                        (gdocs--docos-sync-raw-async
+                         doc-id state
+                         (lambda (raw _docos-err)
+                           (condition-case sig2
+                               (let* ((comments
+                                       (and raw
+                                            (gdocs--parse-docos-sync-response raw)))
+                                      (_namespace-available
+                                       (and comments
+                                            (gdocs--assert-comment-footnote-namespace-available
+                                             body)))
+                                      (body-with-refs
+                                       (if (and comments ot-body)
+                                           (gdocs--inline-comment-refs
+                                            body ot-body anchor-map comments)
+                                         body))
+                                      (final
+                                       (if comments
+                                           (concat
+                                            (string-trim-right body-with-refs)
+                                            "\n\n"
+                                            (gdocs--render-comments-section
+                                             comments))
+                                         body-with-refs)))
+                                 (gdocs--apply-pull-into-buffer
+                                  doc-id buf title final snapshot
+                                  (plist-get state :revision))
+                                 (finish final nil))
+                             (error
+                              (finish nil (error-message-string sig2)))))))
+                    (error (finish nil (error-message-string sig))))))
+             (error (finish nil (error-message-string setup-sig)))))))))))
 
 (defface gdocs-pull-flash
   '((((background dark))  :background "#264f3a" :extend t)
@@ -5791,7 +6027,7 @@ Edits are applied in reverse order so earlier offsets stay valid."
     flash))
 
 (defun gdocs--apply-pull-into-buffer (doc-id buf title body
-                                            &optional snapshot remote-revision)
+                                             &optional snapshot remote-revision)
   "Update BUF so its body matches BODY, preserving point and metadata.
 
 The Drive name is stored in `GDOC_TITLE'. Body Title/Subtitle keywords in
@@ -5928,21 +6164,23 @@ excluded. Numeric and user-named Org footnotes remain pushable content."
     (let* ((body-start (gdocs--body-start-pos))
            (end (gdocs--find-local-subtree-start body-start))
            (text (buffer-substring-no-properties body-start end))
-            (text (replace-regexp-in-string "\r\n" "\n" text))
-            ;; The reserved namespace belongs only to Google's generated
-            ;; comment projection; ordinary Org footnotes are user content.
-            (text (replace-regexp-in-string
-                   (concat "\\[fn:"
-                           (regexp-quote gdocs--comment-footnote-label-prefix)
-                           "[0-9]+\\]")
-                   "" text)))
+           (text (replace-regexp-in-string "\r\n" "\n" text))
+           ;; The reserved namespace belongs only to Google's generated
+           ;; comment projection; ordinary Org footnotes are user content.
+           (text (replace-regexp-in-string
+                  (concat "\\[fn:"
+                          (regexp-quote gdocs--comment-footnote-label-prefix)
+                          "[0-9]+\\]")
+                  "" text)))
       text)))
 
 (defun gdocs--inline-object-capability-report (object &optional source)
   "Build a capability report for decoded inline OBJECT."
   (gdocs--capability-report
-   :inline-image
-   "Inline images are pull-only; the current OT encoder can preserve one only when it is left untouched."
+   (if (gdocs--inline-object-is-image-p object) :inline-image :remote-chip)
+   (if (gdocs--inline-object-is-image-p object)
+       "Inline images are pull-only; the current OT encoder can preserve one only when it is left untouched."
+     "Remote chips are pull-only; the current OT encoder can preserve one only when it is left untouched.")
    :entity-id (plist-get object :entity-id)
    :ot-start (plist-get object :ot-position)
    :ot-end (plist-get object :ot-position)
@@ -5984,8 +6222,10 @@ buffer-local report over raw remote state."
 (defun gdocs--local-inline-object-capability-report (object)
   "Build the local capability report for inline OBJECT."
   (gdocs--capability-report
-   :inline-image
-   "The local document contains an inline image marker that the OT encoder cannot create or change."
+   (if (gdocs--inline-object-is-image-p object) :inline-image :remote-chip)
+   (if (gdocs--inline-object-is-image-p object)
+       "The local document contains an inline image marker that the OT encoder cannot create or change."
+     "The local document contains a remote chip marker that the OT encoder cannot create or change.")
    :entity-id (plist-get object :entity-id)
    :source :local-object
    :preserve-untouched t :refuse-push nil
@@ -6005,7 +6245,8 @@ SOURCE identifies which representation supplied OBJECT.  The entity ID is
 retained internally for matching and range bookkeeping, but capability error
 summaries never serialize it."
   (gdocs--capability-report
-   :inline-image explanation
+   (if (gdocs--inline-object-is-image-p object) :inline-image :remote-chip)
+   explanation
    :entity-id (gdocs--capability-object-entity-id object)
    :ot-start (plist-get object :ot-position)
    :ot-end (plist-get object :ot-position)
@@ -6051,13 +6292,13 @@ payload, because the payload is not the complete local document."
          ((null id)
           (push (gdocs--inline-object-matching-report
                  object :local-object
-                 "A local inline image marker has no usable entity ID.")
+                 "A local inline object marker has no usable entity ID.")
                 errors))
          ((gethash id local-seen)
           (puthash id t local-duplicates)
           (push (gdocs--inline-object-matching-report
                  object :local-object
-                 "A local inline image marker uses an entity ID more than once.")
+                 "A local inline object marker uses an entity ID more than once.")
                 errors))
          (t (puthash id object local-seen)))))
     ;; Validate remote IDs separately.  Legacy/synthetic states may carry an
@@ -6069,13 +6310,13 @@ payload, because the payload is not the complete local document."
          ((null id)
           (push (gdocs--inline-object-matching-report
                  object :remote-object
-                 "A remote inline image has no usable entity ID.")
+                 "A remote inline object has no usable entity ID.")
                 errors))
          ((gethash id remote-seen)
           (puthash id t remote-duplicates)
           (push (gdocs--inline-object-matching-report
                  object :remote-object
-                 "A remote inline image uses an entity ID more than once.")
+                 "A remote inline object uses an entity ID more than once.")
                 errors))
          (t
           (puthash id object remote-seen)
@@ -6089,7 +6330,7 @@ payload, because the payload is not the complete local document."
                            local-duplicates)
             (push (gdocs--inline-object-matching-report
                    object :local-object
-                   "An inline image marker cannot be inserted or changed.")
+                   "An inline object marker cannot be inserted or changed.")
                   errors)))
       (progn
         ;; Pair by entity ID, consuming a remote object exactly once.  A
@@ -6109,14 +6350,14 @@ payload, because the payload is not the complete local document."
                  ((null remote)
                   (push (gdocs--inline-object-matching-report
                          object :local-object
-                         "A local inline image marker has no matching remote object.")
+                         "A local inline object marker has no matching remote object.")
                         errors))
                  (t
                   (puthash id t consumed)
                   (unless (gdocs--capability-object-equal-p object remote)
                     (push (gdocs--inline-object-matching-report
                            remote :remote-object
-                           "Inline image metadata differs between local and remote documents.")
+                           "Inline object metadata differs between local and remote documents.")
                           errors))))))))
         ;; A remote ID without a local marker is a deletion, not an ordinary
         ;; text edit.  Do not let placeholder normalization hide it.
@@ -6127,7 +6368,7 @@ payload, because the payload is not the complete local document."
                        (not (gethash id consumed)))
               (push (gdocs--inline-object-matching-report
                      object :remote-object
-                     "A remote inline image has no local marker.")
+                     "A remote inline object has no local marker.")
                     errors))))
         ;; OT positions are transient, but moving an image is not supported.
         ;; Compare document order separately from object identity.
@@ -6139,7 +6380,7 @@ payload, because the payload is not the complete local document."
             (unless (equal local-order remote-order)
               (push (gdocs--inline-object-matching-report
                      (car remote-objects) :remote-object
-                     "Inline image markers were reordered, but moving images is unsupported.")
+                     "Inline object markers were reordered, but moving remote objects is unsupported.")
                     errors))))))
     (nreverse errors)))
 
@@ -6157,14 +6398,14 @@ payload, because the payload is not the complete local document."
              (plist-get paragraph :runs))))))
 
 (defun gdocs--remote-inline-object-validation-errors (reports)
-  "Return hard inline-image reports from remote capability REPORTS.
+  "Return hard inline-object reports from remote capability REPORTS.
 
-Valid remote image reports deliberately have `:refuse-push' nil and are
-preserved by range checks.  A hard inline-image report represents malformed or
+Valid remote image/chip reports deliberately have `:refuse-push' nil and
+are preserved by range checks.  A hard report represents malformed or
 ambiguous remote object data that must also block a no-op."
   (cl-remove-if-not
    (lambda (report)
-     (and (eq (plist-get report :kind) :inline-image)
+     (and (memq (plist-get report :kind) '(:inline-image :remote-chip))
           (plist-get report :refuse-push)))
    reports))
 
@@ -6177,15 +6418,15 @@ parsed marker nodes are reported as invalid."
          (doc (gdocs-dm-from-org body))
          (objects (gdocs-dm-inline-objects doc))
          (reports (mapcar #'gdocs--local-inline-object-capability-report
-                           objects))
+                          objects))
          (malformed-count (gdocs--doc-malformed-inline-object-count doc))
          (marker-errors
-           (if (zerop malformed-count)
-               nil
-             (list
+          (if (zerop malformed-count)
+              nil
+            (list
              (gdocs--capability-report
               :inline-image
-              "The local document contains an invalid inline image marker."
+              "The local document contains an invalid inline object marker."
               :source :local-marker :refuse-push t :render-directive nil)))))
     (list :objects objects
           :inline-marker-errors marker-errors
@@ -6196,32 +6437,40 @@ parsed marker nodes are reported as invalid."
 (defun gdocs--capability-object-equal-p (a b)
   "Return non-nil when local and remote inline objects are unchanged.
 
-The stable entity ID is the primary identity.  Once it matches, immutable
-object kind, content ID, and dimensions must also match.  Dimensions use the
-exact numeric policy of `gdocs--inline-object-canonical-value': numeric values
-are compared after conversion to double precision with no tolerance, and
-missing dimensions are not preserved.  OT position and decoder/source metadata
-are ignored."
+The stable entity ID is the primary identity.  Once it matches, the object
+kind and the immutable payload must also match: images compare content ID
+and dimensions, chips compare their Google-supplied label.  Dimensions use
+the exact numeric policy of `gdocs--inline-object-canonical-value': numeric
+values are compared after conversion to double precision with no tolerance,
+and missing dimensions are not preserved.  OT position and decoder/source
+metadata are ignored."
   (let ((id-a (gdocs--capability-object-entity-id a))
         (id-b (gdocs--capability-object-entity-id b))
         (object-kind-a (plist-get a :object-kind))
-        (object-kind-b (plist-get b :object-kind))
-        (content-a (plist-get a :content-id))
-        (content-b (plist-get b :content-id)))
+        (object-kind-b (plist-get b :object-kind)))
     (and id-a id-b
          (equal id-a id-b)
          (plist-get a :kind)
          (equal (plist-get a :kind) (plist-get b :kind))
          object-kind-a object-kind-b
          (equal object-kind-a object-kind-b)
-         (stringp content-a) (stringp content-b)
-         (not (string-empty-p content-a))
-         (not (string-empty-p content-b))
-         (equal content-a content-b)
-         (gdocs--inline-object-dimension-equal-p
-          (plist-get a :width) (plist-get b :width))
-         (gdocs--inline-object-dimension-equal-p
-          (plist-get a :height) (plist-get b :height)))))
+         (if (eq object-kind-a :image)
+             (let ((content-a (plist-get a :content-id))
+                   (content-b (plist-get b :content-id)))
+               (and (stringp content-a) (stringp content-b)
+                    (not (string-empty-p content-a))
+                    (not (string-empty-p content-b))
+                    (equal content-a content-b)
+                    (gdocs--inline-object-dimension-equal-p
+                     (plist-get a :width) (plist-get b :width))
+                    (gdocs--inline-object-dimension-equal-p
+                     (plist-get a :height) (plist-get b :height))))
+           ;; Chips carry a label instead of image metadata.
+           (let ((label-a (plist-get a :label))
+                 (label-b (plist-get b :label)))
+             (and (gdocs--valid-chip-label-p label-a)
+                  (gdocs--valid-chip-label-p label-b)
+                  (equal label-a label-b)))))))
 
 (defun gdocs--capability-object-matches-p (object remote-objects)
   "Return non-nil when OBJECT has exactly one matching remote object.
@@ -6264,18 +6513,25 @@ range. Any deletion that overlaps the range touches it."
                    (or (and (> delete-count 0)
                             (<= (car cap-range) end)
                             (<= start (cdr cap-range)))
-                        (and (integerp insert-at)
-                             (> insert-at (car cap-range))
-                             (<= insert-at (cdr cap-range)))))))
+                       (and (integerp insert-at)
+                            (> insert-at (car cap-range))
+                            (<= insert-at (cdr cap-range)))))))
           ranges))))
 
+(defun gdocs--inline-marker-ot-char (object)
+  "Return the single OT placeholder char Google indexes for OBJECT.
+Images use `*'; date/person chips use `gdocs--ot-chip-codepoint'."
+  (if (gdocs--inline-object-is-image-p object)
+      ?* gdocs--ot-chip-codepoint))
+
 (defun gdocs--inline-markers-as-ot-placeholders (text)
-  "Replace local/Org inline-object markers with their OT `*' placeholder.
+  "Replace local/Org inline-object markers with their OT placeholder.
 
 The rendered Org view carries a descriptive line or embedded export token,
-while Google indexes one literal asterisk. This normalization is used only
-for diff anchoring after capability validation; the original local body is
-never rewritten."
+while Google indexes one placeholder codepoint (an asterisk for images, a
+private-use chip codepoint for date/person chips). This normalization is
+used only for diff anchoring after capability validation; the original local
+body is never rewritten."
   (with-temp-buffer
     (let ((org-inhibit-startup t))
       (insert (or text "")))
@@ -6297,22 +6553,25 @@ never rewritten."
                                 (string= (downcase (format "%s" backend))
                                          "gdocs-inline-object")
                                 (not (gdocs--org-element-escaped-p element)))))
-            (when (and (or standalone embedded)
-                       (gdocs--parse-inline-object-spec value))
-              (let ((begin (org-element-property :begin element))
-                    (end (org-element-property :end element)))
-                (when embedded
-                  (setq end (- end (or (org-element-property :post-blank element)
-                                       0))))
-                (when (and standalone (> end begin)
-                           (= (char-before end) ?\n))
-                  (cl-decf end))
-                (push (cons begin end) replacements))))))
+            (let ((parsed (and (or standalone embedded)
+                               (gdocs--parse-inline-object-spec value))))
+              (when parsed
+                (let ((begin (org-element-property :begin element))
+                      (end (org-element-property :end element)))
+                  (when embedded
+                    (setq end (- end (or (org-element-property :post-blank element)
+                                         0))))
+                  (when (and standalone (> end begin)
+                             (= (char-before end) ?\n))
+                    (cl-decf end))
+                  (push (list begin end
+                              (gdocs--inline-marker-ot-char parsed))
+                        replacements)))))))
       (dolist (range (sort replacements
                            (lambda (a b) (> (car a) (car b)))))
-        (delete-region (car range) (cdr range))
+        (delete-region (car range) (cadr range))
         (goto-char (car range))
-        (insert "*"))
+        (insert (char-to-string (nth 2 range))))
       (buffer-string))))
 
 (defun gdocs--push-capability-summary-error (reports reason)
@@ -6577,16 +6836,16 @@ stale buffer-local capability metadata cannot bypass policy."
                (car (gdocs--strip-heading-drawers local-body))))
              (remote-mappable
               (gdocs--inline-markers-as-ot-placeholders remote-body))
-              (incremental-plan
-               (and (eq gdocs-push-backend 'ot-incremental)
-                    (gdocs--incremental-plan-for-state state local-body)))
-              (kind
-               (cond
-                ((eq gdocs-push-backend 'ot-incremental)
-                 (plist-get incremental-plan :kind))
-                ((string= remote-mappable local-stripped) :noop)
-                ((eq gdocs-push-backend 'ot-encode) :full-replace)
-                (t :incremental))))
+             (incremental-plan
+              (and (eq gdocs-push-backend 'ot-incremental)
+                   (gdocs--incremental-plan-for-state state local-body)))
+             (kind
+              (cond
+               ((eq gdocs-push-backend 'ot-incremental)
+                (plist-get incremental-plan :kind))
+               ((string= remote-mappable local-stripped) :noop)
+               ((eq gdocs-push-backend 'ot-encode) :full-replace)
+               (t :incremental))))
         (list :kind kind
               :ranges (cond
                        ((and incremental-plan (eq kind :incremental))
@@ -6610,7 +6869,7 @@ marker are required so unrelated local-marked subtrees remain pushable."
     (goto-char start)
     (let ((found nil))
       (while (and (not found)
-                   (re-search-forward "^\\* Comments[ \t]*$" nil t))
+                  (re-search-forward "^\\* Comments[ \t]*$" nil t))
         (let ((head-bol (line-beginning-position)))
           (forward-line 1)
           (when (looking-at org-property-drawer-re)
@@ -6648,7 +6907,7 @@ return raw length and let the caller decide whether to subtract."
 ;; different rejection class.
 (define-error 'gdocs-save-rejected "gdocs /save returned an error")
 (define-error 'gdocs-save-post-dispatch-failed
-  "gdocs /save failed after dispatch")
+              "gdocs /save failed after dispatch")
 
 (defun gdocs--parse-save-error-body (body)
   "Extract (ERR-CODE . DI) from a /save error response BODY, or (nil . nil).
@@ -6699,7 +6958,7 @@ that causes intermittent code-13 rejections from /save."
                               headers)
                              (list url)))
           (let* ((_ (let ((coding-system-for-write 'utf-8))
-                       (with-temp-file body-file (insert body))))
+                      (with-temp-file body-file (insert body))))
                  (status-string
                   (with-temp-buffer
                     (let ((exit (apply #'call-process "curl" nil t nil args)))
@@ -7760,8 +8019,8 @@ higher values signal an error so the caller reconciles against fresh content."
                                            state-err))
                          (condition-case sig
                              (finish
-                               (gdocs--push-classify-refetched-state
-                                doc-id fresh-state plan body-only)
+                              (gdocs--push-classify-refetched-state
+                               doc-id fresh-state plan body-only)
                               fresh-state nil)
                            (error
                             (finish nil nil
@@ -7828,14 +8087,14 @@ higher values signal an error so the caller reconciles against fresh content."
         (condition-case revision-sig
             (funcall
              callback
-              (list :revision (gdocs--save-response-revision response plan)
+             (list :revision (gdocs--save-response-revision response plan)
                    :state state
                    :plan plan)
              nil)
           (error
            (gdocs--run-op-result-async-reconcile
             doc-id intent plan callback attempt
-             (error-message-string revision-sig) nil t))))
+            (error-message-string revision-sig) nil t))))
        (t
         (let* ((retryable (gdocs--async-throttle-error-p err))
                (failure
@@ -8192,91 +8451,91 @@ reported revision semantics.  BUFFER is where property writes go."
                   (gdocs--diff-prepend remote-mappable local-stripped))
                  (appended
                   (gdocs--diff-append remote-mappable local-stripped)))
-          (cond
-           ;; Full OT bundles use the same intent engine.  A throttle is only
-           ;; retryable when the exact target body can be observed or the
-           ;; exact pre-state is still present for a fresh command rebuild.
-           ((memq gdocs-push-backend '(ot-encode ot-incremental))
-            (let* ((backend gdocs-push-backend)
-                   (initial (gdocs--push-full-plan
-                             doc-id state local-body backend))
-                   (commands (gdocs--push-plan-commands initial)))
-              (if (null commands)
-                  (finalize (plist-get state :revision) nil
-                            (format ", %s (0 ops)" backend))
-                (let ((intent
-                       (gdocs--make-push-intent
-                        state local-body remote-mappable
-                        (lambda (fresh-state _fresh-body)
-                          (gdocs--push-full-plan
-                           doc-id fresh-state local-body backend))
-                        (format "%s" backend))))
-                  (gdocs--run-op-result-async
-                   doc-id state intent
-                   (lambda (result err)
-                     (finalize (and result (plist-get result :revision))
-                               err
-                               (format ", %s (%d ops)"
-                                       backend (length commands)))))))))
-           (prepended
-            (let ((intent
-                   (gdocs--make-push-intent
-                    state local-body remote-mappable
-                    (lambda (fresh-state fresh-body)
-                      (gdocs--push-insert-plan
-                       fresh-state fresh-body prepended :prepend))
-                    "prepend")))
-              (gdocs--run-op-result-async
-               doc-id state intent
-               (lambda (result err)
-                 (when (and result (null err) (buffer-live-p buffer))
-                   (with-current-buffer buffer
-                     (gdocs--shift-buffer-anchors
-                      'is (plist-get (plist-get result :plan) :ot-start)
-                      (length prepended))))
-                 (finalize (and result (plist-get result :revision))
-                           err
-                           (format ", +%d prepended chars"
-                                   (length prepended)))))))
-           ((and appended ot-body)
-            (let ((intent
-                   (gdocs--make-push-intent
-                    state local-body remote-mappable
-                    (lambda (fresh-state fresh-body)
-                      (gdocs--push-insert-plan
-                       fresh-state fresh-body appended :append))
-                    "append")))
-              (gdocs--run-op-result-async
-               doc-id state intent
-               (lambda (result err)
-                 (finalize (and result (plist-get result :revision))
-                           err
-                           (format ", +%d appended chars"
-                                   (length appended)))))))
-           (ot-body
-            (let* ((para-regions
-                    (gdocs--diff-paragraphs remote-mappable local-stripped))
-                   (n-regions (length para-regions)))
-              (cond
-               ((or (zerop n-regions) (= n-regions 1))
-                (let ((single (gdocs--diff-single-region
-                               remote-mappable local-stripped)))
-                  (if single
-                      (gdocs--apply-in-place-region-result-async
-                       doc-id state remote-mappable single buffer local-body
-                       (lambda (result err)
-                         (finalize (and result (plist-get result :revision))
-                                   err nil)))
-                    (finish nil nil))))
-               (t
-                (gdocs--apply-multi-regions-async
-                 doc-id state remote-mappable
-                 (nreverse (copy-sequence para-regions)) buffer
-                 (lambda (rev err) (finalize rev err nil))
-                 local-body)))))
-           (t
-            (finish nil
-                    "edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)")))))))))
+            (cond
+             ;; Full OT bundles use the same intent engine.  A throttle is only
+             ;; retryable when the exact target body can be observed or the
+             ;; exact pre-state is still present for a fresh command rebuild.
+             ((memq gdocs-push-backend '(ot-encode ot-incremental))
+              (let* ((backend gdocs-push-backend)
+                     (initial (gdocs--push-full-plan
+                               doc-id state local-body backend))
+                     (commands (gdocs--push-plan-commands initial)))
+                (if (null commands)
+                    (finalize (plist-get state :revision) nil
+                              (format ", %s (0 ops)" backend))
+                  (let ((intent
+                         (gdocs--make-push-intent
+                          state local-body remote-mappable
+                          (lambda (fresh-state _fresh-body)
+                            (gdocs--push-full-plan
+                             doc-id fresh-state local-body backend))
+                          (format "%s" backend))))
+                    (gdocs--run-op-result-async
+                     doc-id state intent
+                     (lambda (result err)
+                       (finalize (and result (plist-get result :revision))
+                                 err
+                                 (format ", %s (%d ops)"
+                                         backend (length commands)))))))))
+             (prepended
+              (let ((intent
+                     (gdocs--make-push-intent
+                      state local-body remote-mappable
+                      (lambda (fresh-state fresh-body)
+                        (gdocs--push-insert-plan
+                         fresh-state fresh-body prepended :prepend))
+                      "prepend")))
+                (gdocs--run-op-result-async
+                 doc-id state intent
+                 (lambda (result err)
+                   (when (and result (null err) (buffer-live-p buffer))
+                     (with-current-buffer buffer
+                       (gdocs--shift-buffer-anchors
+                        'is (plist-get (plist-get result :plan) :ot-start)
+                        (length prepended))))
+                   (finalize (and result (plist-get result :revision))
+                             err
+                             (format ", +%d prepended chars"
+                                     (length prepended)))))))
+             ((and appended ot-body)
+              (let ((intent
+                     (gdocs--make-push-intent
+                      state local-body remote-mappable
+                      (lambda (fresh-state fresh-body)
+                        (gdocs--push-insert-plan
+                         fresh-state fresh-body appended :append))
+                      "append")))
+                (gdocs--run-op-result-async
+                 doc-id state intent
+                 (lambda (result err)
+                   (finalize (and result (plist-get result :revision))
+                             err
+                             (format ", +%d appended chars"
+                                     (length appended)))))))
+             (ot-body
+              (let* ((para-regions
+                      (gdocs--diff-paragraphs remote-mappable local-stripped))
+                     (n-regions (length para-regions)))
+                (cond
+                 ((or (zerop n-regions) (= n-regions 1))
+                  (let ((single (gdocs--diff-single-region
+                                 remote-mappable local-stripped)))
+                    (if single
+                        (gdocs--apply-in-place-region-result-async
+                         doc-id state remote-mappable single buffer local-body
+                         (lambda (result err)
+                           (finalize (and result (plist-get result :revision))
+                                     err nil)))
+                      (finish nil nil))))
+                 (t
+                  (gdocs--apply-multi-regions-async
+                   doc-id state remote-mappable
+                   (nreverse (copy-sequence para-regions)) buffer
+                   (lambda (rev err) (finalize rev err nil))
+                   local-body)))))
+             (t
+              (finish nil
+                      "edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)")))))))))
 
 (defun gdocs--diff-prepend (remote local)
   "If LOCAL = NEW + REMOTE for some NEW, return NEW; else nil.
@@ -8514,7 +8773,7 @@ operation."
           ;; This runs for every planned attempt, including a retry.
           (gdocs--push-preflight-plan intent current-state plan))
         (cl-labels
-             ((reconcile (failure retryable &optional body-only)
+            ((reconcile (failure retryable &optional body-only)
                (when retryable
                  (gdocs-log
                   'warn
@@ -8530,8 +8789,8 @@ operation."
                           "gdocs: ambiguous save outcome after %s; state refetch failed: %s"
                           (error-message-string failure)
                           (error-message-string fetch-sig))))))
-                  (pcase (gdocs--push-classify-refetched-state
-                          doc-id fresh-state plan body-only)
+                 (pcase (gdocs--push-classify-refetched-state
+                         doc-id fresh-state plan body-only)
                    (:committed
                     (setq result
                           (list :revision (plist-get fresh-state :revision)
@@ -8553,10 +8812,10 @@ operation."
                 (condition-case revision-sig
                     (setq result
                           (list :revision
-                                 (gdocs--save-response-revision response plan)
+                                (gdocs--save-response-revision response plan)
                                 :state current-state
                                 :plan plan))
-                   (error (reconcile revision-sig nil t))))
+                  (error (reconcile revision-sig nil t))))
             ((gdocs-save-rejected gdocs-save-post-dispatch-failed)
              (reconcile err (gdocs--throttle-error-p err)))))))
     result))
@@ -9105,11 +9364,11 @@ completion or error."
   (let* ((done nil)
          (release
           (lambda (err)
-           (unless done
-             (setq done t)
-             (gdocs--sync-release owner)
-             (when err (gdocs-log 'warn "Push %s: %s" doc-id err))
-             t))))
+            (unless done
+              (setq done t)
+              (gdocs--sync-release owner)
+              (when err (gdocs-log 'warn "Push %s: %s" doc-id err))
+              t))))
     (gdocs--fetch-edit-page-async
      doc-id
      (lambda (state html err)
@@ -9414,12 +9673,12 @@ transient network blip doesn't disable auto-sync."
                                  (gdocs-log 'info "Auto-pushing %s (local edits)"
                                             doc-id)
                                  (gdocs-push-remotely doc-id)))))))))))))
-            (error
-             (when (and (= generation gdocs--auto-sync-generation)
-                        (eq token gdocs--auto-sync-in-flight))
-               (setq gdocs--auto-sync-in-flight nil))
-             (gdocs-log 'warn "Auto-sync state fetch failed for %s: %s"
-                        doc-id (error-message-string fetch-error))))))))))
+              (error
+               (when (and (= generation gdocs--auto-sync-generation)
+                          (eq token gdocs--auto-sync-in-flight))
+                 (setq gdocs--auto-sync-in-flight nil))
+               (gdocs-log 'warn "Auto-sync state fetch failed for %s: %s"
+                          doc-id (error-message-string fetch-error))))))))))
 
 (defun gdocs--enable ()
   (gdocs--restore-sync-baseline)

@@ -13,18 +13,26 @@ properly sync.
 
 ## Features
 
-- **Pull** — fetches the current remote content and rewrites the local buffer.
-Headings, paragraphs, bold/italic/code spans, bullet and numbered lists,
-tables, code blocks, and inline image metadata convert to Org equivalents.
-Remote images are represented by explicit remote-object placeholders: standalone
-images use `#+gdocs_inline_object:` and images embedded in prose use
-`@@gdocs-inline-object:image ENTITY WIDTHxHEIGHT content-id=CONTENT@@`; the
-image bytes are not downloaded.
-Comments are pulled into an editable local-only, ephemeral projection. Comments
-with unambiguous anchors get reserved `[fn:gdocs-comment-N]` references, and all
-fetched comments are listed in a local `* Comments` subtree. You may edit that
-projection locally, but only its reserved references and generated subtree are
-stripped before push; ordinary numeric and named Org footnotes remain content.
+- **Pull** — fetches the current remote content and rewrites the local buffer.  
+Headings, paragraphs, bold/italic/code spans, bullet and numbered lists,  
+tables, code blocks, and inline image metadata convert to Org equivalents.  
+Remote images are represented by explicit remote-object placeholders: standalone  
+images use `#+gdocs_inline_object:` and images embedded in prose use  
+`@@gdocs-inline-object:image ENTITY WIDTHxHEIGHT content-id=CONTENT@@`; the  
+image bytes are not downloaded.  
+Date and person smart chips are decoded the same way and rendered as readable  
+placeholders, for example `@@gdocs-inline-object:date ENTITY Sep 24, 2026@@`;  
+the Google-supplied display text is kept as part of the chip's identity, so an  
+edited chip marker is refused on push instead of silently rewritten.  Rendered  
+tables pad their cells so every row shares column widths, and emphasis markers  
+are placed so Org actually parses the result (boundary whitespace moves  
+outside the markers; emphasis that Org could not parse is dropped rather than  
+emitted as literal markup).  
+Comments are pulled into an editable local-only, ephemeral projection. Comments  
+with unambiguous anchors get reserved `[fn:gdocs-comment-N]` references, and all  
+fetched comments are listed in a local `* Comments` subtree. You may edit that  
+projection locally, but only its reserved references and generated subtree are  
+stripped before push; ordinary numeric and named Org footnotes remain content.  
 Pull fails visibly if the remote body already uses the reserved namespace.
 - **Push** — converts the local Org buffer back to Google Docs format and
 writes it remotely. The configured `gdocs-push-backend` determines whether the
@@ -150,6 +158,18 @@ may proceed only when the remote image is matched to its unchanged local
 placeholder and the edit range is proven not to touch it. Image creation,
 deletion, movement, duplication, metadata changes, and ambiguous
 entity-to-placeholder associations remain refused.
+
+Date and person smart chips follow the same policy with `date`/`person` object  
+kinds and the Google-supplied label as the editable-identity field:
+
+```org
+Before @@gdocs-inline-object:date kix.example Sep 24, 2026@@ after
+Owner: @@gdocs-inline-object:person kix.example Jane Doe@@, team.
+```
+
+Chips are pull-only like images: an unchanged chip is preserved by incremental  
+edits that do not touch it, while creating, deleting, moving, or editing a chip  
+marker is refused before any `/save`.
 
 ## Requirements
 
