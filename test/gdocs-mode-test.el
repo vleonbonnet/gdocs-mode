@@ -2883,11 +2883,41 @@ END is the inclusive final OT position."
     (should (string-match-p ":GDOC_REVISION: 12" pull-body))
     (should (string-match-p "^#\\+date: \\[20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]"
                             pull-body))
+    ;; Canonical spacing: one blank line between the sync drawer and
+    ;; the `#+date:' keyword, and one between the keyword and the body.
+    (should (string-match-p ":END:\n\n#\\+date:" pull-body))
+    (should (string-match-p "#\\+date: \\[[^]]*\\]\n\n" pull-body))
     ;; The Drive name is in GDOC_TITLE; only the body Title style is visible.
     (should (= (gdocs-test--count-substring pull-body
                                             "#+title: Synthetic Document")
                1))
     (should (string-suffix-p "Body text\n" pull-body))))
+
+(ert-deftest gdocs-test-ot-decode-pipeline-blank-line-without-date ()
+  "Without a creation date the body still starts after one blank line."
+  (let* ((fixture (gdocs-test--fixture "basic-document"))
+         (body (plist-get fixture :body))
+         (ops (gdocs-test--fixture-ops
+               (list :body body
+                     :paragraph-styles (plist-get fixture :paragraph-styles))))
+         (result (gdocs--ot-decode-pipeline
+                  (plist-get fixture :doc-id)
+                  (gdocs-test--html-for-ops 12 ops)
+                  (list :revision 12
+                        :title (plist-get fixture :title)
+                        :ot-body body)))
+         (pull-body (cdr result)))
+    (should-not (string-match-p "#\\+date:" pull-body))
+    (should (string-match-p ":END:\n\n" pull-body))
+    (should (string-suffix-p "Body text\n" pull-body))))
+
+(ert-deftest gdocs-test-append-comments-section-single-blank ()
+  "Exactly one blank line separates the body from the Comments heading."
+  (let ((comments '((1 :text "Root" :anchor "kix.comment"))))
+    (should (equal (gdocs--append-comments-section "Body text" comments)
+                   "Body text\n\n* Comments\n:PROPERTIES:\n:GDOC_LOCAL: t\n:END:\n\n[fn:gdocs-comment-1] Root\n"))
+    (should (equal (gdocs--append-comments-section "Body text" nil)
+                   "Body text"))))
 
 (ert-deftest gdocs-test-pipeline-drive-title-without-body-title ()
   "A Drive name does not create a synthetic Org title keyword."

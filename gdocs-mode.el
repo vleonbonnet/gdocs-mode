@@ -728,6 +728,15 @@ ephemeral local projection that the next pull regenerates)."
     (sort comments :key #'car)
     "")))
 
+(defun gdocs--append-comments-section (body comments)
+  "Return BODY with the rendered COMMENTS section appended.
+Exactly one blank line separates the body from the `* Comments'
+heading; without comments BODY passes through unchanged."
+  (if comments
+      (concat (string-trim-right body) "\n"
+              (gdocs--render-comments-section comments))
+    body))
+
 ;;; Public commands — pull
 
 (defun gdocs--parse-model-chunks-raw (html)
@@ -5446,9 +5455,14 @@ CREATION-TIME-MS is non-nil) a `#+date:' line, ready for
          (org-content (gdocs-dm-to-org doc))
          (date-str (gdocs--format-creation-date creation-time-ms))
          (header
+          ;; Canonical spacing: one blank line between the sync drawer
+          ;; and the `#+date:' keyword, and one between the keyword and
+          ;; the body — the same padding `gdocs-dm-to-org' gives its
+          ;; own title keywords.
           (concat
+           (when date-str "\n")
            (when date-str (format "#+date: %s\n" date-str))
-           (when date-str "\n")))
+           "\n"))
          (titled (concat header org-content))
          (effective-title (or edit-title doc-id))
          ;; Hash only the text that can be sent back to Google. The date,
@@ -5957,13 +5971,8 @@ modelChunk we need for the op stream. Comments live in the cookie-auth
                                             body ot-body anchor-map comments)
                                          body))
                                       (final
-                                       (if comments
-                                           (concat
-                                            (string-trim-right body-with-refs)
-                                            "\n\n"
-                                            (gdocs--render-comments-section
-                                             comments))
-                                         body-with-refs)))
+                                       (gdocs--append-comments-section
+                                        body-with-refs comments)))
                                  (gdocs--apply-pull-into-buffer
                                   doc-id buf title final snapshot
                                   (plist-get state :revision))
