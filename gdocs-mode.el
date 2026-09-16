@@ -110,6 +110,23 @@ documents only have the initial tab \"t.0\"."
   :type 'string
   :group 'gdocs-mode)
 
+(defconst gdocs-save-build-header
+  "editors.documents-frontend_20260909.00_p1"
+  "Fallback X-Build header value for /save requests.
+
+The live value is taken from the document page's own `buildLabel'; this
+fallback covers synthetic states without one.  Update it (or rely on the
+page value) when Google rotates the editors frontend.")
+
+(defcustom gdocs-save-send-sid nil
+  "Include the persisted session sid in /save requests.
+
+The 2026-05 frontend required it; Google's current editors frontend
+rejects an unknown session id with HTTP 400 (err 3), while omitting the
+parameter saves fine.  The bundle-internal sid is unaffected."
+  :type 'boolean
+  :group 'gdocs-mode)
+
 (defcustom gdocs-auto-sync-interval 5
   "Idle interval in seconds for background pull checks."
   :type 'integer
@@ -6041,12 +6058,12 @@ fed straight into OT-position arithmetic."
 (defun gdocs--parse-edit-state-html (html)
   "Extract the edit-state plist from an /edit page HTML string.
 Returns a plist (:title :token :ouid :revision :smv :smb-seg :ot-body
-:ot-ops :unsupported). The capability fields are derived from this HTML,
-not from buffer-local metadata.
+:ot-ops :build-label :unsupported). The capability fields are derived
+from this HTML, not from buffer-local metadata.
 Any field may be nil if not present. Returns nil if HTML is nil."
   (when html
     (let ((title nil) (token nil) (ouid nil) (revision nil)
-          (smv nil) (smb-seg nil) (ot-body nil))
+          (smv nil) (smb-seg nil) (ot-body nil) (build-label nil))
       (when (string-match "<title[^>]*>\\([^<]*\\)</title>" html)
         (let ((raw (string-trim (match-string 1 html))))
           (setq title
@@ -6070,7 +6087,19 @@ Any field may be nil if not present. Returns nil if HTML is nil."
       (when (string-match
              "\"docs-smfb\"[ \t]*:[ \t]*\\[[ \t]*[0-9]+[ \t]*,[ \t]*\"\\([^\"]+\\)\"\\]"
              html)
-        (setq smb-seg (match-string 1 html)))
+        ;; The regex captures the raw JSON literal including \uXXXX escapes
+        ;; (the segment is base64 whose `=' signs arrive as \u003d).  Decode
+        ;; them by reading the value as a JSON string; leaving them in makes
+        ;; /save double-escape the segment and reject with 400/err 3.
+        (setq smb-seg
+              (condition-case _
+                  (let ((json-array-type 'list)
+                        (json-object-type 'alist))
+                    (json-read-from-string
+                     (concat "\"" (match-string 1 html) "\"")))
+                (error (match-string 1 html)))))
+      (when (string-match "\"buildLabel\"[ \t]*:[ \t]*\"\\([^\"]+\\)\"" html)
+        (setq build-label (match-string 1 html)))
       (let ((mc (gdocs--parse-model-chunk html))
             (full (gdocs--parse-model-chunk-full html)))
         (setq ot-body (plist-get mc :ot-body))
@@ -6082,6 +6111,7 @@ Any field may be nil if not present. Returns nil if HTML is nil."
           (list :title title :token token :ouid ouid :revision revision
                 :smv smv :smb-seg smb-seg :ot-body ot-body
                 :ot-ops ops
+                :build-label build-label
                 :inline-objects (plist-get analysis :objects)
                 :unsupported (plist-get analysis :unsupported)))))))
 
@@ -7533,10 +7563,12 @@ of OT ops (alists). Returns parsed JSON response (XSSI-stripped)."
          ;; from `docs-smv' / `docs-smfb' on the /edit page. Without them
          ;; Google's OT engine rejects multi-char ops with 550/code 13.
          (smb-pair (if smb-seg
-                       (format "[%d, %s]" smv smb-seg)
+                       (format "[%d, \"%s\"]" smv smb-seg)
                      (format "[%d]" smv)))
          (qs (concat "id=" doc-id
-                     "&sid=" sid
+                     ;; The current editors frontend rejects unknown
+                     ;; session ids with HTTP 400; send it only when asked.
+                     (if gdocs-save-send-sid (concat "&sid=" sid) "")
                      "&vc=1&c=1&w=1&flr=0"
                      (format "&smv=%d" smv)
                      "&smb=" (url-hexify-string smb-pair)
@@ -7558,13 +7590,14 @@ of OT ops (alists). Returns parsed JSON response (XSSI-stripped)."
          ;; The X-Rel-Id / X-Build / X-Client-Deadline-Ms triple is the
          ;; browser-fingerprint set the editors frontend sends; Google
          ;; uses it as a "real client" heuristic and 550s without it.
-         ;; Values are stable placeholders — they don't need to match a
-         ;; specific release.
+         ;; X-Build prefers the document page's own `buildLabel' and falls
+         ;; back to `gdocs-save-build-header'.
          (headers (append
                    `(("Content-Type" . "application/x-www-form-urlencoded;charset=utf-8")
                      ("X-Same-Domain" . "1")
                      ("X-Rel-Id" . "30a.558e52c.s")
-                     ("X-Build" . "editors.documents-frontend_20260513.00_p2")
+                     ("X-Build" . ,(or (plist-get state :build-label)
+                                       gdocs-save-build-header))
                      ("X-Client-Deadline-Ms" . "20000")
                      ("Origin" . "https://docs.google.com")
                      ("Referer" . ,(format "https://docs.google.com/document/d/%s/edit" doc-id))
@@ -7811,7 +7844,7 @@ the `reqid' param is omitted (matches the session-init POST)."
          (smv (or (plist-get state :smv) 2147483647))
          (smb-seg (plist-get state :smb-seg))
          (smb-pair (if smb-seg
-                       (format "[%d, %s]" smv smb-seg)
+                       (format "[%d, \"%s\"]" smv smb-seg)
                      (format "[%d]" smv))))
     (concat (when doc-id (format "id=%s&" doc-id))
             (when reqid (format "reqid=%d&" reqid))
@@ -7984,10 +8017,12 @@ On curl error, ERR is a string."
          (req-id (gdocs--session-next-reqid))
          (sid gdocs--session-sid)
          (smb-pair (if smb-seg
-                       (format "[%d, %s]" smv smb-seg)
+                       (format "[%d, \"%s\"]" smv smb-seg)
                      (format "[%d]" smv)))
          (qs (concat "id=" doc-id
-                     "&sid=" sid
+                     ;; The current editors frontend rejects unknown
+                     ;; session ids with HTTP 400; send it only when asked.
+                     (if gdocs-save-send-sid (concat "&sid=" sid) "")
                      "&vc=1&c=1&w=1&flr=0"
                      (format "&smv=%d" smv)
                      "&smb=" (url-hexify-string smb-pair)
@@ -8010,7 +8045,8 @@ On curl error, ERR is a string."
                    `(("Content-Type" . "application/x-www-form-urlencoded;charset=utf-8")
                      ("X-Same-Domain" . "1")
                      ("X-Rel-Id" . "30a.558e52c.s")
-                     ("X-Build" . "editors.documents-frontend_20260513.00_p2")
+                     ("X-Build" . ,(or (plist-get state :build-label)
+                                       gdocs-save-build-header))
                      ("X-Client-Deadline-Ms" . "20000")
                      ("Origin" . "https://docs.google.com")
                      ("Referer" . ,(format "https://docs.google.com/document/d/%s/edit" doc-id))
@@ -8493,6 +8529,23 @@ higher values signal an error so the caller reconciles against fresh content."
                   (plist-get plan :post-revision)))
     expected))
 
+(defun gdocs--save-response-xsrf-token (response)
+  "Return the rotated XSRF token carried by an HTTP 200 RESPONSE.
+
+When another client (for example an open browser tab auto-saving the
+same document) consumed the session's save token, the server answers 200
+with an `er' entry of the shape [\"er\" \"XSRF\" nil nil NEW-TOKEN 200 …]
+and no revision metadata.  The save is NOT committed; the new token is
+the current one and the request may be retried with it."
+  (when (listp response)
+    (let* ((er-cell (seq-find
+                     (lambda (entry)
+                       (and (listp entry) (equal (car entry) "er")
+                            (equal (nth 1 entry) "XSRF")
+                            (stringp (nth 4 entry))))
+                     response)))
+      (and er-cell (nth 4 er-cell)))))
+
 (defun gdocs--async-throttle-error-p (err)
   "Return non-nil when async ERR has the structured throttle shape."
   (and (listp err)
@@ -8587,17 +8640,33 @@ higher values signal an error so the caller reconciles against fresh content."
   (condition-case sig
       (cond
        ((null err)
-        (condition-case revision-sig
-            (funcall
-             callback
-             (list :revision (gdocs--save-response-revision response plan)
-                   :state state
-                   :plan plan)
-             nil)
-          (error
-           (gdocs--run-op-result-async-reconcile
-            doc-id intent plan callback attempt
-            (error-message-string revision-sig) nil t))))
+        (let ((xsrf-token (gdocs--save-response-xsrf-token response)))
+          (cond
+           ;; Another client consumed the save token; the server rotated it.
+           ;; Retry the whole intent with the rotated token — the save never
+           ;; committed, so the plan replans against the unchanged body.
+           ((and xsrf-token (< attempt 5))
+            (gdocs-log
+             'info
+             "/save token rotated by a concurrent client (attempt %d); retrying"
+             attempt)
+            (gdocs--run-op-result-async-step
+             doc-id (plist-put (copy-sequence state) :token xsrf-token)
+             intent callback (1+ attempt)))
+           ((and xsrf-token (>= attempt 5))
+            (funcall callback nil "gdocs: /save token kept rotating; giving up"))
+           (t
+            (condition-case revision-sig
+                (funcall
+                 callback
+                 (list :revision (gdocs--save-response-revision response plan)
+                       :state state
+                       :plan plan)
+                 nil)
+              (error
+               (gdocs--run-op-result-async-reconcile
+                doc-id intent plan callback attempt
+                (error-message-string revision-sig) nil t)))))))
        (t
         (let* ((retryable (gdocs--async-throttle-error-p err))
                (failure

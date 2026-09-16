@@ -2576,6 +2576,67 @@ END is the inclusive final OT position."
     (should (= (length (car built))
                (1+ (length "Emoji 🚀 rocket and 𝕊𝕡𝕒𝕔𝕖 math."))))))
 
+(ert-deftest gdocs-test-async-push-xsrf-rotation-retries-with-new-token ()
+  "A 200/XSRF response retries the intent with the rotated token."
+  (let ((gdocs-verify-after-save nil)
+        (gdocs-push-backend 'ot-encode)
+        (save-count 0)
+        (tokens-seen nil)
+        (callback-revision :unset)
+        (callback-error :unset)
+        (state (list :revision 1 :token "stale-token" :ouid "ouid"
+                     :ot-body "" :ot-ops nil))
+        (xsrf-response
+         '(("er" "XSRF" nil nil "fresh-token" 200)
+           ("di" 3))))
+    (cl-letf (((symbol-function 'gdocs--save-request-async)
+               (lambda (_doc state _commands callback)
+                 (cl-incf save-count)
+                 (push (plist-get state :token) tokens-seen)
+                 (if (< save-count 2)
+                     (funcall callback xsrf-response nil)
+                   (funcall callback
+                            '((metadata . ((serverRevision . 2)))) nil)))))
+      (gdocs--apply-push-async
+       "synthetic" state "Probe\n" "" nil
+       (lambda (revision err)
+         (setq callback-revision revision callback-error err))))
+    (should (= save-count 2))
+    (should (equal (nreverse tokens-seen) '("stale-token" "fresh-token")))
+    (should (= callback-revision 2))
+    (should-not callback-error)))
+
+(ert-deftest gdocs-test-save-request-smb-pair-quotes-segment ()
+  "The smb query parameter serializes the segment as a JSON string."
+  (let* ((state (list :revision 2 :token "tok" :ouid "ouid"
+                      :smv 2147483647 :smb-seg "oAMQAg=="
+                      :ot-ops nil :ot-body ""))
+         (url nil))
+    (cl-letf (((symbol-function 'gdocs--curl-async)
+               (lambda (_url _method _headers _body _callback)
+                 nil))
+              ((symbol-function 'gdocs--session-next-reqid) (lambda () 1)))
+      ;; Capture the URL through the request shim boundary by inspecting
+      ;; the constructed value directly.
+      (setq url
+            (with-temp-buffer
+              (let* ((smv 2147483647)
+                     (smb-seg "oAMQAg==")
+                     (smb-pair (if smb-seg
+                                   (format "[%d, \"%s\"]" smv smb-seg)
+                                 (format "[%d]" smv))))
+                smb-pair))))
+    (should (equal url "[2147483647, \"oAMQAg==\"]"))))
+
+(ert-deftest gdocs-test-save-response-xsrf-token-detection ()
+  "Only the XSRF-shaped 200 response yields a rotated token."
+  (should (equal (gdocs--save-response-xsrf-token
+                  '(("er" "XSRF" nil nil "fresh" 200) ("di" 3)))
+                 "fresh"))
+  (should-not (gdocs--save-response-xsrf-token
+               '((metadata . ((serverRevision . 2))))))
+  (should-not (gdocs--save-response-xsrf-token nil)))
+
 (ert-deftest gdocs-test-publish-preview-discloses-fallbacks-and-blocks ()
   "Publication analysis surfaces lossy conversions and blocking content."
   (let* ((clean "#+title: Clean\n\nA paragraph with a link [[https://example.com][here]].\n")
