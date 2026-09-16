@@ -239,6 +239,20 @@ conflict has disappeared and later recurs.")
 (defvar-local gdocs--pull-generation 0
   "Identity of the most recently dispatched pull for this buffer.")
 
+(defvar-local gdocs--auto-sync-failures 0
+  "Consecutive failed auto-sync ticks in this buffer.
+
+Each failure doubles the next tick's delay (capped at ten minutes);
+a successful pull or push resets it.  Stops the every-5-seconds
+warning spam when Google rate-limits the session or the network is
+down.")
+
+(defun gdocs--auto-sync-delay ()
+  "Seconds until the next auto-sync tick, with exponential backoff."
+  (min (* gdocs-auto-sync-interval
+          (expt 2 (max 0 gdocs--auto-sync-failures)))
+       600))
+
 (define-error 'gdocs-pull-conflict "GDocs pull conflict")
 
 
@@ -1591,6 +1605,13 @@ gets to reuse the URL from a neighboring range."
                    (action (gdocs--link-sm-action (alist-get 'sm op nil)))
                    (kind (plist-get action :action)))
               (cond
+               ;; The annotation envelopes Google emits around saved ranges
+               ;; (e.g. a link-clear op whose ei is one past the body) are
+               ;; bookkeeping, not malformed data: skip them silently.
+               ((and (gdocs--capability-annotation-op-empty-p
+                      (alist-get 'sm op nil))
+                     (>= ei (1- body-len)))
+                nil)
                ((not (and (integerp si) (integerp ei)
                           (<= 1 si) (<= si ei) (<= ei body-len)))
                 (gdocs-log 'warn
@@ -10721,16 +10742,18 @@ Local-edit detection uses a buffer-local hash baseline refreshed by
 `buffer-modified-p', which doesn't fire for programmatic inserts and
 isn't reliable in temp/indirect buffers).
 
-Fully async; the outer timer is re-armed regardless of outcome so a
-transient network blip doesn't disable auto-sync."
+Fully async; the timer re-arms with an adaptive backoff so a transient
+network blip or Google rate limit doesn't spam warnings every interval."
   (when (and (bound-and-true-p gdocs-mode)
              (gdocs--has-id-p)
              (not gdocs--sync-mutex))
     (let ((doc-id (gdocs--doc-id-from-buffer)))
       (if (eq (gdocs--sync-state) 'unknown)
-          (gdocs-log 'warn
-                     "Auto-sync skipped for %s: synchronization baseline unavailable; run `gdocs-pull-locally' or `gdocs-push-remotely' manually"
-                     doc-id)
+          (progn
+            (cl-incf gdocs--auto-sync-failures)
+            (gdocs-log 'warn
+                       "Auto-sync skipped for %s: synchronization baseline unavailable; run `gdocs-pull-locally' or `gdocs-push-remotely' manually"
+                       doc-id))
         (let ((buf (current-buffer))
               (generation gdocs--auto-sync-generation)
               (token (list nil)))
@@ -10748,13 +10771,15 @@ transient network blip doesn't disable auto-sync."
                          (setq gdocs--auto-sync-in-flight nil)
                          (cond
                           (err
+                           (cl-incf gdocs--auto-sync-failures)
                            (gdocs-log 'warn
-                                      "Auto-sync state fetch failed for %s: %s"
-                                      doc-id err))
+                                      "Auto-sync state fetch failed for %s (next tick in %ss): %s"
+                                      doc-id (gdocs--auto-sync-delay) err))
                           ((null state)
+                           (cl-incf gdocs--auto-sync-failures)
                            (gdocs-log 'warn
-                                      "Auto-sync skipped for %s: remote revision unavailable"
-                                      doc-id))
+                                      "Auto-sync skipped for %s: remote revision unavailable (next tick in %ss)"
+                                      doc-id (gdocs--auto-sync-delay)))
                           (t
                            (let* ((remote-rev (plist-get state :revision))
                                   (local-rev
@@ -10781,9 +10806,11 @@ transient network blip doesn't disable auto-sync."
                                           "Auto-sync skipped for %s: synchronization baseline unavailable; run `gdocs-pull-locally' or `gdocs-push-remotely' manually"
                                           doc-id))
                               ((not have-revs)
+                               (cl-incf gdocs--auto-sync-failures)
                                (gdocs-log 'warn
-                                          "Auto-sync skipped for %s: revision unavailable (remote=%S local=%S)"
-                                          doc-id remote-rev local-rev))
+                                          "Auto-sync skipped for %s: revision unavailable (remote=%S local=%S; next tick in %ss)"
+                                          doc-id remote-rev local-rev
+                                          (gdocs--auto-sync-delay)))
                               ((and stale dirty)
                                (unless (equal gdocs--auto-sync-conflict-revision
                                               remote-rev-number)
@@ -10797,6 +10824,7 @@ transient network blip doesn't disable auto-sync."
                                ;; A valid non-conflicting state means an earlier conflict
                                ;; no longer applies, even if the subsequent sync fails.
                                (setq gdocs--auto-sync-conflict-revision nil)
+                               (setq gdocs--auto-sync-failures 0)
                                (cond
                                 (stale
                                  (gdocs-pull-locally
@@ -10814,8 +10842,10 @@ transient network blip doesn't disable auto-sync."
                (when (and (= generation gdocs--auto-sync-generation)
                           (eq token gdocs--auto-sync-in-flight))
                  (setq gdocs--auto-sync-in-flight nil))
-               (gdocs-log 'warn "Auto-sync state fetch failed for %s: %s"
-                          doc-id (error-message-string fetch-error))))))))))
+               (cl-incf gdocs--auto-sync-failures)
+               (gdocs-log 'warn "Auto-sync state fetch failed for %s (next tick in %ss): %s"
+                          doc-id (gdocs--auto-sync-delay)
+                          (error-message-string fetch-error))))))))))
 
 (defun gdocs--enable ()
   (gdocs--restore-sync-baseline)
@@ -10827,26 +10857,34 @@ transient network blip doesn't disable auto-sync."
   (let* ((buf (current-buffer))
          (generation gdocs--auto-sync-generation)
          (timer nil))
-    (setq timer
-          (run-with-timer
-           gdocs-auto-sync-interval
-           gdocs-auto-sync-interval
-           (lambda ()
-             (if (buffer-live-p buf)
-                 (with-current-buffer buf
-                   (if (and (bound-and-true-p gdocs-mode)
-                            (= generation gdocs--auto-sync-generation)
-                            (eq timer gdocs--sync-timer))
-                       (gdocs--auto-sync-tick)
-                     (when timer (cancel-timer timer))))
-               (when timer (cancel-timer timer))))))
+    (cl-labels
+        ((arm ()
+           ;; Self-re-arming (non-repeating) timer: the delay is
+           ;; recomputed every cycle so consecutive failures back off
+           ;; exponentially (see `gdocs--auto-sync-delay').
+           (setq timer
+                 (run-with-timer
+                  (gdocs--auto-sync-delay)
+                  nil
+                  (lambda ()
+                    (if (and (buffer-live-p buf)
+                             (with-current-buffer buf
+                               (and (bound-and-true-p gdocs-mode)
+                                    (= generation gdocs--auto-sync-generation)
+                                    (eq timer gdocs--sync-timer))))
+                        (progn
+                          (gdocs--auto-sync-tick)
+                          (arm))
+                      (when timer (cancel-timer timer))))))))
+      (arm))
     (setq gdocs--sync-timer timer)
     (add-hook 'kill-buffer-hook #'gdocs--disable nil t))
   (gdocs-log 'info "gdocs-mode enabled"))
 
 (defun gdocs--disable ()
   (cl-incf gdocs--auto-sync-generation)
-  (setq gdocs--auto-sync-in-flight nil)
+  (setq gdocs--auto-sync-in-flight nil
+        gdocs--auto-sync-failures 0)
   (when gdocs--sync-timer
     (cancel-timer gdocs--sync-timer)
     (setq gdocs--sync-timer nil))
