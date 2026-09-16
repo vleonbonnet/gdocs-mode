@@ -288,6 +288,9 @@ a documented OAuth-capable API.
 | `gdocs-push-remotely` | Push local Org changes back to the remote document.            |
 | `gdocs-out-of-date`   | Check whether the remote document has advanced.                |
 | `gdocs-mode`          | The Org minor mode that ties pull/push/auto-sync together.     |
+| `gdocs-publish-file`  | Publish a source Org file as the body of a Google Doc (one-way projection). |
+| `gdocs-publish-preview` | Show the conversion preview, disclosed fallbacks, and blocking content for a source file. |
+| `gdocs-publish-check` | Compare a source file with its published document (read-only drift check). |
 | `gdocs-session-reset` | Delete the persisted `/save` SID/request-id session and create a new one on the next push. |
 | `gdocs-recon-dump` | Write read-only OT reconstruction and summary dumps to unpredictable mode-0600 temporary files. |
 | `gdocs-debug-comments-fetch` | Fetch comments into `*gdocs-comments-debug*` for diagnostics; does not push. |
@@ -311,6 +314,14 @@ performs an initial pull. `gdocs-mode` auto-enables in any Org buffer that
 carries a `GDOC_ID` property, and the mode line shows an indicator while it is
 active.
 
+### Source-file publication (one-way Org → Google Docs)
+
+For documents whose source of truth is a plain Org file (not a synced buffer), `gdocs-publish-file` publishes it as the full body of a Google Doc. The source file is never modified; the Google Doc is a projection.
+
+The command: converts the source and refuses blocking unsupported content; discloses lossy conversions before writing (quotes, source-block languages, footnotes-as-text, …) and confirms them interactively; refuses to overwrite a document whose non-empty body was never published from that source (pass FORCE deliberately); refuses a remote revision newer than the last recorded publish; runs the standard capability preflight against the freshly fetched remote state; refetches after the commit and verifies the body when `gdocs-verify-after-save` (default t); records the association and last revision in `gdocs-publish-registry-file`, and refreshes a synchronized buffer for the document, if one is open.
+
+`gdocs-publish-preview` shows the conversion result without any network I/O. `gdocs-publish-check` compares the source against the published document and reports `:in-sync`, `:drift`, `:stale-revision`, or `:unpublished`.
+
 ### Buffer metadata
 
 These properties are maintained on the top-level node of every synced buffer:
@@ -329,6 +340,9 @@ These properties are maintained on the top-level node of every synced buffer:
 |---------------------------|-------------|----------------------------------------------------------|
 | `gdocs-auth-function`     | `nil`       | Returns the HTTP auth headers (see above). **Required.** |
 | `gdocs-push-backend`      | `ot-encode` | Push strategy; see [Push backends](#push-backends).      |
+| `gdocs-verify-after-save` | `t`         | Refetch after a committed OT save and verify the body.   |
+| `gdocs-docs-tab`          | `"t.0"`     | Google Docs tab identifier for `/save` and comment requests. |
+| `gdocs-publish-registry-file` | `~/.emacs.d/gdocs-publish-registry.el` | Source-file → document publication registry. |
 | `gdocs-auto-sync-interval`| `5`         | Seconds between periodic background sync checks.         |
 | `gdocs-log-level`         | `warn`      | One of `debug`, `info`, `warn`, `error`.                |
 | `gdocs-session-file`      | `$XDG_CACHE_HOME/gdocs-mode/session.eld`, or `~/.cache/gdocs-mode/session.eld` | Where the persistent `/save` SID + request id are kept. |
@@ -398,14 +412,10 @@ and compilation prerequisites even when invoked with `make -j check`.
 and requires browser-session cookie authentication. OAuth bearer tokens can be
 used for reads but do not support `/save`; there is no hardened credential story
 yet.
-- **Format fidelity is best-effort.** Headings, paragraphs, inline emphasis,
-lists, tables, and code blocks round-trip. Inline images are pull-only
-placeholders; downloading, uploading, moving, replacing, and deleting them
-through push are unsupported except for safe incremental text edits that prove
-the image was left untouched. Comments are pulled as an editable local-only footnote and `* Comments`
-projection. It is stripped before push, local edits are never sent to Google, and
-the next pull regenerates it from remote comments.
-Suggestions and column layouts remain out of scope.
+- **Format fidelity is best-effort.** Headings, paragraphs, inline emphasis, lists, tables, and code blocks round-trip.
+- **Disclosed fallbacks, not silent loss.** Blocks the remote model cannot represent (quote/verse/center/example/special blocks, footnote definitions, horizontal rules, fixed-width lines) keep their text as ordinary content with a disclosed fallback instead of disappearing. Inline leaves (timestamps, entities, LaTeX fragments, footnote references, macros) are literalized in prose. Source-block language, checkbox structure inside lists, and rich Google-only formatting have no faithful round trip.
+- **Inline images are pull-only placeholders.** Downloading, uploading, moving, replacing, and deleting them through push are unsupported except for safe incremental text edits that prove the image was left untouched.
+- **Comments** are pulled as an editable local-only footnote and `* Comments` projection, stripped before push, and regenerated from remote comments on the next pull; local edits are never sent to Google. Suggestions and column layouts remain out of scope.
 - **Rate limiting.** Google's `/save` endpoint rejects malformed or
 excessively bursty requests; the mode persists a session SID to look like a
 single stable client.

@@ -91,6 +91,25 @@ is preserved."
                  (const :tag "OT incremental (paragraph diff)" ot-incremental))
   :group 'gdocs-mode)
 
+(defcustom gdocs-verify-after-save t
+  "Refetch the document after a committed OT save and verify its body.
+
+When non-nil, every successful `ot-encode' / `ot-incremental' push is
+followed by one /edit refetch whose decoded body must equal the expected
+round-trip render of the pushed model; a mismatch is reported as an error
+instead of a clean sync.  Set to nil to restore the older behavior of
+trusting the /save response revision alone."
+  :type 'boolean
+  :group 'gdocs-mode)
+
+(defcustom gdocs-docs-tab "t.0"
+  "Google Docs tab identifier used in /save and comment requests.
+
+The browser protocol addresses one tab of a multi-tab document.  Most
+documents only have the initial tab \"t.0\"."
+  :type 'string
+  :group 'gdocs-mode)
+
 (defcustom gdocs-auto-sync-interval 5
   "Idle interval in seconds for background pull checks."
   :type 'integer
@@ -786,8 +805,11 @@ OT-position for any doc with structure."
               (when (and (listp op) (equal (cdr (assq 'ty op)) "is")
                          (stringp (cdr (assq 's op))))
                 (setq body (concat body (cdr (assq 's op))))))))
-        (when (length> body 0)
-          (list :ot-body body :revision rev))))))
+        ;; Chunks were found, so the snapshot is valid even when no `is' op
+        ;; carried text: that is a genuinely empty body.  Returning nil here
+        ;; is reserved for "no model chunks at all" (a failed parse), which
+        ;; callers must never treat as an empty document.
+        (list :ot-body body :revision rev)))))
 
 (defun gdocs--parse-model-chunk-full (html)
   "Like `gdocs--parse-model-chunk' but returns the entire op stream
@@ -962,6 +984,7 @@ caller's `gdocs-auth-function' is used."
 (defsubst gdocs-dm-title (doc) (plist-get doc :title))
 (defsubst gdocs-dm-inline-objects (doc) (plist-get doc :inline-objects))
 (defsubst gdocs-dm-unsupported (doc) (plist-get doc :unsupported))
+(defsubst gdocs-dm-lossy (doc) (plist-get doc :lossy))
 
 ;; The registry describes wire-level recognition only.  A recognized key is
 ;; not necessarily a supported capability: the value-policy tables below
@@ -985,13 +1008,22 @@ caller's `gdocs-auth-function' is used."
      ("paragraph" . :recognized)
      ("list" . :recognized)
      ("tbl" . :recognized)
-     ("doco_anchor" . :recognized-not-editable)))
+     ("doco_anchor" . :recognized-not-editable)
+     ("document" . :document-settings)
+     ("headings" . :document-settings)
+     ("language" . :document-settings)))
   "Central registry for raw Google Docs OT constructs.
 
 The values describe wire-level recognition, not push safety.  Semantic value
 support is defined by the capability policy tables, because recognizing a
 field name alone does not prove that its value survives a decode/encode
-round-trip.")
+round-trip.
+
+`:document-settings' marks attribute types that describe the document as a
+whole (initial heading styles, document flags, spell-check language).  Google
+sends them as zero-width `as' operations outside the OT body text, so a body
+replacement does not remove them; see
+`gdocs--capability-document-attribute-types'.")
 
 (defun gdocs--capability-classify (category value)
   "Return the registry classification for CATEGORY and VALUE.
@@ -1098,6 +1130,22 @@ would otherwise be silently replaced by one of these mappings.")
 (defconst gdocs--capability-default-vertical-alignment "nor")
 (defconst gdocs--capability-default-text-weight 400)
 
+(defconst gdocs--capability-document-attribute-types
+  '("document" "headings" "language")
+  "Attribute types Google scopes to the whole document.
+
+They are emitted as zero-width `as' operations (`si' equals `ei') whose
+range lies outside the replaced body text.  Body deletion and insertion
+therefore cannot discard them, so the capability scanner reports them as
+informational instead of destructive.  A non-zero-width operation carrying
+one of these types is NOT understood and stays fail-closed.")
+
+(defun gdocs--capability-document-settings-p (style op)
+  "Return non-nil when STYLE is a document-scoped type on a zero-width OP."
+  (and (member style gdocs--capability-document-attribute-types)
+       (listp op)
+       (equal (alist-get 'si op) (alist-get 'ei op))))
+
 (defun gdocs--capability-font-family-style (family)
   "Return the exact Org style represented by FONT or nil.
 
@@ -1121,7 +1169,9 @@ no Org inline marker."
                    (:structural-codepoint . "unhandled structural codepoint")
                    (:comment-anchor . "comment anchor")
                    (:local-unsupported . "local unsupported-content marker")
-                   (:unsupported-entity . "unsupported entity"))))
+                   (:unsupported-entity . "unsupported entity")
+                   (:document-settings . "document setting")
+                   (:lossy-fallback . "disclosed fallback"))))
       (replace-regexp-in-string "-" " " (symbol-name kind))))
 
 (defun gdocs--capability-plural-label (kind)
@@ -1137,6 +1187,8 @@ no Org inline marker."
     (:comment-anchor "comment anchors")
     (:local-unsupported "local unsupported-content markers")
     (:unsupported-entity "unsupported entities")
+    (:document-settings "document settings")
+    (:lossy-fallback "disclosed fallbacks")
     (_ (concat (gdocs--capability-kind-label kind) "s"))))
 
 (defun gdocs--capability-report (kind explanation &rest props)
@@ -2658,6 +2710,30 @@ report. Inline image reports are produced by
                                  :attribute style))
                    (sm (alist-get 'sm op)))
               (cond
+               ;; Document-scoped settings are zero-width `as' operations
+               ;; outside the replaced body.  Recognized types are reported
+               ;; informationally; they never block push because body
+               ;; commands cannot remove them.  A non-zero-width operation
+               ;; carrying one of these types is not understood and is
+               ;; refused like any other unknown feature.
+               ((eq style-class :document-settings)
+                (if (gdocs--capability-document-settings-p style op)
+                    (push (gdocs--capability-report-for-op
+                           :document-settings
+                           "Document-level settings live outside the replaced body and are not affected by push."
+                           op :feature-type (if (stringp style)
+                                                style "document-settings")
+                           :severity :informational
+                           :preserve-untouched t
+                           :refuse-push nil
+                           :push-policy :allow-push)
+                          reports)
+                  (push (gdocs--capability-report-for-op
+                         :unknown-feature
+                         "A document-level attribute has an unexpected range and would be removed by a full replacement."
+                         op :feature-type (if (stringp style) style "unknown")
+                         :refuse-push t)
+                        reports)))
                ((eq style-class :unknown)
                 (push (gdocs--capability-report-for-op
                        :unknown-feature
@@ -4214,9 +4290,13 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                          (and visible-fallback
                               (gdocs--org-element-visible-text
                                el inherited-link table-cell))
-                         (and table-cell
-                              (or (plist-get props :utf-8)
-                                  (plist-get props :ascii)))))
+                         ;; Ordinary prose keeps the entity's UTF-8
+                         ;; replacement (or its ASCII form) instead of
+                         ;; dropping it.
+                         (plist-get props :utf-8)
+                         (plist-get props :ascii)
+                         (gdocs--org-element-visible-text
+                          el inherited-link table-cell)))
                (runs (when (stringp text)
                        (list (gdocs-dm-make-run
                               text inherited-styles inherited-link))))
@@ -4234,7 +4314,11 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                          (and visible-fallback
                               (gdocs--org-element-visible-text
                                el inherited-link table-cell))
-                         (and table-cell (plist-get props :value))))
+                         (and table-cell (plist-get props :value))
+                         ;; Ordinary prose keeps the raw LaTeX source as
+                         ;; literal text instead of dropping it.
+                         (gdocs--org-element-visible-text
+                          el inherited-link table-cell)))
                (runs (when (stringp text)
                        (list (gdocs-dm-make-run
                               text
@@ -4277,6 +4361,9 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                              (make-string post-blank ?\s)
                              inherited-styles inherited-link)))
             runs)))
+       ;; Org anchors never appear in exported text, but a title or table
+       ;; cell visible-fallback keeps the literal source.
+       ((and (memq type '(target radio-target)) (not visible-fallback)) nil)
        (t
         (if (and contents (not (and table-cell visible-fallback)))
             (cl-mapcan
@@ -4284,9 +4371,11 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                (gdocs--element-runs c inherited-styles inherited-link
                                     table-cell visible-fallback))
              contents)
-          (let ((text (and visible-fallback
-                           (gdocs--org-element-visible-text
-                            el inherited-link table-cell))))
+          ;; Leaf objects (timestamps, footnote references, statistics
+          ;; cookies, macros, …) keep their source-visible text rather
+          ;; than disappearing from ordinary prose.
+          (let ((text (gdocs--org-element-visible-text
+                       el inherited-link table-cell)))
             (when text
               (list (gdocs-dm-make-run
                      text inherited-styles inherited-link)))))))))))
@@ -4416,18 +4505,49 @@ visible content."
         (puthash glyph id ids)
         id)))
 
+(defun gdocs--org-item-prefix-runs (item)
+  "Return runs carrying ITEM's checkbox state and description tag.
+
+Checkbox markers keep their literal `[X]' / `[ ]' / `[-]' text so the state
+survives publication.  Description-list terms are rendered as `term :: '
+prefix runs.  Both are disclosed fallbacks, not structural support."
+  (let* ((props (cadr item))
+         (checkbox (plist-get props :checkbox))
+         (tag (plist-get props :tag))
+         (runs nil))
+    (when checkbox
+      (let ((marker (pcase checkbox
+                      ('on "[X] ") ('off "[ ] ") ('trans "[-] ")
+                      ('intermediate "[-] ")
+                      (_ nil))))
+        (when marker
+          (push (gdocs-dm-make-run marker) runs))))
+    (when tag
+      (let ((tag-runs (cl-mapcan
+                       (lambda (obj) (gdocs--element-runs obj nil nil))
+                       (if (consp (car tag)) tag (list tag)))))
+        (setq runs (append runs tag-runs (list (gdocs-dm-make-run " :: "))))))
+    (nreverse runs)))
+
 (defun gdocs--walk-org-list (plain-list nest ids &optional source-spans)
-  "Convert PLAIN-LIST recursively at logical NEST using glyph ID table IDS."
+  "Convert PLAIN-LIST recursively at logical NEST using glyph ID table IDS.
+
+An item's first paragraph becomes the list paragraph; checkbox state and
+description tags are prefixed literally.  Remaining children keep their
+text as ordinary paragraphs marked with a disclosed fallback, and nested
+plain lists recurse normally."
   (let (paragraphs)
     (dolist (item (cddr plain-list))
       (when (and (consp item) (eq (car item) 'item))
         (let* ((glyph (gdocs--item-glyph item))
                (paragraph (gdocs--org-item-paragraph item))
+               (runs (append (gdocs--org-item-prefix-runs item)
+                             (gdocs--org-item-runs item)))
                (model (list :kind :list
                             :glyph glyph
                             :nest nest
                             :list-id (gdocs--org-list-id plain-list glyph ids)
-                            :runs (gdocs--org-item-runs item))))
+                            :runs runs)))
           (push (if source-spans
                     (gdocs--org-annotate-paragraph
                      model
@@ -4435,13 +4555,38 @@ visible content."
                      (gdocs--org-element-last-line-number (or paragraph item)))
                   model)
                 paragraphs)
-          (dolist (child (cddr item))
-            (when (and (consp child) (eq (car child) 'plain-list))
-              (setq paragraphs
-                    (nconc (nreverse
-                            (gdocs--walk-org-list child (1+ nest) ids
-                                                  source-spans))
-                           paragraphs)))))))
+          (let ((first-paragraph t))
+            (dolist (child (cddr item))
+              (when (consp child)
+                (cond
+                 ((eq (car child) 'plain-list)
+                  (setq paragraphs
+                        (nconc
+                         (nreverse
+                          (gdocs--walk-org-list child (1+ nest) ids
+                                                source-spans))
+                         paragraphs)))
+                 ((and (eq (car child) 'paragraph) first-paragraph)
+                  (setq first-paragraph nil))
+                 (t
+                  (setq first-paragraph nil)
+                  ;; Any other block inside the item keeps its text as
+                  ;; ordinary content with a disclosed fallback.
+                  (let ((extras
+                         (cl-mapcan
+                          (lambda (grandchild)
+                            (gdocs--walk-org-element grandchild
+                                                     source-spans))
+                          (list child))))
+                    (when extras
+                      (let ((first (car extras)))
+                        (unless (plist-get first :lossy-fallback)
+                          (setcar extras
+                                  (plist-put (copy-sequence first)
+                                             :lossy-fallback
+                                             "list item continuation is rendered as ordinary content"))))
+                      (setq paragraphs
+                            (nconc (nreverse extras) paragraphs))))))))))))
     (nreverse paragraphs)))
 
 (defun gdocs--coalesce-table-cell-runs (runs)
@@ -4516,7 +4661,12 @@ empty run list rather than disappearing from its row."
                  runs))))
 
 (defun gdocs--src-block-paragraphs (sb)
-  "Split a src-block's :value into a list of :code paragraphs."
+  "Split a src-block's :value into a list of :code paragraphs.
+
+Each run carries the `:code' style so the OT emitter sends the matching
+monospace font (Roboto Mono) and a pull decodes the paragraph back into a
+`:code' paragraph.  The source language is not represented by the remote
+model; a pull always renders `text' as the language."
   (let* ((val (or (plist-get (cadr sb) :value) ""))
          (lines (split-string val "\n"))
          ;; org-element appends a trailing \n; drop the trailing empty line.
@@ -4529,7 +4679,9 @@ empty run list rather than disappearing from its row."
     (unless lines (setq lines (list "")))
     (mapcar (lambda (line)
               (list :kind :code
-                    :runs (list (gdocs-dm-make-run line))))
+                    :runs (list (gdocs-dm-make-run line '(:code)))
+                    :lossy-fallback
+                    "source block is published as code text; its language is not preserved remotely"))
             lines)))
 
 (defun gdocs--org-element-line-number (el)
@@ -4637,11 +4789,35 @@ Each cell becomes (RUNS) — one element holding a list of runs."
           :rows (nreverse rows)
           :cols max-cols)))
 
+(defun gdocs--walk-children-with-lossy (el source-spans reason)
+  "Walk EL's children as ordinary content, marking the first paragraph.
+
+REASON explains the disclosed structural loss and is attached as
+`:lossy-fallback' to the first produced paragraph so publication previews
+can enumerate it.  Children that produce no paragraphs yield no entry."
+  (let ((children (cl-mapcan
+                   (lambda (child)
+                     (gdocs--walk-org-element child source-spans))
+                   (cddr el))))
+    (when children
+      (let ((first (car children)))
+        (unless (plist-get first :lossy-fallback)
+          (setcar children (plist-put (copy-sequence first)
+                                      :lossy-fallback reason)))))
+    children))
+
 (defun gdocs--walk-org-element (el &optional source-spans)
   "Convert a top-level org-element EL into zero or more paragraphs.
 
 When SOURCE-SPANS is non-nil, attach transient source line metadata so the
-caller can distinguish meaningful blank lines from heading padding."
+caller can distinguish meaningful blank lines from heading padding.
+
+Every element type receives an explicit treatment.  Blocks the remote model
+cannot represent structurally (quotes, verse, centers, special, example,
+drawers, footnote definitions, horizontal rules) keep their text and are
+marked with a `:lossy-fallback' explanation; purely organizational
+metadata (planning lines, clocks, diary sexps, unknown keywords, targets)
+is intentionally excluded.  Nothing silently disappears."
   (pcase (and (consp el) (car el))
     ('headline
      (let* ((props (cadr el))
@@ -4728,7 +4904,82 @@ caller can distinguish meaningful blank lines from heading padding."
                      :unsupported-reason
                      "The local document contains an unsupported-content marker.")))
         (t nil))))
-    (_ nil)))
+    ;; Greater blocks and drawers the remote model cannot represent keep all
+    ;; of their text as ordinary content, marked with a disclosed fallback.
+    ((or 'quote-block 'verse-block 'center-block 'example-block
+         'special-block 'dynamic-block)
+     (gdocs--walk-children-with-lossy
+      el source-spans
+      (format "%s block is rendered as ordinary paragraphs"
+              (replace-regexp-in-string "-block$" "" (symbol-name (car el))))))
+    ('drawer
+     (gdocs--walk-children-with-lossy
+      el source-spans "drawer contents are rendered as ordinary paragraphs"))
+    ('footnote-definition
+     (let* ((label (or (plist-get (cadr el) :label) "fn"))
+            (children (cl-mapcan
+                       (lambda (child)
+                         (gdocs--walk-org-element child source-spans))
+                       (cddr el))))
+       (when children
+         (let ((first (car children)))
+           ;; Keep the marker visible so the note survives publication.
+           (setcar children
+                   (plist-put (copy-sequence first)
+                              :runs (append
+                                     (list (gdocs-dm-make-run
+                                            (format "[fn:%s] " label)))
+                                     (plist-get first :runs))))
+           (unless (plist-get (car children) :lossy-fallback)
+             (setcar children
+                     (plist-put (car children)
+                                :lossy-fallback
+                                (format "footnote [%s] is rendered as inline text because the remote model has no footnotes"
+                                        label))))))
+       children))
+    ('horizontal-rule
+     (let ((para (list :kind :para
+                       :runs (list (gdocs-dm-make-run
+                                    (make-string 40 ?-)))
+                       :lossy-fallback
+                       "horizontal rule is rendered as a dashed line")))
+       (list (if source-spans
+                 (gdocs--org-annotate-paragraph
+                  para (gdocs--org-element-line-number el))
+               para))))
+    ;; Organizational metadata that ordinary Org export also excludes.
+    ((or 'planning 'clock 'diary-sexp) nil)
+    ;; Drawers and comments carry metadata or editor notes, not content.
+    ((or 'property-drawer 'node-property 'comment 'comment-block
+         'export-block) nil)
+    ('fixed-width
+     (let* ((value (string-join
+                    (split-string (or (plist-get (cadr el) :value) "")
+                                  "\n") "\n"))
+            (para (list :kind :para
+                        :runs (list (gdocs-dm-make-run value))
+                        :lossy-fallback
+                        "fixed-width line is rendered as an ordinary paragraph")))
+       (list (if source-spans
+                 (gdocs--org-annotate-paragraph
+                  para (gdocs--org-element-line-number el))
+               para))))
+    ;; Fallback for any remaining block element with children: keep the
+    ;; content, disclose the structural loss.  Childless elements are
+    ;; literalized from their source text.
+    (_
+     (if (cddr el)
+         (gdocs--walk-children-with-lossy
+          el source-spans
+          (format "%s is not represented structurally and keeps its text"
+                  (car el)))
+       (let ((text (gdocs--org-element-visible-text el nil nil)))
+         (when (and text (not (string-empty-p text)))
+           (list (list :kind :para
+                       :runs (list (gdocs-dm-make-run text))
+                       :lossy-fallback
+                       (format "%s is rendered as literal text"
+                               (car el))))))))))
 
 (defun gdocs-dm-from-org (org-text)
   "Parse ORG-TEXT (a string) into a canonical doc-model.
@@ -4753,10 +5004,15 @@ syntax)."
             (cl-mapcan
              (lambda (el) (gdocs--walk-org-element el t))
              (cddr tree)))
-           (paras (gdocs--org-with-meaningful-blanks with-spans)))
+           (paras (gdocs--org-with-meaningful-blanks with-spans))
+           (lossy (delq nil
+                        (cl-loop for paragraph in paras
+                                 collect (plist-get paragraph
+                                                    :lossy-fallback)))))
       (gdocs-dm-make-doc
        :revision nil :doc-id nil :title nil
        :paragraphs paras
+       :lossy (delete-dups lossy)
        :inline-objects
        (cl-loop for paragraph in paras
                 append (cond
@@ -5057,8 +5313,17 @@ BODY at position 1)."
                                 (car (gdocs-dm-unsupported doc)))
                                :explanation)
                     "unsupported content")))
-  (let* ((paragraphs (gdocs--normalize-paragraphs-for-ot
-                      (gdocs-dm-paragraphs doc)))
+  (gdocs--emit-paragraphs-ot
+   (gdocs--normalize-paragraphs-for-ot (gdocs-dm-paragraphs doc))))
+
+(defun gdocs--emit-paragraphs-ot (paragraphs)
+  "Render PARAGRAPHS (already canonicalized) to (BODY . OPS).
+
+No paragraph normalization happens here: callers such as the incremental
+planner depend on the emitted positions matching the exact paragraph
+sequence supplied, including blank paragraphs the generic normalization
+would drop."
+  (let* ((paragraphs paragraphs)
          (list-defs (gdocs--collect-list-ids paragraphs))
          (parts nil)
          (pos 1)
@@ -5331,8 +5596,7 @@ rendered docs.  Malformed tables are never equal."
                                         (plist-get copy :runs))))))
                   copy)))
             paras)))
-      (length (car (gdocs-dm-to-ot
-                    (gdocs-dm-make-doc :paragraphs sanitized)))))))
+      (length (car (gdocs--emit-paragraphs-ot sanitized))))))
 
 (defun gdocs--shift-op-positions (op shift)
   (mapcar (lambda (kv)
@@ -5341,8 +5605,35 @@ rendered docs.  Malformed tables are never equal."
               (_ kv)))
           op))
 
+(defun gdocs--raw-indices-for-norm (raw norm)
+  "Return, for each paragraph in NORM, its index in RAW.
+
+`gdocs--normalize-paragraphs-for-ot' drops or merges raw paragraphs but
+never reorders them, so every normalized paragraph either is one of the
+raw paragraph objects (matched with `eq') or — for a blank converted to
+an empty source line — has the same OT length as the raw paragraph it
+replaced.  Unmatched entries reuse the previous matched index."
+  (let ((indices nil)
+        (previous 0))
+    (dolist (para norm)
+      (let ((index (cl-position para raw :test #'eq)))
+        (if index
+            (setq previous index)
+          (setq index previous))
+        (push index indices)))
+    (nreverse indices)))
+
 (defun gdocs-dm-to-incremental-save-plan (old-doc new-doc &optional classify-only)
   "Compute a paragraph-level save plan from OLD-DOC to NEW-DOC.
+
+The paragraph diff runs on the canonicalized
+(`gdocs--normalize-paragraphs-for-ot') sequences of both documents so
+spacing-only differences around headings do not create diff noise.  All
+OT offsets, however, are computed from the RAW old-document paragraphs
+— exactly as decoded from the remote operations — because `ds'/`is'
+positions address the raw body.  Normalizing the position source would
+silently shorten heading-adjacent blank paragraphs and corrupt the
+edited range.
 
 Falls back to a full-replace bundle if the diff region includes any
 list, table, or inline-object paragraphs — those carry structure or
@@ -5351,17 +5642,17 @@ entity data whose live values we cannot safely rewrite in place.
 The returned plist contains `:commands', an explicit `:kind', and the OT
 `:ranges' touched by an incremental plan.  When CLASSIFY-ONLY is non-nil, a
 fallback plan omits commands that would re-encode unsupported local entities."
-  (let* ((old-paras (gdocs--normalize-paragraphs-for-ot
-                     (gdocs-dm-paragraphs old-doc)))
-         (new-paras (gdocs--normalize-paragraphs-for-ot
-                     (gdocs-dm-paragraphs new-doc)))
-         (pre (gdocs--paragraphs-common-prefix old-paras new-paras))
+  (let* ((old-raw (gdocs-dm-paragraphs old-doc))
+         (new-raw (gdocs-dm-paragraphs new-doc))
+         (old-norm (gdocs--normalize-paragraphs-for-ot old-raw))
+         (new-norm (gdocs--normalize-paragraphs-for-ot new-raw))
+         (pre (gdocs--paragraphs-common-prefix old-norm new-norm))
          (suf (gdocs--paragraphs-common-suffix
-               (nthcdr pre old-paras) (nthcdr pre new-paras)))
-         (old-mid (cl-subseq old-paras pre
-                             (- (length old-paras) suf)))
-         (new-mid (cl-subseq new-paras pre
-                             (- (length new-paras) suf))))
+               (nthcdr pre old-norm) (nthcdr pre new-norm)))
+         (old-mid (cl-subseq old-norm pre
+                             (- (length old-norm) suf)))
+         (new-mid (cl-subseq new-norm pre
+                             (- (length new-norm) suf))))
     (cond
      ((and (null old-mid) (null new-mid))
       '(:commands nil :kind :noop :ranges nil))
@@ -5375,39 +5666,62 @@ fallback plan omits commands that would re-encode unsupported local entities."
       (list :commands
             (and (not classify-only)
                  (gdocs-dm-to-save-commands
-                  (gdocs--paragraphs-ot-length old-paras) new-doc))
+                  (gdocs--paragraphs-ot-length old-raw) new-doc))
             :kind :full-replace
             :ranges nil))
      (t
-      (let* ((old-pre-len (gdocs--paragraphs-ot-length
-                           (cl-subseq old-paras 0 pre)))
-             (old-mid-len (gdocs--paragraphs-ot-length old-mid))
+      (let* ((old-map (gdocs--raw-indices-for-norm old-raw old-norm))
+             ;; Raw span covering the common prefix: through the raw
+             ;; paragraph that produced the last normalized prefix entry.
+             (prefix-last-raw (and (> pre 0)
+                                   (nth (1- pre) old-map)))
+             (raw-prefix-len (if prefix-last-raw
+                                 (gdocs--paragraphs-ot-length
+                                  (cl-subseq old-raw 0 (1+ prefix-last-raw)))
+                               0))
+             ;; Raw span of the replaced middle: from the prefix end to the
+             ;; raw paragraph that produced the first normalized suffix
+             ;; entry.  Raw paragraphs dropped by normalization inside that
+             ;; span are deleted, which is the intended canonicalization.
+             (suffix-first-raw (and (> suf 0)
+                                    (nth (- (length old-norm) suf) old-map)))
+             (raw-mid-len (cond
+                           (suffix-first-raw
+                            (- (gdocs--paragraphs-ot-length
+                                (cl-subseq old-raw 0 suffix-first-raw))
+                               raw-prefix-len))
+                           ;; No common suffix: the middle extends to the
+                           ;; end of the raw body, including trailing
+                           ;; normalized-away paragraphs.
+                           (t
+                            (- (gdocs--paragraphs-ot-length old-raw)
+                               raw-prefix-len))))
              (sub-doc (gdocs-dm-make-doc :paragraphs new-mid))
              (built (gdocs-dm-to-ot sub-doc))
              (mid-body (car built))
              (mid-style-ops (cdr built))
              (shifted-ops
               (mapcar (lambda (op)
-                        (gdocs--shift-op-positions op old-pre-len))
+                        (gdocs--shift-op-positions op raw-prefix-len))
                       mid-style-ops))
              (cmds nil))
-        (when (> old-mid-len 0)
-          (push `((ty . "ds") (si . ,(1+ old-pre-len))
-                  (ei . ,(+ old-pre-len old-mid-len)))
+        (when (> raw-mid-len 0)
+          (push `((ty . "ds") (si . ,(1+ raw-prefix-len))
+                  (ei . ,(+ raw-prefix-len raw-mid-len)))
                 cmds))
         (when (length> mid-body 0)
-          (push `((ty . "is") (ibi . ,(1+ old-pre-len))
+          (push `((ty . "is") (ibi . ,(1+ raw-prefix-len))
                   (s . ,mid-body))
                 cmds))
         (list :commands (append (nreverse cmds) shifted-ops)
               :kind :incremental
               :ranges
-              (list (list :ot-start (1+ old-pre-len)
-                          :ot-end (if (> old-mid-len 0)
-                                      (+ old-pre-len old-mid-len)
-                                    (1+ old-pre-len))
-                          :insert-at (1+ old-pre-len)
-                          :delete-count old-mid-len))))))))
+              (list (list :ot-start (1+ raw-prefix-len)
+                          :ot-end (if (> raw-mid-len 0)
+                                      (+ raw-prefix-len raw-mid-len)
+                                    (1+ raw-prefix-len))
+                          :insert-at (1+ raw-prefix-len)
+                          :delete-count raw-mid-len))))))))
 
 (defun gdocs-dm-to-incremental-save-commands (old-doc new-doc)
   "Return OT commands for the paragraph-level diff from OLD-DOC to NEW-DOC.
@@ -6789,7 +7103,14 @@ stale buffer-local capability metadata cannot bypass policy."
                    (cl-remove-if
                     (lambda (report)
                       (eq (plist-get report :source) :local-object))
-                    local-reports))))
+                    local-reports)))
+         ;; Reports whose policy allows push regardless of context (document
+         ;; settings outside the replaced body) never block any plan kind,
+         ;; including the conservative no-op path.
+         (blocking (cl-remove-if
+                    (lambda (report)
+                      (eq (plist-get report :push-policy) :allow-push))
+                    reports)))
     (when object-errors
       (gdocs--push-capability-summary-error
        object-errors
@@ -6808,7 +7129,7 @@ stale buffer-local capability metadata cannot bypass policy."
                (cl-remove-if-not
                 (lambda (report)
                   (eq (plist-get report :severity) :destructive))
-                reports)))
+                blocking)))
           (when destructive
             (gdocs--push-capability-summary-error
              destructive :full-replace))))
@@ -6818,24 +7139,24 @@ stale buffer-local capability metadata cannot bypass policy."
                       (lambda (report)
                         (or (plist-get report :refuse-push)
                             (not (plist-get report :preserve-untouched))))
-                      reports))
+                      blocking))
                (unranged (cl-remove-if
-                          #'gdocs--capability-report-range reports))
+                          #'gdocs--capability-report-range blocking))
                (intersecting
                 (cl-remove-if-not
                  (lambda (report)
                    (gdocs--capability-range-touched-p report ranges))
-                 reports)))
+                 blocking)))
           (cond
            (hard (gdocs--push-capability-summary-error hard :proof))
            ((or (null ranges) unranged)
             (gdocs--push-capability-summary-error
-             (or unranged reports) :proof))
+             (or unranged blocking) :proof))
            (intersecting
             (gdocs--push-capability-summary-error intersecting :intersects)))))
        (t
-        (when reports
-          (gdocs--push-capability-summary-error reports :proof)))))
+        (when blocking
+          (gdocs--push-capability-summary-error blocking :proof)))))
     t))
 
 (defun gdocs--push-preflight-insertion (state ot-position text)
@@ -7223,7 +7544,7 @@ of OT ops (alists). Returns parsed JSON response (XSSI-stripped)."
                      "&ouid=" ouid
                      "&includes_info_params=true"
                      "&cros_files=false&nded=false"
-                     "&tab=t.0"))
+                     "&tab=" (url-hexify-string gdocs-docs-tab)))
          (url (format "https://docs.google.com/document/u/0/d/%s/save?%s"
                       doc-id qs))
          (bundles (json-encode
@@ -7502,15 +7823,15 @@ the `reqid' param is omitted (matches the session-init POST)."
             "&ouid=" (or ouid "")
             "&includes_info_params=true"
             "&cros_files=false&nded=false"
-            "&tab=t.0")))
+            "&tab=" (url-hexify-string gdocs-docs-tab))))
 
 (defun gdocs--docos-headers (doc-id)
   "Return the cookie-auth headers the browser sends to /docos/p/*."
   (append
    `(("X-Same-Domain" . "1")
      ("Origin" . "https://docs.google.com")
-     ("Referer" . ,(format "https://docs.google.com/document/d/%s/edit?tab=t.0"
-                           doc-id))
+     ("Referer" . ,(format "https://docs.google.com/document/d/%s/edit?tab=%s"
+                           doc-id gdocs-docs-tab))
      ("User-Agent" . ,gdocs-default-user-agent))
    (gdocs--auth-headers)))
 
@@ -7674,7 +7995,7 @@ On curl error, ERR is a string."
                      "&ouid=" ouid
                      "&includes_info_params=true"
                      "&cros_files=false&nded=false"
-                     "&tab=t.0"))
+                     "&tab=" (url-hexify-string gdocs-docs-tab)))
          (url (format "https://docs.google.com/document/u/0/d/%s/save?%s"
                       doc-id qs))
          (bundles (json-encode
@@ -7942,6 +8263,16 @@ complete desired canonical body.  STAGE is `:delete' or `:insert'."
                                     :insert-at ot-start
                                     :delete-count 0))))))
 
+(defun gdocs--push-expected-remote-body (doc)
+  "Return the canonical Org body expected after DOC is committed.
+
+The expectation is derived from the actual publication model by rendering
+DOC to Org — the same transformation a post-save refetch decodes — rather
+than from the user's original Org spelling.  Keyword case, blank padding,
+and other source-only normalization must not make a committed save look
+unconfirmed."
+  (gdocs-dm-to-org doc))
+
 (defun gdocs--push-full-plan (doc-id state local-body backend)
   "Build a fresh full-bundle plan for BACKEND against STATE."
   (let* ((ot-body (or (plist-get state :ot-body) ""))
@@ -7967,7 +8298,10 @@ complete desired canonical body.  STAGE is `:delete' or `:insert'."
     (list :kind (plist-get generated :kind)
           :commands (plist-get generated :commands)
           :ranges (plist-get generated :ranges)
-          :post-body (gdocs--push-comparison-body local-body))))
+          ;; The expected post-save body is the round-trip render of the
+          ;; pushed model, not the original local spelling.
+          :post-body (gdocs--push-comparison-body
+                      (gdocs--push-expected-remote-body new-doc)))))
 
 (defun gdocs--make-push-intent
     (state local-body expected-body replan &optional label)
@@ -8567,6 +8901,37 @@ so the insertion position is never copied from the delete plan."
           (finish nil nil)
         (step)))))
 
+(defun gdocs--push-verify-and-finalize-async
+    (doc-id initial result backend command-count finalize)
+  "Verify a committed save by refetching DOC-ID, then call FINALIZE.
+
+INITIAL is the full push plan (its `:post-body' is the expected round-trip
+render); RESULT is the save result plist with `:revision'.  BACKEND and
+COMMAND-COUNT describe the completed operation for the log line.  FINALIZE
+is `gdocs--apply-push-async''s one-shot finisher, called as
+`(funcall FINALIZE REV ERR EXTRA)'."
+  (gdocs--fetch-edit-state-async
+   doc-id
+   (lambda (fresh-state v-err)
+     (let ((v-failure
+            (or v-err
+                (condition-case sig
+                    (progn
+                      (gdocs--push-verify-state
+                       doc-id fresh-state
+                       (plist-get initial :post-body)
+                       (plist-get result :revision))
+                      nil)
+                  (error (error-message-string sig))))))
+       (funcall finalize
+                (plist-get result :revision)
+                v-failure
+                (if v-failure
+                    (format ", %s (%d ops, verification failed)"
+                            backend command-count)
+                  (format ", %s (%d ops, verified)"
+                          backend command-count)))))))
+
 (defun gdocs--apply-push-async
     (doc-id state local-body remote-body buffer callback)
   "Async sibling of `gdocs--apply-push'.
@@ -8642,10 +9007,19 @@ reported revision semantics.  BUFFER is where property writes go."
                     (gdocs--run-op-result-async
                      doc-id state intent
                      (lambda (result err)
-                       (finalize (and result (plist-get result :revision))
-                                 err
-                                 (format ", %s (%d ops)"
-                                         backend (length commands)))))))))
+                       (cond
+                        ((or err (null result) (not gdocs-verify-after-save))
+                         (finalize (and result (plist-get result :revision))
+                                   err
+                                   (format ", %s (%d ops)"
+                                           backend (length commands))))
+                        ;; Read-after-write verification: a committed save
+                        ;; is only reported as success when a fresh refetch
+                        ;; decodes to the expected round-trip body.
+                        (t
+                         (gdocs--push-verify-and-finalize-async
+                          doc-id initial result backend
+                          (length commands) #'finalize)))))))))
              (prepended
               (let ((intent
                      (gdocs--make-push-intent
@@ -8705,6 +9079,8 @@ reported revision semantics.  BUFFER is where property writes go."
              (t
               (finish nil
                       "edit shape not yet supported (non-contiguous diff, or change crosses table/list structure)")))))))))
+
+
 
 (defun gdocs--diff-prepend (remote local)
   "If LOCAL = NEW + REMOTE for some NEW, return NEW; else nil.
@@ -9548,6 +9924,12 @@ completion or error."
            (cond
             (err (funcall release err))
             ((null state) (funcall release "empty edit state"))
+            ;; A state with neither ops nor body means the /edit page carried
+            ;; no model chunks at all.  Decoding failure must never be
+            ;; interpreted as an empty document that is safe to replace.
+            ((and (null (plist-get state :ot-ops))
+                  (null (plist-get state :ot-body)))
+             (funcall release "edit state could not be decoded: no model chunks"))
             ((not (and token ouid remote-rev))
              (funcall release "missing token/ouid/rev"))
             (t
@@ -9680,6 +10062,270 @@ without logging raw content."
       (unless completed
         (when (and generated-out out (file-exists-p out))
           (ignore-errors (delete-file out)))))))
+
+
+;;; Source-file publication (one-way Org → Google Docs)
+;;
+;; The source Org file remains authoritative; the Google Doc is a published
+;; projection.  Publication metadata lives in `gdocs-publish-registry-file',
+;; never in the user's source text.  Publishing converts the source, runs
+;; the normal capability preflight, refuses to clobber foreign content or a
+;; concurrently changed revision, and verifies the committed result by
+;; refetching it.
+
+(defcustom gdocs-publish-registry-file
+  (expand-file-name "gdocs-publish-registry.el" user-emacs-directory)
+  "File recording source-file → Google Doc associations.
+
+Each entry stores the last published revision so a later publish refuses
+to overwrite concurrent remote changes instead of clobbering them."
+  :type 'file
+  :group 'gdocs-mode)
+
+(defvar gdocs--publish-registry nil
+  "Alist ((SOURCE . (DOC-ID . LAST-PUBLISHED-REVISION))).")
+
+(defun gdocs--publish-registry-load ()
+  "Populate `gdocs--publish-registry' from `gdocs-publish-registry-file'."
+  (setq gdocs--publish-registry
+        (when (and gdocs-publish-registry-file
+                   (file-exists-p gdocs-publish-registry-file))
+          (with-temp-buffer
+            (insert-file-contents gdocs-publish-registry-file)
+            (ignore-errors (read (current-buffer)))))))
+
+(defun gdocs--publish-registry-record (source doc-id revision)
+  "Persist that SOURCE published to DOC-ID at REVISION."
+  (gdocs--publish-registry-load)
+  (setq gdocs--publish-registry
+        (cons (cons (expand-file-name source) (cons doc-id revision))
+              (cl-remove-if
+               (lambda (entry)
+                 (equal (car entry) (expand-file-name source)))
+               gdocs--publish-registry)))
+  (when gdocs-publish-registry-file
+    (let ((directory (file-name-directory gdocs-publish-registry-file)))
+      (when (and directory (not (file-exists-p directory)))
+        (ignore-errors (make-directory directory t))))
+    (with-temp-file gdocs-publish-registry-file
+      (prin1 gdocs--publish-registry (current-buffer)))))
+
+(defun gdocs--publish-registry-lookup (source)
+  "Return (DOC-ID . LAST-REVISION) recorded for SOURCE, or nil."
+  (gdocs--publish-registry-load)
+  (cdr (assoc (expand-file-name source) gdocs--publish-registry)))
+
+(defun gdocs--publish-analysis (source)
+  "Convert SOURCE's Org text and return a publication analysis plist.
+
+The plist carries `:org-text', `:doc' (the parsed model), `:lossy' (the
+disclosed fallback explanations), `:unsupported-summary' (non-nil text
+blocks publication), and `:expected-org' (the round-trip render that a
+committed document must decode back to)."
+  (let* ((org-text (with-temp-buffer
+                     (insert-file-contents-literally source)
+                     (buffer-string)))
+         (doc (gdocs-dm-from-org org-text))
+         (unsupported (gdocs-dm-unsupported doc)))
+    (list :org-text org-text
+          :doc doc
+          :lossy (gdocs-dm-lossy doc)
+          :unsupported-summary (and unsupported
+                                    (gdocs--capability-summary unsupported))
+          :expected-org (gdocs--push-expected-remote-body doc))))
+
+(defun gdocs--publish-target-buffer (doc-id)
+  "Return the live org buffer synchronized with DOC-ID, or nil."
+  (seq-find
+   (lambda (buffer)
+     (with-current-buffer buffer
+       (and (derived-mode-p 'org-mode)
+            (equal (gdocs--top-property-value "GDOC_ID") doc-id))))
+   (buffer-list)))
+
+(defun gdocs-publish-preview (source &optional doc-id)
+  "Return a preview plist for publishing Org file SOURCE to DOC-ID.
+
+DOC-ID defaults to the recorded association for SOURCE.  The plist
+carries `:doc-id', `:lossy', `:unsupported-summary', `:expected-org',
+and `:paragraph-count'.  This function performs no network I/O and
+never modifies files.  Interactively, a readable report is shown in a
+help buffer."
+  (interactive "fOrg file to publish: ")
+  (let* ((analysis (gdocs--publish-analysis source))
+         (doc-id (or doc-id
+                     (car (gdocs--publish-registry-lookup source))))
+         (result (list :doc-id doc-id
+                       :lossy (plist-get analysis :lossy)
+                       :unsupported-summary
+                       (plist-get analysis :unsupported-summary)
+                       :expected-org (plist-get analysis :expected-org)
+                       :paragraph-count
+                       (length (gdocs-dm-paragraphs
+                                (plist-get analysis :doc))))))
+    (when (called-interactively-p 'any)
+      (with-help-window "*gdocs publish preview*"
+        (princ (format "Publish %s → %s\n\n"
+                       (file-name-nondirectory source)
+                       (or doc-id "(no associated doc)")))
+        (princ (format "Paragraphs: %d\n\n"
+                       (plist-get result :paragraph-count)))
+        (if (plist-get result :unsupported-summary)
+            (progn
+              (princ "BLOCKED — unsupported content:\n  ")
+              (princ (plist-get result :unsupported-summary))
+              (princ "\n"))
+          (princ "No blocking unsupported content.\n"))
+        (if (plist-get result :lossy)
+            (progn
+              (princ "\nDisclosed fallbacks:\n")
+              (dolist (reason (plist-get result :lossy))
+                (princ (format "  - %s\n" reason))))
+          (princ "\nNo disclosed fallbacks.\n"))))
+    result))
+
+(defun gdocs-publish-check (source &optional doc-id)
+  "Compare Org file SOURCE with its published Google Doc DOC-ID.
+
+Returns a plist with `:status' (`:in-sync', `:drift', `:stale-revision',
+`:unpublished', or `:error'), and `:detail'.  Network I/O is synchronous;
+the document is never modified."
+  (interactive "fOrg file to check: ")
+  (let* ((registered (gdocs--publish-registry-lookup source))
+         (doc-id (gdocs--extract-doc-id
+                  (or doc-id (car registered))))
+         (analysis (gdocs--publish-analysis source)))
+    (unless doc-id
+      (user-error "gdocs: no doc-id for %s; publish first or pass DOC-ID"
+                  source))
+    (let* ((state (gdocs--fetch-edit-state doc-id))
+           (remote-rev (and state (plist-get state :revision))))
+      (cond
+       ((or (null state)
+            (and (null (plist-get state :ot-ops))
+                 (null (plist-get state :ot-body))))
+        (list :status :error :detail "remote state could not be decoded"))
+       ((and (cdr registered) remote-rev
+             (not (string= (format "%s" (cdr registered))
+                           (format "%s" remote-rev))))
+        (list :status :stale-revision
+              :detail (format "registry rev %s, remote rev %s"
+                              (cdr registered) remote-rev)))
+       ((null remote-rev)
+        (list :status :unpublished :detail "no remote revision"))
+       (t
+        (let* ((remote-doc
+                (gdocs-dm-from-ops remote-rev doc-id
+                                   (plist-get state :title)
+                                   (or (plist-get state :ot-body) "")
+                                   (plist-get state :ot-ops)))
+               (remote-body
+                (gdocs--push-comparison-body (gdocs-dm-to-org remote-doc)))
+               (expected
+                (gdocs--push-comparison-body
+                 (plist-get analysis :expected-org))))
+          (if (string= remote-body expected)
+              (list :status :in-sync
+                    :detail (format "remote rev %s matches source" remote-rev))
+            (list :status :drift
+                  :detail "remote body differs from the source projection"))))))))
+
+(defun gdocs-publish-file (source doc-id &optional force no-prompt callback)
+  "Publish Org file SOURCE as the body of Google Doc DOC-ID.
+
+The document body is fully replaced from the source file; the source
+file is never modified.  Guards, in order:
+
+- The conversion must be free of blocking unsupported content.
+- A foreign document (non-empty body never published from this source)
+  requires FORCE.
+- A remote revision newer than the last recorded publish requires FORCE.
+
+Disclosed fallbacks are confirmed interactively unless NO-PROMPT is
+non-nil; non-interactive calls log them instead.
+
+After a successful commit the association and revision are recorded in
+`gdocs-publish-registry-file', and a synchronized org buffer for DOC-ID
+is refreshed by a pull.  When `gdocs-verify-after-save' is non-nil the
+committed body is refetched and verified before success is reported.
+
+The push is asynchronous; CALLBACK receives `(RESULT ERR)' exactly once,
+where RESULT is a plist with `:revision', `:verified', `:lossy', and
+`:doc-id'.  For interactive use the outcome is also logged."
+  (let* ((source (expand-file-name source))
+         (doc-id (gdocs--extract-doc-id doc-id))
+         (analysis (gdocs--publish-analysis source))
+         (lossy (plist-get analysis :lossy))
+         (registered (gdocs--publish-registry-lookup source))
+         (buffer (gdocs--publish-target-buffer doc-id)))
+    (when (plist-get analysis :unsupported-summary)
+      (user-error
+       "gdocs: publish refused: source contains %s"
+       (plist-get analysis :unsupported-summary)))
+    (when (and lossy (not no-prompt))
+      (if noninteractive
+          (gdocs-log 'info "Publish fallbacks for %s: %s" doc-id
+                     (string-join lossy "; "))
+        (unless (yes-or-no-p
+                 (format "Publish with disclosed fallbacks (%s)? "
+                         (string-join lossy "; ")))
+          (user-error "gdocs: publish cancelled"))))
+    (let* ((state (gdocs--fetch-edit-state doc-id))
+           (remote-rev (and state (plist-get state :revision)))
+           (remote-body
+            (and state
+                 (gdocs--remote-org-body-from-state doc-id state))))
+      (cond
+       ((or (null state)
+            (and (null (plist-get state :ot-ops))
+                 (null (plist-get state :ot-body))))
+        (user-error
+         "gdocs: publish refused: remote state could not be decoded"))
+       ((and (cdr registered) remote-rev
+             (not (string= (format "%s" (cdr registered))
+                           (format "%s" remote-rev)))
+             (not force))
+        (user-error
+         "gdocs: publish refused: remote rev %s is newer than the last publish (%s); re-check and pass FORCE"
+         remote-rev (cdr registered)))
+       ((and (length> (gdocs--push-comparison-body remote-body) 0)
+             (null registered)
+             (not force)
+             (not (and buffer
+                       (with-current-buffer buffer
+                         (gdocs--top-property-value "GDOC_CONTENT_HASH")))))
+        (user-error
+         "gdocs: publish refused: %s has content and was never published from %s; pass FORCE to overwrite"
+         doc-id source)))
+      ;; Capability preflight against the freshly fetched state.
+      (gdocs--push-preflight state (plist-get analysis :org-text)
+                             '(:kind :full-replace))
+      (let ((owner (or (gdocs--sync-acquire)
+                       (user-error "gdocs: another sync operation is active"))))
+        (gdocs--apply-push-async
+         doc-id state (plist-get analysis :org-text) remote-body buffer
+         (lambda (new-rev err)
+           (gdocs--sync-release owner)
+           (if err
+               (progn
+                 (gdocs-log 'warn "Publish of %s failed: %s" source err)
+                 (when callback (funcall callback nil err)))
+             (gdocs--publish-registry-record source doc-id new-rev)
+             (let ((result (list :revision new-rev
+                                 :verified (and gdocs-verify-after-save t)
+                                 :lossy lossy
+                                 :doc-id doc-id)))
+               (gdocs-log 'info "Published %s → %s (rev %s%s)"
+                          source doc-id new-rev
+                          (if lossy
+                              (format ", %d disclosed fallbacks"
+                                      (length lossy))
+                            ""))
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (gdocs-pull-locally doc-id)))
+               (when callback (funcall callback result nil)))))))
+      nil)))
 
 
 ;;; Public command — open

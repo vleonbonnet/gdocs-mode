@@ -1044,11 +1044,20 @@ END is the inclusive final OT position."
     (should (equal (plist-get parsed :ot-body) "valid\n"))))
 
 (ert-deftest gdocs-test-malformed-and-empty-model-chunks-are-safe ()
-  "Malformed assignments are skipped and empty chunks do not become bodies."
+  "Malformed assignments are skipped; an empty body is distinguished from a failed parse."
   (should-not (gdocs--parse-model-chunk "DOCS_modelChunk = {oops};"))
-  (should-not (gdocs--parse-model-chunk
-               (gdocs-test--html-for-ops 1 nil)))
-  (should-not (gdocs--parse-model-chunks-raw nil)))
+  (should-not (gdocs--parse-model-chunks-raw nil))
+  ;; No model chunks at all means the /edit page could not be parsed: nil.
+  (should-not (gdocs--parse-model-chunk "<html></html>"))
+  ;; Chunks present but no text inserts is a valid empty document body —
+  ;; the real blank-document shape carries only document-level `as' ops.
+  (let ((parsed (gdocs--parse-model-chunk
+                 (gdocs-test--html-for-ops
+                  1 '(((ty . "as") (st . "document") (si . 0) (ei . 0)
+                       (sm . ((ds_lhs . 1)))))))))
+    (should parsed)
+    (should (= (plist-get parsed :revision) 1))
+    (should (equal (plist-get parsed :ot-body) ""))))
 
 (ert-deftest gdocs-test-structural-codepoint-mapping ()
   "Plain text drops structure while retaining exact OT positions."
@@ -2428,6 +2437,10 @@ END is the inclusive final OT position."
                    '(("a" nil "https://valid.example")
                      ("bc" nil nil))))))
 
+(defun gdocs-test--write-temp (name content)
+  "Write CONTENT to a suite-temporary .org file named NAME; return its path."
+  (make-temp-file (concat "gdocs-publish-" name) nil ".org" content))
+
 (ert-deftest gdocs-test-org-model-org-normalized-round-trip ()
   "Rendering a parsed Org model is stable after normalization."
   (let* ((source "#+title: Round trip\n\n* Heading\n\nA *bold* and /italic/.\n")
@@ -2444,6 +2457,186 @@ END is the inclusive final OT position."
          (decoded (gdocs-dm-from-ops nil nil nil (car built) (cdr built))))
     (should (equal (gdocs-test--model-view original)
                    (gdocs-test--model-view decoded)))))
+
+(ert-deftest gdocs-test-blank-document-settings-do-not-block-push ()
+  "Document-level `as' ops on a blank doc are informational, not destructive."
+  (let* ((ops (list
+               '((ty . "as") (st . "document") (si . 0) (ei . 0)
+                 (sm . ((ds_lhs . 1) (ds_ulhfl . :json-false))))
+               '((ty . "as") (st . "headings") (si . 0) (ei . 0)
+                 (sm . ((hs_h1 (sdef_ts (ts_bd_i . t) (ts_fs . 20.0))))))
+               '((ty . "as") (st . "language") (si . 0) (ei . 0)
+                 (sm . ((lgs_l . "en"))))))
+         (state (list :revision 1 :token "token" :ouid "ouid"
+                      :ot-body "" :ot-ops ops))
+         (analysis (gdocs--remote-capability-analysis state))
+         (reports (plist-get analysis :unsupported)))
+    (should (= (length reports) 3))
+    (should (cl-every (lambda (report)
+                        (eq (plist-get report :kind) :document-settings))
+                      reports))
+    (should (cl-every (lambda (report)
+                        (eq (plist-get report :severity) :informational))
+                      reports))
+    ;; All three plan kinds pass preflight.
+    (should (gdocs--push-preflight state "Local\n" '(:kind :full-replace)))
+    (should (gdocs--push-preflight state "Local\n" '(:kind :noop)))
+    ;; A non-zero-width document-level op is still fail-closed.
+    (let* ((bad (list :revision 1 :token "token" :ouid "ouid"
+                      :ot-body "x\n"
+                      :ot-ops (list (gdocs-test--insert-op "x\n")
+                                    '((ty . "as") (st . "document")
+                                      (si . 1) (ei . 2)
+                                      (sm . ((ds_lhs . 1)))))))
+           (message nil))
+      (condition-case err
+          (gdocs--push-preflight bad "Local\n" '(:kind :full-replace))
+        (user-error (setq message (error-message-string err))))
+      (should (string-match-p "unknown feature" message)))))
+
+(ert-deftest gdocs-test-source-block-round-trips-through-ot-with-code-style ()
+  "Src blocks keep their code font across the OT boundary."
+  (let* ((source "#+begin_src python\nprint(1)\n\nprint(2)\n#+end_src\n")
+         (doc (gdocs-dm-from-org source))
+         (built (gdocs-dm-to-ot doc))
+         (decoded (gdocs-dm-from-ops nil nil nil (car built) (cdr built))))
+    ;; Non-empty paragraphs decode back as :code with the monospace marker
+    ;; style; the empty source line stays a :blank in the raw decoded model
+    ;; and is converted back to a :code paragraph by render normalization.
+    (should (cl-every (lambda (paragraph)
+                        (eq (plist-get paragraph :kind) :code))
+                      (cl-remove-if
+                       (lambda (paragraph)
+                         (eq (plist-get paragraph :kind) :blank))
+                       (gdocs-dm-paragraphs decoded))))
+    (should (cl-every (lambda (paragraph)
+                        (cl-some (lambda (run)
+                                   (equal (plist-get run :styles) '(:code)))
+                                 (plist-get paragraph :runs)))
+                      (cl-remove-if
+                       (lambda (paragraph)
+                         (eq (plist-get paragraph :kind) :blank))
+                       (gdocs-dm-paragraphs decoded))))
+    ;; Rendering pulls the block back out as a source block (language is
+    ;; disclosed as lost and renders as `text').
+    (should (string-match-p "#\\+begin_src text\nprint(1)\n\nprint(2)\n#\\+end_src"
+                            (gdocs-dm-to-org decoded)))))
+
+(ert-deftest gdocs-test-blocks-footnotes-and-inline-objects-never-vanish ()
+  "Quote blocks, footnotes, timestamps, and entities keep their text."
+  (let* ((quote-src "#+begin_quote\nKeep this text.\n#+end_quote\n")
+         (quote-doc (gdocs-dm-from-org quote-src))
+         (quote-runs (gdocs-dm-paragraphs quote-doc)))
+    (should (= (length quote-runs) 1))
+    (should (equal (gdocs-dm-runs-text (plist-get (car quote-runs) :runs))
+                   "Keep this text."))
+    (should (plist-get (car quote-runs) :lossy-fallback)))
+  (let* ((foot-src "A footnote[fn:1].\n\n[fn:1] Important detail.\n")
+         (foot-doc (gdocs-dm-from-org foot-src))
+         (texts (mapcar (lambda (paragraph)
+                          (gdocs-dm-runs-text (plist-get paragraph :runs)))
+                        (gdocs-dm-paragraphs foot-doc))))
+    (should (equal texts '("A footnote[fn:1]." ""
+                           "[fn:1] Important detail."))))
+  (let* ((ts-src "Due <2026-09-16 Wed> and \\alpha{} stays.\n")
+         (ts-doc (gdocs-dm-from-org ts-src))
+         (text (gdocs-dm-runs-text
+                (plist-get (car (gdocs-dm-paragraphs ts-doc)) :runs))))
+    (should (string-match-p "<2026-09-16 Wed>" text))
+    (should (string-match-p "α" text))))
+
+(ert-deftest gdocs-test-list-item-continuations-and-checkboxes-keep-text ()
+  "Checkbox state and wrapped item lines survive publication."
+  (let* ((source (concat "- [ ] unchecked item\n"
+                         "- [X] done item\n"
+                         "  continued prose\n"
+                         "- plain\n"))
+         (doc (gdocs-dm-from-org source))
+         (paras (gdocs-dm-paragraphs doc)))
+    (should (= (length paras) 3))
+    (should (equal (gdocs-dm-runs-text (plist-get (nth 0 paras) :runs))
+                   "[ ] unchecked item"))
+    ;; An indented line inside an item is one Org paragraph: its literal
+    ;; newline and indent are preserved in the runs.
+    (should (equal (gdocs-dm-runs-text (plist-get (nth 1 paras) :runs))
+                   "[X] done item\n  continued prose"))
+    (should (equal (gdocs-dm-runs-text (plist-get (nth 2 paras) :runs))
+                   "plain"))))
+
+(ert-deftest gdocs-test-non-bmp-text-preserves-ot-indexing ()
+  "One OT position per character holds for astral-plane characters."
+  (let* ((source "Emoji 🚀 rocket and 𝕊𝕡𝕒𝕔𝕖 math.\n")
+         (doc (gdocs-dm-from-org source))
+         (built (gdocs-dm-to-ot doc))
+         (decoded (gdocs-dm-from-ops nil nil nil (car built) (cdr built))))
+    (should (equal (gdocs-dm-runs-text
+                    (plist-get (car (gdocs-dm-paragraphs decoded)) :runs))
+                   "Emoji 🚀 rocket and 𝕊𝕡𝕒𝕔𝕖 math."))
+    ;; The emitted body length matches the model's own text length exactly.
+    (should (= (length (car built))
+               (1+ (length "Emoji 🚀 rocket and 𝕊𝕡𝕒𝕔𝕖 math."))))))
+
+(ert-deftest gdocs-test-publish-preview-discloses-fallbacks-and-blocks ()
+  "Publication analysis surfaces lossy conversions and blocking content."
+  (let* ((clean "#+title: Clean\n\nA paragraph with a link [[https://example.com][here]].\n")
+         (clean-preview (gdocs-publish-preview
+                         (gdocs-test--write-temp "clean.org" clean))))
+    (should-not (plist-get clean-preview :unsupported-summary))
+    (should (= (plist-get clean-preview :paragraph-count) 2)))
+  (let* ((lossy "#+begin_quote\nQuote.\n#+end_quote\n#+begin_src sh\nls\n#+end_src\n")
+         (lossy-preview (gdocs-publish-preview
+                         (gdocs-test--write-temp "lossy.org" lossy))))
+    (should (= (length (plist-get lossy-preview :lossy)) 2)))
+  (let* ((blocked "Text\n\n#+gdocs_unsupported: marker\n")
+         (blocked-preview (gdocs-publish-preview
+                           (gdocs-test--write-temp "blocked.org" blocked))))
+    (should (plist-get blocked-preview :unsupported-summary))))
+
+(ert-deftest gdocs-test-publish-incremental-plan-uses-raw-spans ()
+  "Incremental offsets address the raw remote body, not its normalization."
+  (let* ((ot-body "Before\n\nHeading\n\nAfter\n")
+         (heading-styles
+          (list '((ty . "as") (st . "paragraph") (si . 16) (ei . 16)
+                  (sm . ((ps_hd . 1) (ps_hd_i . :json-false))))
+                '((ty . "as") (st . "paragraph") (si . 22) (ei . 22)
+                  (sm . ((ps_hd . 1) (ps_hd_i . :json-false)))))))
+    ;; si/ei here are the 1-based positions of the paragraphs' newlines.
+    (let* ((old (gdocs-dm-from-ops
+                 3 "synthetic" nil ot-body
+                 (cons (gdocs-test--insert-op ot-body) heading-styles)))
+           (new (gdocs-dm-from-org
+                 "Before\n\n* Heading\n\nChanged\n\nMore\n"))
+           (plan (gdocs-dm-to-incremental-save-plan old new))
+           (commands (plist-get plan :commands))
+           (ds (seq-find (lambda (cmd) (equal (alist-get 'ty cmd) "ds"))
+                         commands))
+           (is (seq-find (lambda (cmd) (equal (alist-get 'ty cmd) "is"))
+                         commands)))
+      (should (eq (plist-get plan :kind) :incremental))
+      ;; The common prefix is Before + Heading (the raw blanks between them
+      ;; are normalization-only); the replaced raw mid ends the body.
+      (should (= (alist-get 'si ds) 17))
+      (should (= (alist-get 'ei ds) 23))
+      (should (= (alist-get 'ibi is) 17))
+      ;; Applying the plan (deletion + insertion + shifted style ops) to
+      ;; the raw body reproduces the new document.  Style ops for the
+      ;; untouched prefix (the Heading's ps_hd) live on the server and are
+      ;; not re-emitted by the plan.
+      (let* ((result (concat
+                      (substring ot-body 0 (1- (alist-get 'si ds)))
+                      (alist-get 's is)
+                      (substring ot-body (alist-get 'ei ds))))
+             (decoded (gdocs-dm-from-ops
+                       nil nil nil result
+                       (append (list (gdocs-test--insert-op result))
+                               heading-styles
+                               (cl-remove-if-not
+                                (lambda (cmd)
+                                  (equal (alist-get 'ty cmd) "as"))
+                                commands)))))
+        (should (equal (gdocs-test--normalize-org (gdocs-dm-to-org decoded))
+                       (gdocs-test--normalize-org
+                        (gdocs-dm-to-org new))))))))
 
 (ert-deftest gdocs-test-generated-save-command-shapes-ignore-unstable-ids ()
   "Save commands expose stable OT shapes without comparing generated IDs."
@@ -3835,26 +4028,77 @@ END is the inclusive final OT position."
 
 (ert-deftest gdocs-test-async-push-transport-completes-once ()
   "Transport success and failure each preserve exactly-once completion."
-  (dolist (outcome '(((:revision 2) nil 2 nil)
-                     (nil "transport failed" nil "transport failed")))
-    (let ((callback-count 0)
-          (callback-revision :unset)
-          (callback-error :unset))
-      (cl-letf (((symbol-function 'gdocs--push-preflight) #'ignore)
-                ((symbol-function 'gdocs--run-op-result-async)
-                 (lambda (_doc _state _intent callback)
-                   (funcall callback (nth 0 outcome) (nth 1 outcome))
-                   (funcall callback (nth 0 outcome) (nth 1 outcome)))))
-        (gdocs--apply-push-async
-         "synthetic" '(:revision 1 :ot-body "remote\n")
-         "new\nremote\n" "remote\n" nil
-         (lambda (revision err)
-           (cl-incf callback-count)
-           (setq callback-revision revision
-                 callback-error err))))
-      (should (= callback-count 1))
-      (should (equal callback-revision (nth 2 outcome)))
-      (should (equal callback-error (nth 3 outcome))))))
+  (let ((gdocs-verify-after-save nil))
+    (dolist (outcome '(((:revision 2) nil 2 nil)
+                       (nil "transport failed" nil "transport failed")))
+      (let ((callback-count 0)
+            (callback-revision :unset)
+            (callback-error :unset))
+        (cl-letf (((symbol-function 'gdocs--push-preflight) #'ignore)
+                  ((symbol-function 'gdocs--run-op-result-async)
+                   (lambda (_doc _state _intent callback)
+                     (funcall callback (nth 0 outcome) (nth 1 outcome))
+                     (funcall callback (nth 0 outcome) (nth 1 outcome)))))
+          (gdocs--apply-push-async
+           "synthetic" '(:revision 1 :ot-body "remote\n")
+           "new\nremote\n" "remote\n" nil
+           (lambda (revision err)
+             (cl-incf callback-count)
+             (setq callback-revision revision
+                   callback-error err))))
+        (should (= callback-count 1))
+        (should (equal callback-revision (nth 2 outcome)))
+        (should (equal callback-error (nth 3 outcome)))))))
+
+(ert-deftest gdocs-test-async-push-verification-refetches-and-confirms ()
+  "With verification on, a committed save is confirmed by a fresh refetch."
+  (let ((gdocs-verify-after-save t)
+        (callback-revision :unset)
+        (callback-error :unset)
+        (callback-count 0)
+        (verify-state '(:revision 2 :ot-body "new\nremote\n")))
+    (cl-letf (((symbol-function 'gdocs--push-preflight) #'ignore)
+              ((symbol-function 'gdocs--run-op-result-async)
+               (lambda (_doc _state _intent callback)
+                 (funcall callback '(:revision 2) nil)))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback)
+                 (funcall callback verify-state nil))))
+      (gdocs--apply-push-async
+       "synthetic" '(:revision 1 :ot-body "remote\n")
+       "new\nremote\n" "remote\n" nil
+       (lambda (revision err)
+         (cl-incf callback-count)
+         (setq callback-revision revision callback-error err))))
+    (should (= callback-count 1))
+    (should (= callback-revision 2))
+    (should-not callback-error)))
+
+(ert-deftest gdocs-test-async-push-verification-mismatch-reports-error ()
+  "A verification refetch that decodes differently is reported, not cleaned."
+  (let ((gdocs-verify-after-save t)
+        (callback-revision :unset)
+        (callback-error :unset)
+        (callback-count 0))
+    (cl-letf (((symbol-function 'gdocs--push-preflight) #'ignore)
+              ((symbol-function 'gdocs--run-op-result-async)
+               (lambda (_doc _state _intent callback)
+                 (funcall callback '(:revision 2) nil)))
+              ((symbol-function 'gdocs--fetch-edit-state-async)
+               (lambda (_doc callback)
+                 ;; Refetched body does not match the expected round-trip.
+                 (funcall callback
+                          '(:revision 2 :ot-body "unexpected\n") nil))))
+      (gdocs--apply-push-async
+       "synthetic" '(:revision 1 :ot-body "remote\n")
+       "new\nremote\n" "remote\n" nil
+       (lambda (revision err)
+         (cl-incf callback-count)
+         (setq callback-revision revision callback-error err))))
+    (should (= callback-count 1))
+    (should (= callback-revision 2))
+    (should callback-error)
+    (should (string-match-p "unexpected remote content" callback-error))))
 
 (ert-deftest gdocs-test-async-push-committed-body-remains-clean ()
   "A successful push records the captured body as the clean baseline."
@@ -6409,7 +6653,9 @@ that a removed preflight guard would be observed as an unexpected success."
     (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
                (lambda (_doc callback)
                  (funcall callback
-                          '(:revision 7 :token "token" :ouid "ouid")
+                          (list :revision 7 :token "token" :ouid "ouid"
+                                :ot-body "same\n"
+                                :ot-ops (list (gdocs-test--insert-op "same\n")))
                           "synthetic-html" nil)))
               ((symbol-function 'gdocs--ot-remote-org-body)
                (lambda (&rest _args) "same"))
@@ -6425,7 +6671,9 @@ that a removed preflight guard would be observed as an unexpected success."
     (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
                (lambda (_doc callback)
                  (funcall callback
-                          '(:revision 7 :token "token" :ouid "ouid")
+                          (list :revision 7 :token "token" :ouid "ouid"
+                                :ot-body "remote\n"
+                                :ot-ops (list (gdocs-test--insert-op "remote\n")))
                           "synthetic-html" nil)))
               ((symbol-function 'gdocs--ot-remote-org-body)
                (lambda (&rest _args) "remote"))
@@ -6893,37 +7141,40 @@ that a removed preflight guard would be observed as an unexpected success."
 
 (ert-deftest gdocs-test-unexpected-success-delays-baseline-until-post-body-confirmed ()
   "Unexpected revision metadata cannot update the baseline before refetch."
-  (let* ((state (gdocs-test--push-state 1 "A"))
-         fetch-callback
-         callback-revision callback-error)
-    (with-temp-buffer
-      (insert ":PROPERTIES:\n:GDOC_REVISION: 1\n"
-              ":GDOC_CONTENT_HASH: old-hash\n:END:\n\nA!\n")
-      (org-mode)
-      (setq gdocs--last-synced-hash "old-baseline")
-      (cl-letf (((symbol-function 'gdocs--save-request-async)
-                 (lambda (_doc _state _commands callback)
-                   (funcall callback
-                            '((metadata . ((serverRevision . 3)))) nil)))
-                ((symbol-function 'gdocs--fetch-edit-state-async)
-                 (lambda (_doc callback) (setq fetch-callback callback))))
-        (gdocs--apply-push-async
-         "synthetic" state "A!" "A" (current-buffer)
-         (lambda (revision err)
-           (setq callback-revision revision callback-error err)))
-        (should fetch-callback)
-        (should-not callback-revision)
-        (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "1"))
-        (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
-                       "old-hash"))
-        (should (equal gdocs--last-synced-hash "old-baseline"))
-        (funcall fetch-callback (gdocs-test--push-state 2 "A!") nil)
-        (should (= callback-revision 2))
-        (should-not callback-error)
-        (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "2"))
-        (should-not (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
-                           "old-hash"))
-        (should-not (equal gdocs--last-synced-hash "old-baseline"))))))
+  ;; Read-after-write verification is exercised by dedicated tests; this
+  ;; test pins the reconcile flow itself.
+  (let ((gdocs-verify-after-save nil))
+    (let* ((state (gdocs-test--push-state 1 "A\n"))
+           fetch-callback
+           callback-revision callback-error)
+      (with-temp-buffer
+        (insert ":PROPERTIES:\n:GDOC_REVISION: 1\n"
+                ":GDOC_CONTENT_HASH: old-hash\n:END:\n\nA!\n")
+        (org-mode)
+        (setq gdocs--last-synced-hash "old-baseline")
+        (cl-letf (((symbol-function 'gdocs--save-request-async)
+                   (lambda (_doc _state _commands callback)
+                     (funcall callback
+                              '((metadata . ((serverRevision . 3)))) nil)))
+                  ((symbol-function 'gdocs--fetch-edit-state-async)
+                   (lambda (_doc callback) (setq fetch-callback callback))))
+          (gdocs--apply-push-async
+           "synthetic" state "A!\n" "A\n" (current-buffer)
+           (lambda (revision err)
+             (setq callback-revision revision callback-error err)))
+          (should fetch-callback)
+          (should-not callback-revision)
+          (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "1"))
+          (should (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                         "old-hash"))
+          (should (equal gdocs--last-synced-hash "old-baseline"))
+          (funcall fetch-callback (gdocs-test--push-state 2 "A!\n") nil)
+          (should (= callback-revision 2))
+          (should-not callback-error)
+          (should (equal (org-entry-get (point-min) "GDOC_REVISION" t) "2"))
+          (should-not (equal (org-entry-get (point-min) "GDOC_CONTENT_HASH" t)
+                             "old-hash"))
+          (should-not (equal gdocs--last-synced-hash "old-baseline")))))))
 
 (ert-deftest gdocs-test-sync-unexpected-success-confirms-without-replay ()
   "The synchronous path also reconciles an unexpected success exactly once."
