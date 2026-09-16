@@ -2634,6 +2634,53 @@ END is the inclusive final OT position."
                '((metadata . ((serverRevision . 2))))))
   (should-not (gdocs--save-response-xsrf-token nil)))
 
+(ert-deftest gdocs-test-doc-body-title-extracts-title-paragraph ()
+  "The body title is the first Title-kind paragraph's text."
+  (let ((doc (gdocs-dm-from-org "#+TITLE: The Brief\n\nBody.\n")))
+    (should (equal (gdocs--doc-body-title doc) "The Brief")))
+  (let ((doc (gdocs-dm-from-org "No title here.\n")))
+    (should-not (gdocs--doc-body-title doc))))
+
+(ert-deftest gdocs-test-rename-uses-bearer-when-token-configured ()
+  "With an OAuth token the rename PATCHes the Drive API with Bearer auth."
+  (let* ((gdocs-drive-oauth-token "token-123")
+         (gdocs--drive-rename-gave-up nil)
+         (captured nil)
+         (gdocs-auth-function (lambda () (list (cons "Cookie" "x=1")))))
+    (cl-letf (((symbol-function 'gdocs--curl-async)
+               (lambda (url method headers body callback)
+                 (setq captured (list url method headers body))
+                 (funcall callback "{\"name\":\"T\"}" 200 nil))))
+      (let ((result :pending))
+        (gdocs-rename-remotely "doc-id" "T" (lambda (title err)
+                                              (setq result (list title err))))
+        (should (equal result '("T" nil)))
+        (should (string-match-p "www.googleapis.com/drive/v3/files/doc-id"
+                                (nth 0 captured)))
+        (should (equal (nth 1 captured) "PATCH"))
+        (should (string-match-p "Bearer token-123"
+                                (prin1-to-string (nth 2 captured))))))))
+
+(ert-deftest gdocs-test-rename-without-token-stops-after-rejection ()
+  "The cookie-authenticated rename gives up after the first 401/403."
+  (let* ((gdocs-drive-oauth-token nil)
+         (gdocs--drive-rename-gave-up nil)
+         (gdocs-auth-function (lambda () (list (cons "Cookie" "SAPISID=s"))))
+         (attempts 0))
+    (cl-letf (((symbol-function 'gdocs--curl-async)
+               (lambda (_url _method _headers _body callback)
+                 (cl-incf attempts)
+                 (funcall callback nil 403 nil))))
+      (let ((first :pending))
+        (gdocs-rename-remotely "doc-id" "T" (lambda (_t err) (setq first err)))
+        (should first)
+        (should (string-match-p "requires gdocs-drive-oauth-token" first)))
+      ;; The second call short-circuits without a request.
+      (let ((second :pending))
+        (gdocs-rename-remotely "doc-id" "T" (lambda (_t err) (setq second err)))
+        (should (string-match-p "unavailable" second)))
+      (should (= attempts 1)))))
+
 (ert-deftest gdocs-test-publish-preview-discloses-fallbacks-and-blocks ()
   "Publication analysis surfaces lossy conversions and blocking content."
   (let* ((clean "#+title: Clean\n\nA paragraph with a link [[https://example.com][here]].\n")

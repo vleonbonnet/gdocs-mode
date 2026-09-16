@@ -10232,6 +10232,121 @@ without logging raw content."
 ;; concurrently changed revision, and verifies the committed result by
 ;; refetching it.
 
+(defconst gdocs-drive-rename-base
+  "https://drivefrontend-pa.clients6.google.com/drive/v3/files"
+  "Cookie-authenticated Drive file endpoint used by the editors frontend.
+
+The documented googleapis.com Drive API requires OAuth; the editors'
+own frontend proxy accepts the browser's SAPISIDHASH authorization
+derived from the same cookie jar the /save protocol uses.")
+
+(defcustom gdocs-drive-oauth-token nil
+  "Optional OAuth access token with the Drive `drive.file' scope.
+
+When non-nil, document renames use `Authorization: Bearer' on the
+Google Drive API, which is the reliable path (Google's current
+frontends reject cookie-only Drive API calls with 401/403).  When nil,
+the rename falls back to the browser's SAPISIDHASH authorization and
+silently gives up after the first rejection."
+  :type '(choice (const :tag "None" nil) string)
+  :group 'gdocs-mode)
+
+(defvar gdocs--drive-rename-gave-up nil
+  "Non-nil after a cookie-authenticated rename was rejected once.
+Avoids log-spamming the failure on every publish for the session.")
+
+(defun gdocs--cookie-value (name)
+  "Return cookie NAME's value from the auth function's Cookie header, or nil."
+  (let ((cookie (cdr (assoc "Cookie" (gdocs--auth-headers)))))
+    (and (stringp cookie)
+         (string-match (concat "\\(?:^\\|;\\s-*\\)"
+                               (regexp-quote name) "=\\([^;]+\\)")
+                       cookie)
+         (match-string 1 cookie))))
+
+(defun gdocs--sapisidhash-header ()
+  "Build the SAPISIDHASH Authorization header, or nil without a SAPISID.
+The hash is bound to the docs.google.com origin because that is the
+origin the browser session (and therefore the SAPISID cookie) is
+associated with."
+  (let ((sapisid (gdocs--cookie-value "SAPISID")))
+    (when (and sapisid (not (string-empty-p sapisid)))
+      (let* ((ts (format-time-string "%s"))
+             (origin "https://docs.google.com")
+             (hash (secure-hash 'sha1 (concat ts " " origin " " sapisid))))
+        (format "SAPISIDHASH %s_%s" ts hash)))))
+
+(defun gdocs-rename-remotely (doc-id title callback)
+  "Rename the Drive document DOC-ID to TITLE asynchronously.
+CALLBACK is called exactly once as `(funcall CALLBACK TITLE ERR)'.
+
+With `gdocs-drive-oauth-token' the rename uses the documented Drive API
+and reliably succeeds.  Without a token the browser's SAPISIDHASH
+authorization is attempted; Google currently rejects it (the cookie
+session lacks the Drive scope), so the first rejection sets
+`gdocs--drive-rename-gave-up' and later renames skip the request with a
+nil CALLBACK result and a \"not available\" error."
+  (cond
+   (gdocs-drive-oauth-token
+    (let* ((url (format "https://www.googleapis.com/drive/v3/files/%s"
+                        doc-id))
+           (headers (append
+                     `(("Content-Type" . "application/json; charset=utf-8")
+                       ("Authorization" . ,(concat "Bearer "
+                                                   gdocs-drive-oauth-token)))
+                     (gdocs--auth-headers)))
+           (data (encode-coding-string (json-encode `((name . ,title)))
+                                       'utf-8)))
+      (gdocs--curl-async url "PATCH" headers data
+                         (lambda (_raw code err)
+                           (cond
+                            (err (funcall callback nil err))
+                            ((and (integerp code) (>= code 200) (< code 300))
+                             (funcall callback title nil))
+                            (t
+                             (funcall callback nil (format "HTTP %s" code))))))))
+   (gdocs--drive-rename-gave-up
+    (funcall callback nil "Drive rename unavailable without gdocs-drive-oauth-token"))
+   (t
+    (let* ((url (format "%s/%s?fields=name" gdocs-drive-rename-base doc-id))
+           (headers (append
+                     `(("Content-Type" . "application/json; charset=utf-8")
+                       ("Origin" . "https://docs.google.com")
+                       ("X-Goog-AuthUser" . "0")
+                       ("Referer" . "https://docs.google.com/")
+                       ("User-Agent" . ,gdocs-default-user-agent))
+                     (gdocs--auth-headers)
+                     (let ((auth (gdocs--sapisidhash-header)))
+                       (and auth (list (cons "Authorization" auth))))))
+           (data (encode-coding-string (json-encode `((name . ,title))) 'utf-8)))
+      (gdocs--curl-async url "PATCH" headers data
+                         (lambda (_raw code err)
+                           (cond
+                            (err (funcall callback nil err))
+                            ((and (integerp code) (>= code 200) (< code 300))
+                             (funcall callback title nil))
+                            ;; Cookie-authenticated Drive calls are
+                            ;; forbidden on Google's current frontends;
+                            ;; don't retry on every publish.
+                            ((memq code '(401 403))
+                             (setq gdocs--drive-rename-gave-up t)
+                             (funcall
+                              callback
+                              nil
+                              "Drive rename requires gdocs-drive-oauth-token (cookie authorization rejected)"))
+                            (t
+                             (funcall callback nil (format "HTTP %s" code))))))))))
+
+(defun gdocs--doc-body-title (doc)
+  "Return DOC's body title (the first Title-kind paragraph's text), or nil."
+  (cl-some
+   (lambda (paragraph)
+     (when (eq (plist-get paragraph :kind) :title)
+       (let ((text (string-trim (gdocs-dm-runs-text (plist-get paragraph :runs)))))
+         (and (not (string-empty-p text)) text))))
+   (gdocs-dm-paragraphs doc)))
+
+
 (defcustom gdocs-publish-registry-file
   (expand-file-name "gdocs-publish-registry.el" user-emacs-directory)
   "File recording source-file → Google Doc associations.
@@ -10239,6 +10354,15 @@ without logging raw content."
 Each entry stores the last published revision so a later publish refuses
 to overwrite concurrent remote changes instead of clobbering them."
   :type 'file
+  :group 'gdocs-mode)
+
+(defcustom gdocs-publish-rename-from-title t
+  "Rename the Drive document to the source's `#+TITLE:' after publishing.
+
+The rename happens best-effort after the content is committed and
+verified; a failure is logged but does not fail the publish.  Without a
+`#+TITLE:' the document name is left alone."
+  :type 'boolean
   :group 'gdocs-mode)
 
 (defvar gdocs--publish-registry nil
@@ -10487,6 +10611,38 @@ where RESULT is a plist with `:revision', `:verified', `:lossy', and
                               (format ", %d disclosed fallbacks"
                                       (length lossy))
                             ""))
+               ;; The Drive document name follows the source's `#+TITLE:'
+               ;; automatically.  A body `#+title:' is a pushable Title
+               ;; paragraph; the Drive name is separate metadata and is
+               ;; renamed best-effort after the content is committed.
+               (let ((body-title (gdocs--doc-body-title
+                                  (plist-get analysis :doc))))
+                 (cond
+                  ((and gdocs-publish-rename-from-title body-title
+                        (plist-get state :title)
+                        (not (string= body-title
+                                      (plist-get state :title))))
+                   (gdocs-rename-remotely
+                    doc-id body-title
+                    (lambda (renamed r-err)
+                      (if r-err
+                          (gdocs-log
+                           (if (string-match-p "unavailable\\|requires" r-err)
+                               'info 'warn)
+                           "Rename of %s to %S skipped: %s"
+                           doc-id body-title r-err)
+                        (gdocs-log
+                         'info
+                         "Renamed %s to %S" doc-id renamed))
+                      (when (buffer-live-p buffer)
+                        (with-current-buffer buffer
+                          (when renamed
+                            (gdocs--put-top-property
+                             "GDOC_TITLE" renamed)))))))
+                  (body-title
+                   (when (buffer-live-p buffer)
+                     (with-current-buffer buffer
+                       (gdocs--put-top-property "GDOC_TITLE" body-title))))))
                (when (buffer-live-p buffer)
                  (with-current-buffer buffer
                    (gdocs-pull-locally doc-id)))
