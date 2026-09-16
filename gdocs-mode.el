@@ -1163,6 +1163,52 @@ one of these types is NOT understood and stays fail-closed.")
        (listp op)
        (equal (alist-get 'si op) (alist-get 'ei op))))
 
+(defconst gdocs--capability-annotation-attribute-types
+  '("bookmark_range" "comment" "ignore_spellcheck" "import_warnings"
+    "markup" "named_range" "suppress_feature")
+  "Annotation-state attribute types.
+
+The editors frontend emits one `as' operation per annotation system per
+saved range, SETting the annotation ids on that range.  An op whose sets
+are all EMPTY carries no annotation content (it is the editor's
+bookkeeping for a range with no bookmarks/comments/named ranges), so it
+is preserved trivially by any push and is reported informationally.  An
+op carrying non-empty annotation ids is real content and stays
+fail-closed.")
+
+(defun gdocs--capability-annotation-op-empty-p (sm)
+  "Return non-nil when SM only clears or declares empty annotation sets.
+Every entry must be an explicitness flag (`*_i'), a boolean, or a
+`cv'-wrapped set operation whose `opValue' is empty.  A link envelope
+(`lnks_link' without a string `ulnk_url') is also an empty marker."
+  (and (listp sm)
+       (cl-every
+        (lambda (entry)
+          (let ((key (car-safe entry))
+                (value (cdr-safe entry)))
+            (or (memq value '(t :json-false))
+                (null value)
+                (and (symbolp key)
+                     (string-suffix-p "_i" (symbol-name key)))
+                (and (listp value)
+                     (assq 'cv value)
+                     (let ((cv (cdr (assq 'cv value))))
+                       (and (listp cv)
+                            (equal (cdr (assq 'op cv)) "set")
+                            (let ((op-value (cdr (assq 'opValue cv))))
+                              (or (null op-value)
+                                  (and (vectorp op-value)
+                                       (= (length op-value) 0))
+                                  (and (listp op-value)
+                                       (null op-value)))))))
+                ;; A link clear-envelope: lnks_link without a usable URL.
+                (and (listp value)
+                     (assq 'lnks_link value)
+                     (not (stringp
+                           (cdr (assq 'ulnk_url
+                                      (cdr (assq 'lnks_link value))))))))))
+        sm)))
+
 (defun gdocs--capability-font-family-style (family)
   "Return the exact Org style represented by FONT or nil.
 
@@ -1188,6 +1234,7 @@ no Org inline marker."
                    (:local-unsupported . "local unsupported-content marker")
                    (:unsupported-entity . "unsupported entity")
                    (:document-settings . "document setting")
+                   (:annotation-state . "empty annotation marker")
                    (:lossy-fallback . "disclosed fallback"))))
       (replace-regexp-in-string "-" " " (symbol-name kind))))
 
@@ -1205,6 +1252,7 @@ no Org inline marker."
     (:local-unsupported "local unsupported-content markers")
     (:unsupported-entity "unsupported entities")
     (:document-settings "document settings")
+    (:annotation-state "empty annotation markers")
     (:lossy-fallback "disclosed fallbacks")
     (_ (concat (gdocs--capability-kind-label kind) "s"))))
 
@@ -2751,6 +2799,22 @@ report. Inline image reports are produced by
                          op :feature-type (if (stringp style) style "unknown")
                          :refuse-push t)
                         reports)))
+               ;; Annotation-state envelopes whose sets are all empty
+               ;; carry no content (the editor's range bookkeeping) and
+               ;; are preserved trivially.  Real annotation ids stay
+               ;; fail-closed via the unknown branch below.
+               ((and (member style
+                             gdocs--capability-annotation-attribute-types)
+                     (gdocs--capability-annotation-op-empty-p sm))
+                (push (gdocs--capability-report-for-op
+                       :annotation-state
+                       "An empty annotation-state marker (no bookmarks, comments, or named ranges on this range); it carries no content."
+                       op :feature-type (if (stringp style) style "annotation")
+                       :severity :informational
+                       :preserve-untouched t
+                       :refuse-push nil
+                       :push-policy :allow-push)
+                      reports))
                ((eq style-class :unknown)
                 (push (gdocs--capability-report-for-op
                        :unknown-feature
@@ -2827,7 +2891,9 @@ report. Inline image reports are produced by
                         reports)))
                ((equal style "link")
                 (let ((action (gdocs--link-sm-action sm)))
-                  (when (eq (plist-get action :action) :invalid)
+                  (unless (or (memq (plist-get action :action) '(:set :clear))
+                              ;; A link clear-envelope carries no URL.
+                              (gdocs--capability-annotation-op-empty-p sm))
                     (push (gdocs--capability-report-for-op
                            :unsupported-style
                            "A remote link modifier is malformed and cannot be safely round-tripped."
@@ -2836,12 +2902,13 @@ report. Inline image reports are produced by
                            :push-policy :allow-if-untouched)
                           reports))))
                ((equal style "doco_anchor")
-                (push (gdocs--capability-report-for-op
-                       :comment-anchor
-                       "A remote comment anchor is not emitted by the OT encoder; it can be preserved only when left untouched."
-                       op :preserve-untouched t :refuse-push nil
-                       :push-policy :allow-if-untouched)
-                      reports))
+                (unless (gdocs--capability-annotation-op-empty-p sm)
+                  (push (gdocs--capability-report-for-op
+                         :comment-anchor
+                         "A remote comment anchor is not emitted by the OT encoder; it can be preserved only when left untouched."
+                         op :preserve-untouched t :refuse-push nil
+                         :push-policy :allow-if-untouched)
+                        reports)))
                ((eq style-class :recognized-not-editable)
                 (push (gdocs--capability-report-for-op
                        :unknown-feature
@@ -7363,7 +7430,15 @@ stale buffer-local capability metadata cannot bypass policy."
               (cond
                ((eq gdocs-push-backend 'ot-incremental)
                 (plist-get incremental-plan :kind))
-               ((string= remote-mappable local-stripped) :noop)
+               ((or (string= remote-mappable local-stripped)
+                    ;; Content that differs only in Org spelling (keyword
+                    ;; case, padding) is a no-op too: the canonical
+                    ;; round-trip render of the local body matches remote.
+                    (string= remote-mappable
+                             (gdocs--push-comparison-body
+                              (gdocs--push-expected-remote-body
+                               (gdocs-dm-from-org local-body)))))
+                :noop)
                ((eq gdocs-push-backend 'ot-encode) :full-replace)
                (t :incremental))))
         (list :kind kind
@@ -7587,18 +7662,13 @@ of OT ops (alists). Returns parsed JSON response (XSSI-stripped)."
          (form (format "rev=%s&bundles=%s"
                        (number-to-string rev)
                        (url-hexify-string bundles)))
-         ;; The X-Rel-Id / X-Build / X-Client-Deadline-Ms triple is the
-         ;; browser-fingerprint set the editors frontend sends; Google
-         ;; uses it as a "real client" heuristic and 550s without it.
-         ;; X-Build prefers the document page's own `buildLabel' and falls
-         ;; back to `gdocs-save-build-header'.
+         ;; The X-Rel-Id / X-Build / X-Client-Deadline-Ms triple was the
+         ;; browser-fingerprint set of the 2026-05 frontend; the current
+         ;; frontend VALIDATES it and rejects mismatches with 400/err 3,
+         ;; so the plain header set is sent instead.
          (headers (append
                    `(("Content-Type" . "application/x-www-form-urlencoded;charset=utf-8")
                      ("X-Same-Domain" . "1")
-                     ("X-Rel-Id" . "30a.558e52c.s")
-                     ("X-Build" . ,(or (plist-get state :build-label)
-                                       gdocs-save-build-header))
-                     ("X-Client-Deadline-Ms" . "20000")
                      ("Origin" . "https://docs.google.com")
                      ("Referer" . ,(format "https://docs.google.com/document/d/%s/edit" doc-id))
                      ("User-Agent" . ,gdocs-default-user-agent))
@@ -8044,10 +8114,6 @@ On curl error, ERR is a string."
          (headers (append
                    `(("Content-Type" . "application/x-www-form-urlencoded;charset=utf-8")
                      ("X-Same-Domain" . "1")
-                     ("X-Rel-Id" . "30a.558e52c.s")
-                     ("X-Build" . ,(or (plist-get state :build-label)
-                                       gdocs-save-build-header))
-                     ("X-Client-Deadline-Ms" . "20000")
                      ("Origin" . "https://docs.google.com")
                      ("Referer" . ,(format "https://docs.google.com/document/d/%s/edit" doc-id))
                      ("User-Agent" . ,gdocs-default-user-agent))
@@ -8611,9 +8677,10 @@ the current one and the request may be retried with it."
                    :state fresh-state
                    :plan plan)
              nil))
-   ((and retryable (eq outcome :retry) (< attempt 2))
+   ((and retryable (eq outcome :retry) (< attempt 5))
     ;; The replanner sees FRESH-STATE; PLAN and its positional operation are
-    ;; never replayed.
+    ;; never replayed.  Throttles and rotated smb/token races (400/err 3)
+    ;; recover by replanning against the refetched state.
     (gdocs--run-op-result-async-step
      doc-id fresh-state intent callback (1+ attempt)))
    (t
@@ -8668,7 +8735,16 @@ the current one and the request may be retried with it."
                 doc-id intent plan callback attempt
                 (error-message-string revision-sig) nil t)))))))
        (t
-        (let* ((retryable (gdocs--async-throttle-error-p err))
+        (let* ((retryable (or (gdocs--async-throttle-error-p err)
+                              ;; The current frontend rejects a save whose
+                              ;; smb segment or token was rotated by a
+                              ;; concurrent page load (every /edit fetch
+                              ;; rotates them) with 400/err 3. Refetching
+                              ;; the full state and retrying is the same
+                              ;; recovery the browser performs.
+                              (and (listp err)
+                                   (= (or (plist-get err :http-code) 0) 400)
+                                   (= (or (plist-get err :err-code) 0) 3))))
                (failure
                 (if (listp err)
                     (format "/save rejected (http %s err %s)"
@@ -8678,8 +8754,8 @@ the current one and the request may be retried with it."
           (when retryable
             (gdocs-log
              'warn
-             "/save rejected (err 13, di %s) attempt %d, verifying in %ds"
-             (plist-get err :di) attempt gdocs--rate-limit-retry-delay))
+             "/save rejected (attempt %d), refetching state and retrying"
+             attempt))
           (gdocs--run-op-result-async-reconcile
            doc-id intent plan callback attempt failure retryable))))
     (error
@@ -9055,6 +9131,16 @@ reported revision semantics.  BUFFER is where property writes go."
                  (appended
                   (gdocs--diff-append remote-mappable local-stripped)))
             (cond
+             ;; Content that already matches remote — directly or after the
+             ;; canonical round-trip render (Org keyword case and padding) —
+             ;; needs no save at all.
+             ((or (string= local-stripped remote-mappable)
+                  (string= remote-mappable
+                           (gdocs--push-comparison-body
+                            (gdocs--push-expected-remote-body
+                             (gdocs-dm-from-org local-body)))))
+              (finalize (plist-get state :revision) nil
+                        ", no changes (content matches remote)"))
              ;; Full OT bundles use the same intent engine.  A throttle is only
              ;; retryable when the exact target body can be observed or the
              ;; exact pre-state is still present for a fresh command rebuild.
@@ -9975,6 +10061,10 @@ writing a final hash baseline."
 Single GET on /edit gives both the edit state and the modelChunk we
 decode into the org view we diff against. Releases the sync mutex on
 completion or error."
+  ;; Editor save sessions expire server-side within minutes of inactivity;
+  ;; a sporadic push must start from a fresh session id or the /save is
+  ;; rejected (400/err 3).
+  (gdocs-session-reset)
   (let* ((done nil)
          (release
           (lambda (err)
@@ -10192,7 +10282,11 @@ disclosed fallback explanations), `:unsupported-summary' (non-nil text
 blocks publication), and `:expected-org' (the round-trip render that a
 committed document must decode back to)."
   (let* ((org-text (with-temp-buffer
-                     (insert-file-contents-literally source)
+                     ;; Decoded read (NOT literally): the source is UTF-8 and
+                     ;; the OT model indexes CHARACTERS.  A literal read makes
+                     ;; every multi-byte character three raw bytes, shifting
+                     ;; all style-op positions after it.
+                     (insert-file-contents source)
                      (buffer-string)))
          (doc (gdocs-dm-from-org org-text))
          (unsupported (gdocs-dm-unsupported doc)))
@@ -10339,6 +10433,9 @@ where RESULT is a plist with `:revision', `:verified', `:lossy', and
                  (format "Publish with disclosed fallbacks (%s)? "
                          (string-join lossy "; ")))
           (user-error "gdocs: publish cancelled"))))
+    ;; Save sessions expire within minutes; publish always saves from a
+    ;; fresh one.
+    (gdocs-session-reset)
     (let* ((state (gdocs--fetch-edit-state doc-id))
            (remote-rev (and state (plist-get state :revision)))
            (remote-body

@@ -2608,10 +2608,7 @@ END is the inclusive final OT position."
 
 (ert-deftest gdocs-test-save-request-smb-pair-quotes-segment ()
   "The smb query parameter serializes the segment as a JSON string."
-  (let* ((state (list :revision 2 :token "tok" :ouid "ouid"
-                      :smv 2147483647 :smb-seg "oAMQAg=="
-                      :ot-ops nil :ot-body ""))
-         (url nil))
+  (let ((url nil))
     (cl-letf (((symbol-function 'gdocs--curl-async)
                (lambda (_url _method _headers _body _callback)
                  nil))
