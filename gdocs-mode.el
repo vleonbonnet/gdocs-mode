@@ -332,7 +332,9 @@ request.el's chatty backend logs so *Messages* stays clean."
 (defun gdocs--doc-id-from-buffer ()
   "Return GDOC_ID from current buffer's top-level node, or nil."
   (and (derived-mode-p 'org-mode)
-       (org-entry-get (point-min) "GDOC_ID" t)))
+       (save-excursion
+         (goto-char (point-min))
+         (org-entry-get (point) "GDOC_ID" nil))))
 
 (defun gdocs--get-doc-id (&optional doc-id)
   "Resolve DOC-ID, or fall back to buffer property, link at point, or prompt."
@@ -859,6 +861,426 @@ styling, headings, lists, tables, and code blocks."
               (setq rev chunk-rev))
             (setq ops (nconc ops (copy-sequence chunk)))))
         (when ops (list :revision rev :ops ops))))))
+
+(defun gdocs--tab-op-body (ops)
+  "Return the text inserted by OPS, in their OT order."
+  (mapconcat (lambda (op) (alist-get 's op))
+             (seq-filter (lambda (op) (equal (alist-get 'ty op) "is")) ops)
+             ""))
+
+(defun gdocs--tabs-from-ops (ops)
+  "Split OPS into ordered tab plists, or signal on unknown tab structure.
+Each tab has :id, :title, :icon, :path, :ops and :ot-body.  Nil means the
+document uses the original, single-body format.  Indices within a tab's
+operations are local to that tab, not to the combined document."
+  (let (root declarations tabs)
+    (dolist (op ops)
+      (pcase (alist-get 'ty op)
+        ("mkch"
+         (unless (and (null root)
+                      (consp (alist-get 'd op))
+                      (consp (car (alist-get 'd op)))
+                      (equal (alist-get 'd op)
+                             (list (list 1 (cadar (alist-get 'd op)))))
+                      (stringp (cadar (alist-get 'd op))))
+           (error "gdocs: unrecognized first tab declaration"))
+         (setq root (cadar (alist-get 'd op))))
+        ("ac"
+         (let* ((data (alist-get 'd op))
+                (id (nth 0 data)) (properties (nth 1 data))
+                (path (nth 2 data))
+                (title (and (listp properties)
+                            (cadr (member 1 properties))))
+                (icon (and (listp properties)
+                           (cadr (member 2 properties)))))
+           (unless (and (= (length data) 3) (stringp id)
+                        (string-match-p "\\`t\\.[A-Za-z0-9]+\\'" id)
+                        (stringp title) (not (string-empty-p title))
+                        (or (null icon) (stringp icon))
+                        (listp properties) (cl-evenp (length properties))
+                        (= (cl-count 1 properties) 1)
+                        (<= (cl-count 2 properties) 1)
+                        (cl-loop for (key value) on properties by #'cddr
+                                 always (and (memq key '(1 2)) (stringp value)))
+                        (consp path) (cl-every #'natnump path))
+             (error "gdocs: unrecognized tab declaration"))
+           (push (list :id id :title title :icon icon :path path
+                       :ops nil :ot-body "")
+                 declarations)))))
+    (when (and declarations (not root))
+      (error "gdocs: missing first tab declaration"))
+    (when (and (not declarations)
+               (seq-some (lambda (op) (equal (alist-get 'ty op) "nm")) ops))
+      (error "gdocs: tab operations without tab declarations"))
+    (when declarations
+      (setq tabs (list (list :id "t.0" :title root :path '(0)
+                             :ops nil :ot-body "")))
+      (dolist (tab (sort declarations
+                         (lambda (a b)
+                           (let ((pa (plist-get a :path)) (pb (plist-get b :path)))
+                             (catch 'order
+                               (cl-loop for x in pa for y in pb
+                                        when (/= x y) do (throw 'order (< x y)))
+                               (< (length pa) (length pb)))))))
+        (let* ((path (plist-get tab :path))
+               (siblings (seq-filter
+                          (lambda (entry)
+                            (equal (butlast (plist-get entry :path))
+                                   (butlast path))) tabs))
+               (parent (and (> (length path) 1)
+                            (seq-find (lambda (entry)
+                                        (equal (plist-get entry :path)
+                                               (butlast path))) tabs))))
+          (unless (and (or (and (= (length path) 1)
+                                (= (car path) 1))
+                           (and parent
+                                (= (length (plist-get parent :path))
+                                   (1- (length path)))))
+                       (= (car (last path)) (length siblings))
+                       (not (seq-find (lambda (entry)
+                                        (equal (plist-get entry :id)
+                                               (plist-get tab :id))) tabs)))
+            (error "gdocs: inconsistent tab tree"))
+          (setq tabs (append tabs (list tab)))))
+      (dolist (op ops)
+        (let* ((ty (alist-get 'ty op))
+               (nmr (alist-get 'nmr op))
+               (tab (if (equal ty "nm")
+                        (and (listp nmr) (= (length nmr) 2)
+                             (equal (car nmr) "ksm")
+                             (seq-find (lambda (entry)
+                                         (equal (plist-get entry :id) (cadr nmr)))
+                                       (cdr tabs)))
+                      (car tabs))))
+          (when (and (equal ty "nm")
+                     (not (and tab (listp (alist-get 'nmc op))
+                               (stringp (alist-get 'ty (alist-get 'nmc op)))
+                               (not (member (alist-get 'ty (alist-get 'nmc op))
+                                            '("mkch" "ac" "nm" "utlp" "umv"))))))
+            (error "gdocs: unrecognized tab operation"))
+          (unless (member ty '("mkch" "ac" "utlp" "umv"))
+            (push (if (equal ty "nm") (alist-get 'nmc op) op)
+                  (plist-get tab :ops)))))
+      (when (seq-some (lambda (tab)
+                        (not (seq-some (lambda (op)
+                                         (equal (alist-get 'ty op) "is"))
+                                       (plist-get tab :ops)))) tabs)
+        (error "gdocs: tab has no decodable body"))
+      (dolist (tab tabs)
+        (setf (plist-get tab :ops) (nreverse (plist-get tab :ops)))
+        (setf (plist-get tab :ot-body)
+              (gdocs--tab-op-body (plist-get tab :ops))))
+      tabs)))
+
+(defun gdocs--state-for-tab (state tab-id)
+  "Return a write-planning STATE scoped to TAB-ID from a fresh edit state."
+  (let* ((tabs (plist-get state :tabs))
+         (tab (seq-find (lambda (item)
+                          (equal (plist-get item :id) tab-id)) tabs)))
+    (unless tab (user-error "gdocs: tab %s not found in remote state" tab-id))
+    (let* ((scoped (copy-sequence state))
+           (ops (plist-get tab :ops))
+           (body (plist-get tab :ot-body))
+           (analysis (gdocs--decode-capability-analysis ops body)))
+      (setq scoped (plist-put scoped :tabs nil))
+      (setq scoped (plist-put scoped :tab-id tab-id))
+      (setq scoped (plist-put scoped :ot-ops ops))
+      (setq scoped (plist-put scoped :ot-body body))
+      (setq scoped (plist-put scoped :inline-objects
+                              (plist-get analysis :objects)))
+      (plist-put scoped :unsupported (plist-get analysis :unsupported)))))
+
+(defun gdocs--local-tabs (body remote-tabs)
+  "Extract tab-local Org bodies from BODY, validating REMOTE-TABS structure.
+Tab and content headings may have the same Org level, so boundaries are
+identified by GDOC_TAB properties, never by heading depth alone."
+  (with-temp-buffer
+    (org-mode)
+    (insert body)
+    (let (headings result)
+      (org-element-map (org-element-parse-buffer) 'headline
+        (lambda (heading)
+          (let ((start (org-element-property :begin heading)))
+            (goto-char start)
+            (when-let ((id (org-entry-get start "GDOC_TAB" nil)))
+              (push (list :id id :start start
+                          :level (org-element-property :level heading)
+                          :title (org-get-heading t t t t)
+                          :icon (org-entry-get start "GDOC_TAB_ICON" nil)
+                          :body-start (save-excursion
+                                        (forward-line)
+                                        (when (looking-at org-property-drawer-re)
+                                          (goto-char (match-end 0))
+                                          (forward-line))
+                                        (point)))
+                    headings)))))
+      (setq headings (nreverse headings))
+      (unless (= (length headings) (length remote-tabs))
+        (user-error "gdocs: tab count changed; tab creation/deletion is unsupported"))
+      (unless (string-empty-p
+               (string-trim (buffer-substring-no-properties
+                             (point-min) (plist-get (car headings) :start))))
+        (user-error "gdocs: content outside the tab headings is unsupported"))
+      (cl-loop for entry in headings
+               for remote in remote-tabs
+               for next in (append (cdr headings) (list nil))
+               do (let* ((depth (length (plist-get remote :path)))
+                         (icon (plist-get remote :icon))
+                         (title (concat (if icon (concat icon " ") "")
+                                        (plist-get remote :title))))
+                    (unless (and (equal (plist-get entry :id)
+                                        (plist-get remote :id))
+                                 (= (plist-get entry :level) depth)
+                                 (equal (plist-get entry :title) title)
+                                 (equal (plist-get entry :icon) icon))
+                      (user-error "gdocs: tab order, level, title or icon changed"))
+                    (let ((text (buffer-substring-no-properties
+                                 (plist-get entry :body-start)
+                                 (if next (plist-get next :start) (point-max)))))
+                      (with-temp-buffer
+                        (org-mode)
+                        (insert (string-trim-right text) "\n")
+                        (goto-char (point-min))
+                        (while (re-search-forward "^\\(\\*+\\) " nil t)
+                          (let ((stars (match-string 1)))
+                            (when (<= (length stars) depth)
+                              (user-error "gdocs: content heading crosses tab boundary"))
+                            (replace-match (concat
+                                            (substring stars depth) " ") t t)))
+                        (push (cons (plist-get entry :id) (buffer-string))
+                              result)))))
+      (nreverse result))))
+
+(defun gdocs--plain-org-text-p (text)
+  "Non-nil when Org TEXT is only unstyled paragraphs that round-trip exactly.
+Such text maps one-to-one onto OT characters, so it can be sent as a
+literal insertion without changing its meaning."
+  (condition-case nil
+      (let* ((doc (gdocs-dm-from-org text))
+             (paras (plist-get doc :paragraphs)))
+        (and (cl-every
+              (lambda (para)
+                (and (memq (plist-get para :kind) '(:para :blank))
+                     (cl-every (lambda (run)
+                                 (and (null (plist-get run :styles))
+                                      (null (plist-get run :link))
+                                      (null (plist-get run :inline-object))))
+                               (plist-get para :runs))))
+              paras)
+             (null (plist-get doc :lossy))
+             (equal (string-trim-right (gdocs-dm-to-org doc))
+                    (string-trim-right text))))
+    (error nil)))
+
+(defun gdocs--tab-push-plan (doc-id state local-body)
+  "Plan one changed tab from LOCAL-BODY against freshly fetched STATE.
+Return nil for an exact no-op.  The current write path deliberately limits
+a multi-tab push to one tab and one incremental model change per save."
+  (let* ((tabs (plist-get state :tabs))
+         (parts (gdocs--local-tabs local-body tabs))
+         (remote-parts
+          (gdocs--local-tabs
+           (car (gdocs--render-tab-tree
+                 tabs (plist-get state :revision) doc-id)) tabs))
+         (changes nil))
+    (dolist (part parts)
+      (let* ((scoped (gdocs--state-for-tab state (car part)))
+             (remote (cdr (assoc (car part) remote-parts)))
+             (local (cdr part)))
+        (unless (string= (gdocs--push-comparison-body local)
+                         (gdocs--push-comparison-body remote))
+          (push (list :tab-id (car part) :state scoped
+                      :local local :remote remote) changes))))
+    (when (> (length changes) 1)
+      (user-error "gdocs: edit one tab at a time; multiple tab changes need separate saves"))
+    (when-let ((change (car changes)))
+      (let* ((scoped (plist-get change :state))
+             (local (plist-get change :local))
+             (remote (plist-get change :remote))
+             (diff (gdocs--diff-single-region remote local))
+             (deleted (and diff (substring-no-properties
+                                 (plist-get diff :deleted))))
+             (inserted (and diff (substring-no-properties
+                                  (plist-get diff :inserted))))
+             (start (and diff (plist-get diff :start)))
+             (ot-body (plist-get scoped :ot-body))
+             (text (gdocs--ot-plain-text ot-body))
+             ;; Only plain-text tabs are planned here: the OT body equals the
+             ;; rendered text with no structural codepoints, so a text offset
+             ;; I is exactly OT position I+1 (checked below before use).
+             (plain-p (and (equal ot-body text)
+                           (equal (string-trim-right text)
+                                  (string-trim-right remote))
+                           (not (string-match-p "[\x00-\x08\x0b-\x1f]" text))))
+             (rem-end (and diff (plist-get diff :rem-end)))
+             (range (and plain-p diff (<= rem-end (length text))
+                         (cons (1+ start) (1+ rem-end))))
+             (position (car-safe range))
+             (plan (cond
+                    ((and position (string-empty-p deleted)
+                          (length> inserted 0))
+                     (list :kind :incremental
+                           :commands (list `((ty . "is") (ibi . ,position)
+                                             (s . ,inserted)))
+                           :ranges (list (list :ot-start position
+                                               :ot-end position
+                                               :insert-at position
+                                               :delete-count 0))
+                           :post-body (gdocs--push-comparison-body local)))
+                    ((and range (string-empty-p inserted)
+                          (length> deleted 0))
+                     (list :kind :incremental
+                           :commands (list `((ty . "ds") (si . ,(car range))
+                                             (ei . ,(1- (cdr range)))))
+                           :ranges (list (list :ot-start (car range)
+                                               :ot-end (1- (cdr range))
+                                               :insert-at (car range)
+                                               :delete-count (length deleted)))
+                           :post-body (gdocs--push-comparison-body local))))))
+        (unless (and plan plain-p (gdocs--plain-org-text-p local))
+          (user-error "gdocs: tab edit is not a safe single text operation"))
+        (gdocs--push-preflight scoped local plan)
+        (append change (list :plan plan))))))
+
+(defun gdocs--tab-remote-unchanged-p (before after tab-id)
+  "Check that every tab except TAB-ID is unchanged from BEFORE to AFTER."
+  (let ((old-tabs (plist-get before :tabs))
+        (new-tabs (plist-get after :tabs)))
+    (and (= (length old-tabs) (length new-tabs))
+         (cl-every
+          (lambda (old new)
+            (and (equal (plist-get old :id) (plist-get new :id))
+                 (equal (plist-get old :title) (plist-get new :title))
+                 (equal (plist-get old :icon) (plist-get new :icon))
+                 (equal (plist-get old :path) (plist-get new :path))
+                 (or (equal (plist-get old :id) tab-id)
+                     (equal (plist-get old :ops) (plist-get new :ops)))))
+          old-tabs new-tabs))))
+
+(defun gdocs--tab-save-ack-p (response pre-revision)
+  "Check RESPONSE's revisions for a tab save from PRE-REVISION."
+  (let* ((previous (gdocs--save-revision-value pre-revision))
+         (metadata (alist-get 'metadata response))
+         (server (gdocs--save-revision-value
+                  (alist-get 'serverRevision metadata)))
+         (ranges (alist-get 'revisionRanges response))
+         (last-range (car (last ranges)))
+         (committed (gdocs--save-revision-value (car (last last-range)))))
+    (and previous server committed
+         (= server previous)
+         (= committed (1+ previous)))))
+
+(defun gdocs--tab-save-outcome (doc-id before after tab-id expected)
+  "Classify AFTER relative to BEFORE for a one-tab save of TAB-ID.
+Return `:committed' when exactly one revision was added, only TAB-ID
+changed and its body is EXPECTED; `:untouched' when the document is
+identical to BEFORE; otherwise `:conflict'."
+  (let ((pre-rev (plist-get before :revision))
+        (post-rev (and after (plist-get after :revision))))
+    (cond
+     ((null after) :conflict)
+     ((and (gdocs--push-revisions-equal-p post-rev pre-rev)
+           (gdocs--tab-remote-unchanged-p before after nil))
+      :untouched)
+     ((and (gdocs--push-revisions-equal-p
+            post-rev (gdocs--push-next-revision pre-rev))
+           (gdocs--tab-remote-unchanged-p before after tab-id)
+           (string= expected
+                    (or (gdocs--push-state-body
+                         doc-id (gdocs--state-for-tab after tab-id))
+                        "")))
+      :committed)
+     (t :conflict))))
+
+(defvar gdocs--rate-limit-retry-delay)
+
+(defconst gdocs--tab-save-max-attempts 5
+  "Maximum /save attempts for one tab edit, counting throttled retries.")
+
+(defun gdocs--tab-push-async (doc-id buf local-rev local-body state owner)
+  "Save one changed tab of DOC-ID from LOCAL-BODY against fresh STATE.
+Each attempt is planned from the current remote state.  After every
+response, success or failure, the document is refetched and classified:
+a verified commit finalizes BUF, an untouched document after a transient
+rejection is replanned and retried, and anything else fails closed.
+OWNER is the sync mutex token and is released exactly once."
+  (let ((done nil))
+    (cl-labels
+        ((finish (err)
+           (unless done
+             (setq done t)
+             (gdocs--sync-release owner)
+             (if err
+                 (gdocs-log 'warn "Push %s: %s" doc-id err)
+               (gdocs-log 'info "Pushed %s (tab edit, verified)" doc-id))))
+         (buffer-unchanged-p ()
+           (and (buffer-live-p buf)
+                (with-current-buffer buf
+                  (equal local-body (gdocs--buffer-body-as-plain)))))
+         (attempt (current n)
+           (condition-case sig
+               (let ((change (gdocs--tab-push-plan doc-id current local-body)))
+                 (cond
+                  ((null change)
+                   (if (buffer-unchanged-p)
+                       (progn
+                         (with-current-buffer buf
+                           (gdocs--finalize-push-props
+                            (plist-get current :revision) local-body))
+                         (finish nil))
+                     (finish "local buffer changed during push")))
+                  ((not (equal local-rev (format "%s" (plist-get current :revision))))
+                   (finish "remote revision changed; pull before pushing"))
+                  ((not (buffer-unchanged-p))
+                   (finish "local buffer changed before save"))
+                  (t (send current change n))))
+             (error (finish (error-message-string sig)))))
+         (send (current change n)
+           (let* ((plan (plist-get change :plan))
+                  (tab-id (plist-get change :tab-id))
+                  (expected (plist-get plan :post-body)))
+             (gdocs--save-request-async
+              doc-id (plist-get change :state) (plist-get plan :commands)
+              (lambda (response err)
+                (let ((transient
+                       (or (and (listp err)
+                                (memq (plist-get err :http-code) '(400 550)))
+                           (and (null err)
+                                (gdocs--save-response-xsrf-token response)))))
+                  (gdocs--fetch-edit-state-async
+                   doc-id
+                   (lambda (fresh fetch-err)
+                     (condition-case sig
+                         (let ((outcome
+                                (if fetch-err :conflict
+                                  (gdocs--tab-save-outcome
+                                   doc-id current fresh tab-id expected))))
+                           (cond
+                            ((and (eq outcome :committed)
+                                  (or err (null response)
+                                      (gdocs--tab-save-ack-p
+                                       response (plist-get current :revision))))
+                             (if (not (buffer-unchanged-p))
+                                 (finish "local buffer changed during save; pull to reconcile")
+                               (with-current-buffer buf
+                                 (gdocs--finalize-push-props
+                                  (plist-get fresh :revision) local-body))
+                               (finish nil)))
+                            ((and (eq outcome :untouched) transient
+                                  (< n gdocs--tab-save-max-attempts))
+                             (gdocs-log 'info "/save throttled for tab %s (attempt %d); retrying"
+                                        tab-id n)
+                             (run-with-timer
+                              gdocs--rate-limit-retry-delay nil
+                              (lambda () (unless done (attempt fresh (1+ n))))))
+                            ((eq outcome :untouched)
+                             (finish (format "tab save not committed: %s"
+                                             (or err "unacknowledged response"))))
+                            (t
+                             (finish (format "tab save outcome unknown (%s); pull before retrying"
+                                             (or fetch-err err "unexpected remote state"))))))
+                       (error (finish (error-message-string sig))))))))))))
+      (attempt state 1))))
 
 (defun gdocs--recon-op-types (ops)
   "Return alist (TY . COUNT) summarising op type frequencies in OPS."
@@ -5856,39 +6278,93 @@ nil/zero/garbage input."
   (when (and (integerp creation-time-ms) (> creation-time-ms 0))
     (format-time-string "[%Y-%m-%d %a]" (/ creation-time-ms 1000))))
 
+(defun gdocs--render-tab-tree (tabs revision doc-id &optional comments)
+  "Render TABS as Org content and return (CONTENT . CAPABILITY-REPORTS)."
+  (let (parts reports)
+    (dolist (tab tabs)
+      (let* ((depth (length (plist-get tab :path)))
+             (model (gdocs-dm-from-ops
+                     revision doc-id (plist-get tab :title)
+                     (plist-get tab :ot-body) (plist-get tab :ops)))
+             (model
+              (plist-put
+               model :paragraphs
+               (mapcar
+                (lambda (para)
+                  (let ((para (copy-sequence para)))
+                    (pcase (plist-get para :kind)
+                      (:heading
+                       (plist-put para :level
+                                  (+ depth (plist-get para :level))))
+                      ((or :title :subtitle) (plist-put para :kind :para))
+                      (_ para))))
+                (gdocs-dm-paragraphs model))))
+             (content (gdocs-dm-to-org model))
+             (anchors (gdocs--decode-doco-anchors (plist-get tab :ops)))
+             (tab-comments (seq-filter
+                            (lambda (comment)
+                              (assoc (plist-get (cdr comment) :anchor) anchors))
+                            comments))
+             (content (if tab-comments
+                          (gdocs--inline-comment-refs
+                           content (plist-get tab :ot-body) anchors tab-comments)
+                        content))
+             (icon (plist-get tab :icon)))
+        (setq reports (nconc reports (gdocs-dm-unsupported model)))
+        (push (concat (make-string depth ?*) " "
+                      (if icon (concat icon " ") "")
+                      (plist-get tab :title) "\n"
+                      ":PROPERTIES:\n:GDOC_TAB: " (plist-get tab :id) "\n"
+                      (if icon (concat ":GDOC_TAB_ICON: " icon "\n") "")
+                      ":END:\n"
+                      content) parts)))
+    (cons (string-join (nreverse parts) "\n") reports)))
+
+(defun gdocs--tabbed-comment-refs (body tabs comments)
+  "Insert COMMENTS in their tab-local content inside BODY."
+  (if (null comments) body
+    (let* ((plain (car (gdocs--render-tab-tree tabs nil nil)))
+           (annotated (car (gdocs--render-tab-tree tabs nil nil comments)))
+           (start (string-match (regexp-quote plain) body)))
+      (unless start (error "gdocs: tab content changed before comment placement"))
+      (concat (substring body 0 start) annotated
+              (substring body (+ start (length plain)))))))
+
 (defun gdocs--ot-decode-pipeline (doc-id html state &optional creation-time-ms)
   "Pure transform: decode an OT-backed HTML + STATE into (TITLE . BODY).
 Returns (TITLE . BODY) — BODY includes the properties drawer,
-Title/Subtitle keywords that are part of the document body, and (when
-CREATION-TIME-MS is non-nil) a `#+date:' line, ready for
-`gdocs--apply-pull-into-buffer'. The Drive document name is stored as
-`GDOC_TITLE', never as a synthetic body keyword."
+and (when CREATION-TIME-MS is non-nil) a `#+date:' line, ready for
+`gdocs--apply-pull-into-buffer'. Multi-tab bodies have one document-level
+`#+title:' from the Drive name; tabs are headings and body Title/Subtitle
+paragraphs inside them are plain text. Single-tab documents retain their
+existing Title/Subtitle behavior."
   (let* ((parsed (gdocs--parse-model-chunk-full html))
-         (ops (plist-get parsed :ops))
+         (ops (or (plist-get state :ot-ops)
+                  (plist-get parsed :ops)))
          (revision (or (plist-get state :revision)
                        (plist-get parsed :revision)))
          (ot-body (plist-get state :ot-body))
          (edit-title (plist-get state :title))
-         (doc (gdocs-dm-from-ops revision doc-id edit-title
-                                 (or ot-body "") ops))
-         (org-content (gdocs-dm-to-org doc))
+         (tabs (plist-get state :tabs))
+         (doc (unless tabs (gdocs-dm-from-ops revision doc-id edit-title
+                                              (or ot-body "") ops)))
+         (rendered-tabs (and tabs (gdocs--render-tab-tree tabs revision doc-id)))
+         (org-content (if tabs (car rendered-tabs) (gdocs-dm-to-org doc)))
          (date-str (gdocs--format-creation-date creation-time-ms))
          (header
-          ;; Canonical spacing: one blank line between the sync drawer
-          ;; and the `#+date:' keyword, and one between the keyword and
-          ;; the body — the same padding `gdocs-dm-to-org' gives its
-          ;; own title keywords.
+          ;; Metadata keywords precede the tab outline, not a tab body.
           (concat
            (when date-str "\n")
+           (when tabs (format "#+title: %s\n" (or edit-title doc-id)))
            (when date-str (format "#+date: %s\n" date-str))
            "\n"))
          (titled (concat header org-content))
          (effective-title (or edit-title doc-id))
-         ;; Hash only the text that can be sent back to Google. The date,
-         ;; property drawer, and GDOC_TITLE are synchronization metadata.
+         ;; Hash the Org projection; title, date and top drawer are metadata.
          (hash (secure-hash 'sha256 org-content))
          (capability-summary (gdocs--capability-summary
-                              (gdocs-dm-unsupported doc)))
+                              (if tabs (cdr rendered-tabs)
+                                (gdocs-dm-unsupported doc))))
          (props (concat
                  (format
                   ":PROPERTIES:\n:GDOC_ID: %s\n:GDOC_TITLE: %s\n:GDOC_REVISION: %s\n:GDOC_CONTENT_HASH: %s\n:GDOC_SYNCED_AT: %s\n"
@@ -5897,6 +6373,7 @@ CREATION-TIME-MS is non-nil) a `#+date:' line, ready for
                   (if revision (number-to-string revision) "")
                   hash
                   (gdocs--now-iso))
+                 (when tabs (format ":GDOC_TABS: %d\n" (length tabs)))
                  (when (length> capability-summary 0)
                    (format ":GDOC_UNSUPPORTED: %s\n"
                            capability-summary))
@@ -6146,9 +6623,10 @@ fed straight into OT-position arithmetic."
 (defun gdocs--parse-edit-state-html (html)
   "Extract the edit-state plist from an /edit page HTML string.
 Returns a plist (:title :token :ouid :revision :smv :smb-seg :ot-body
-:ot-ops :build-label :unsupported). The capability fields are derived
+:ot-ops :tabs :build-label :unsupported). The capability fields are derived
 from this HTML, not from buffer-local metadata.
-Any field may be nil if not present. Returns nil if HTML is nil."
+Any field may be nil if not present. Returns nil if HTML is nil.
+Unrecognized tab structures signal rather than returning a partial body."
   (when html
     (let ((title nil) (token nil) (ouid nil) (revision nil)
           (smv nil) (smb-seg nil) (ot-body nil) (build-label nil))
@@ -6188,17 +6666,31 @@ Any field may be nil if not present. Returns nil if HTML is nil."
                 (error (match-string 1 html)))))
       (when (string-match "\"buildLabel\"[ \t]*:[ \t]*\"\\([^\"]+\\)\"" html)
         (setq build-label (match-string 1 html)))
-      (let ((mc (gdocs--parse-model-chunk html))
-            (full (gdocs--parse-model-chunk-full html)))
-        (setq ot-body (plist-get mc :ot-body))
+      (let* ((mc (gdocs--parse-model-chunk html))
+             (full (gdocs--parse-model-chunk-full html))
+             (all-ops (plist-get full :ops))
+             (tabs (gdocs--tabs-from-ops all-ops))
+             (single-ops (if (and (null tabs)
+                                  (seq-some (lambda (op)
+                                              (equal (alist-get 'ty op) "mkch"))
+                                            all-ops))
+                             (seq-remove (lambda (op)
+                                           (member (alist-get 'ty op)
+                                                   '("mkch" "utlp" "umv")))
+                                         all-ops)
+                           all-ops)))
+        (setq ot-body (if tabs (plist-get (car tabs) :ot-body)
+                        (if (eq single-ops all-ops)
+                            (plist-get mc :ot-body)
+                          (gdocs--tab-op-body single-ops))))
         (when (plist-get mc :revision)
           (setq revision (plist-get mc :revision)))
-        (let* ((ops (plist-get full :ops))
+        (let* ((ops (if tabs (plist-get (car tabs) :ops) single-ops))
                (analysis (gdocs--decode-capability-analysis
                           ops (or ot-body ""))))
           (list :title title :token token :ouid ouid :revision revision
                 :smv smv :smb-seg smb-seg :ot-body ot-body
-                :ot-ops ops
+                :ot-ops ops :tabs tabs
                 :build-label build-label
                 :inline-objects (plist-get analysis :objects)
                 :unsupported (plist-get analysis :unsupported)))))))
@@ -6382,9 +6874,9 @@ modelChunk we need for the op stream. Comments live in the cookie-auth
                                      doc-id edit-html state creation-time-ms))
                              (title (car built))
                              (body (cdr built))
-                             (parsed (gdocs--parse-model-chunk-full edit-html))
+                             (tabs (plist-get state :tabs))
                              (anchor-map (gdocs--decode-doco-anchors
-                                          (plist-get parsed :ops)))
+                                          (plist-get state :ot-ops)))
                              (ot-body (plist-get state :ot-body)))
                         (gdocs--docos-sync-raw-async
                          doc-id state
@@ -6398,10 +6890,13 @@ modelChunk we need for the op stream. Comments live in the cookie-auth
                                             (gdocs--assert-comment-footnote-namespace-available
                                              body)))
                                       (body-with-refs
-                                       (if (and comments ot-body)
-                                           (gdocs--inline-comment-refs
-                                            body ot-body anchor-map comments)
-                                         body))
+                                       (if tabs
+                                           (gdocs--tabbed-comment-refs
+                                            body tabs comments)
+                                         (if (and comments ot-body)
+                                             (gdocs--inline-comment-refs
+                                              body ot-body anchor-map comments)
+                                           body)))
                                       (final
                                        (gdocs--append-comments-section
                                         body-with-refs comments)))
@@ -6496,7 +6991,8 @@ DRAWER-ALIST is a list of (KEY . VALUE) strings from a leading
 the old representation where the first title was synthetic metadata.
 CONTENT is everything after synchronization metadata, with blank lines
 between the header and the body skipped. A leading `#+title:' in a new
-`GDOC_TITLE'-bearing body is content and is never stripped."
+`GDOC_TITLE'-bearing single-tab body is content and is never stripped.
+For multi-tab bodies the document-level `#+title:' is metadata."
   (with-temp-buffer
     (insert body)
     (goto-char (point-min))
@@ -6524,6 +7020,12 @@ between the header and the body skipped. A leading `#+title:' in a new
           (when (and m (not (string-empty-p (string-trim m))))
             (setq legacy-title (string-trim m))))
         (forward-line 1))
+      (when (assoc "GDOC_TABS" drawer)
+        (while (looking-at "^[ \t]*\n") (forward-line 1))
+        (unless (looking-at "^#\\+title:[ \t]*.*$")
+          (error "gdocs: missing document title in tabbed pull"))
+        (forward-line 1)
+        (while (looking-at "^[ \t]*\n") (forward-line 1)))
       (when (looking-at "^#\\+date:[ \t]*.*$")
         (forward-line 1))
       (while (and (not (eobp)) (looking-at "^[ \t]*\n"))
@@ -6536,7 +7038,7 @@ between the header and the body skipped. A leading `#+title:' in a new
   (and (derived-mode-p 'org-mode)
        (save-excursion
          (goto-char (point-min))
-         (org-entry-get (point-min) key t))))
+         (org-entry-get (point-min) key nil))))
 
 (defun gdocs--legacy-leading-title-region ()
   "Return the old synthetic title region, or nil.
@@ -6573,8 +7075,9 @@ Only the first leading title is removed. A second, identical or different,
 
 Skip the top property drawer, an old synthetic title when this is a legacy
 buffer, the generated date keyword, and leading presentation blanks. A
-`#+title:' is retained when `GDOC_TITLE' is present because it is then a
-pushable body Title paragraph."
+`#+title:' is retained for a single-tab `GDOC_TITLE' buffer because it is
+then a pushable body Title paragraph; in a multi-tab buffer it names the
+whole document and is skipped."
   (goto-char (point-min))
   (when (looking-at org-property-drawer-re)
     (goto-char (match-end 0))
@@ -6583,6 +7086,16 @@ pushable body Title paragraph."
              (not (gdocs--top-property-value "GDOC_TITLE"))
              (looking-at "^#\\+title:.*\n?"))
     (goto-char (match-end 0)))
+  (when (gdocs--top-property-value "GDOC_TABS")
+    (while (looking-at "^[ \t]*\n") (forward-line 1))
+    ;; An existing flat buffer has a date but no document-level title until
+    ;; its first tabbed pull has replaced the body. Accept either order.
+    (when (looking-at "^#\\+date:.*\n")
+      (goto-char (match-end 0)))
+    (while (looking-at "^[ \t]*\n") (forward-line 1))
+    (when (looking-at "^#\\+title:.*\n?")
+      (goto-char (match-end 0)))
+    (while (looking-at "^[ \t]*\n") (forward-line 1)))
   (when (looking-at "^#\\+date:.*\n")
     (goto-char (match-end 0)))
   (while (and (not (eobp)) (looking-at "^[ \t]*\n"))
@@ -6625,8 +7138,8 @@ Edits are applied in reverse order so earlier offsets stay valid."
                                              &optional snapshot remote-revision)
   "Update BUF so its body matches BODY, preserving point and metadata.
 
-The Drive name is stored in `GDOC_TITLE'. Body Title/Subtitle keywords in
-BODY are ordinary pushable content. Old buffers whose first title is the
+The Drive name is stored in `GDOC_TITLE'. Multi-tab buffers also show it
+as a document-level `#+title:' keyword. Old buffers whose first title is the
 synthetic metadata title are migrated before the body diff, so a second
 title remains intact even when its text equals the Drive name.
 
@@ -6659,14 +7172,26 @@ anyway."
         ;; we were called with (canonical); other keys come from the
         ;; pull's drawer if present.
         (gdocs--put-top-property "GDOC_ID" doc-id)
+        (unless (assoc "GDOC_TABS" drawer)
+          (when (gdocs--top-property-value "GDOC_TABS")
+            (org-entry-delete (point-min) "GDOC_TABS")))
         (dolist (pair drawer)
           (unless (string= (car pair) "GDOC_ID")
             (gdocs--put-top-property (car pair) (cdr pair))))
-        ;; A successful pull always refreshes the Drive name and sync time.
-        ;; This deliberately does not create a visible #+title keyword.
+        ;; Refresh the Drive name and sync time. Multi-tab documents also
+        ;; show the name as a file-level title above their tab headings.
         (gdocs--update-top-metadata
          effective-title nil
          (or (cdr (assoc "GDOC_UNSUPPORTED" drawer)) ""))
+        (when (assoc "GDOC_TABS" drawer)
+          (save-excursion
+            (goto-char (point-min))
+            (when (looking-at org-property-drawer-re)
+              (goto-char (match-end 0))
+              (forward-line))
+            (if (looking-at "^#\\+title:.*$")
+                (replace-match (format "#+title: %s" effective-title) t t)
+              (insert (format "#+title: %s\n" effective-title)))))
         (let* ((body-start (gdocs--body-start-pos))
                (current-content (buffer-substring-no-properties
                                  body-start (point-max))))
@@ -6716,7 +7241,8 @@ anyway."
   "SHA-256 of the buffer's pushable body.
 
 Synchronization metadata, including `GDOC_TITLE', is excluded. A body
-`#+title:' remains part of the hashed text."
+`#+title:' remains part of the hashed text for single-tab documents;
+the multi-tab document title is metadata."
   (secure-hash 'sha256 (gdocs--buffer-body-as-plain)))
 
 (defun gdocs--valid-content-hash-p (hash)
@@ -6751,8 +7277,9 @@ Call inside `with-current-buffer' after every successful pull or push."
 (defun gdocs--buffer-body-as-plain ()
   "Dump the pushable body, excluding synchronization metadata.
 
-The top property drawer, legacy synthetic title, and generated date are
-excluded. A `#+title:' is retained when it belongs to the body. Generated
+The top property drawer, document-level title for multi-tab buffers,
+legacy synthetic title, and generated date are excluded. A `#+title:' is
+retained when it belongs to the body of a single-tab document. Generated
 `[fn:gdocs-comment-N]' references and the marked `* Comments' subtree are
 excluded. Numeric and user-named Org footnotes remain pushable content."
   (save-excursion
@@ -7202,6 +7729,8 @@ presence of destructive unsupported content. An incremental edit is allowed
  preservation, and no edit range touches it. The caller must pass STATE
 obtained from the current /edit fetch; raw `:ot-ops' are decoded again here so
 stale buffer-local capability metadata cannot bypass policy."
+  (when (plist-get state :tabs)
+    (user-error "gdocs: multi-tab saves require a selected tab state"))
   (let* ((remote (gdocs--remote-capability-analysis state))
          (local (gdocs--local-capability-analysis local-body))
          (remote-objects (plist-get remote :objects))
@@ -7647,6 +8176,8 @@ like one browser session and clears the rejection."
   "POST commands to the cookie-auth /save endpoint.
 STATE is the plist from `gdocs--fetch-edit-state'.  COMMANDS is a list
 of OT ops (alists). Returns parsed JSON response (XSSI-stripped)."
+  (when (plist-get state :tabs)
+    (user-error "gdocs: multi-tab saves require a selected tab state"))
   (let* ((token (plist-get state :token))
          (ouid (plist-get state :ouid))
          (rev (plist-get state :revision))
@@ -7672,9 +8203,16 @@ of OT ops (alists). Returns parsed JSON response (XSSI-stripped)."
                      "&ouid=" ouid
                      "&includes_info_params=true"
                      "&cros_files=false&nded=false"
-                     "&tab=" (url-hexify-string gdocs-docs-tab)))
+                     "&tab=" (url-hexify-string
+                              (or (plist-get state :tab-id) gdocs-docs-tab))))
          (url (format "https://docs.google.com/document/u/0/d/%s/save?%s"
                       doc-id qs))
+         (commands (if (plist-get state :tab-id)
+                       (mapcar (lambda (op)
+                                 `((ty . "nm")
+                                   (nmr . ["ksm" ,(plist-get state :tab-id)])
+                                   (nmc . ,op))) commands)
+                     commands))
          (bundles (json-encode
                    (vector
                     `((commands . ,(vconcat commands))
@@ -7866,7 +8404,12 @@ CALLBACK = `(funcall CB STATE ERR)'. STATE may be nil if parsing fails."
      (lambda (html err)
        (if err
            (funcall callback nil err)
-         (funcall callback (gdocs--parse-edit-state-html html) nil))))))
+         (let ((parsed (condition-case sig
+                           (gdocs--parse-edit-state-html html)
+                         (error (error-message-string sig)))))
+           (if (stringp parsed)
+               (funcall callback nil parsed)
+             (funcall callback parsed nil))))))))
 
 (defun gdocs--fetch-edit-page-async (doc-id callback)
   "Fetch the /edit page once. CALLBACK = `(funcall CB STATE HTML ERR)'.
@@ -7879,7 +8422,12 @@ op stream)."
      (lambda (html err)
        (if err
            (funcall callback nil nil err)
-         (funcall callback (gdocs--parse-edit-state-html html) html nil))))))
+         (let ((parsed (condition-case sig
+                           (gdocs--parse-edit-state-html html)
+                         (error (error-message-string sig)))))
+           (if (stringp parsed)
+               (funcall callback nil nil parsed)
+             (funcall callback parsed html nil))))))))
 
 (defun gdocs--fetch-docdetails-async (doc-id state callback)
   "GET /docdetails/read for DOC-ID; return parsed JSON alist.
@@ -8100,6 +8648,8 @@ On non-2xx, PARSED-JSON is nil and ERR is a plist
 \(:http-code :err-code :di :body) suitable for `gdocs--throttle-error-p'
 on a synthetic (gdocs-save-rejected . ERR) signal data shape.
 On curl error, ERR is a string."
+  (when (plist-get state :tabs)
+    (user-error "gdocs: multi-tab saves require a selected tab state"))
   (let* ((token (plist-get state :token))
          (ouid (plist-get state :ouid))
          (rev (plist-get state :revision))
@@ -8121,9 +8671,16 @@ On curl error, ERR is a string."
                      "&ouid=" ouid
                      "&includes_info_params=true"
                      "&cros_files=false&nded=false"
-                     "&tab=" (url-hexify-string gdocs-docs-tab)))
+                     "&tab=" (url-hexify-string
+                              (or (plist-get state :tab-id) gdocs-docs-tab))))
          (url (format "https://docs.google.com/document/u/0/d/%s/save?%s"
                       doc-id qs))
+         (commands (if (plist-get state :tab-id)
+                       (mapcar (lambda (op)
+                                 `((ty . "nm")
+                                   (nmr . ["ksm" ,(plist-get state :tab-id)])
+                                   (nmc . ,op))) commands)
+                     commands))
          (bundles (json-encode
                    (vector
                     `((commands . ,(vconcat commands))
@@ -10112,6 +10669,27 @@ completion or error."
              (funcall release "edit state could not be decoded: no model chunks"))
             ((not (and token ouid remote-rev))
              (funcall release "missing token/ouid/rev"))
+            ((plist-get state :tabs)
+             (setq done t)
+             (condition-case sig
+                 (if (with-current-buffer buf
+                       (save-excursion
+                         (goto-char (point-min))
+                         (and (re-search-forward
+                               "^#\\+title:[ \t]*\\(.*\\)$" nil t)
+                              (equal (match-string-no-properties 1)
+                                     (plist-get state :title)))))
+                     (gdocs--tab-push-async
+                      doc-id buf local-rev local-body state owner)
+                   (progn
+                     (gdocs--sync-release owner)
+                     (gdocs-log 'warn
+                                "Push %s: document title changed locally; rename separately"
+                                doc-id)))
+               (error
+                (gdocs--sync-release owner)
+                (gdocs-log 'warn "Push %s: %s" doc-id
+                           (error-message-string sig)))))
             (t
              (condition-case sig
                  (let* ((remote-body
@@ -10592,6 +11170,9 @@ where RESULT is a plist with `:revision', `:verified', `:lossy', and
                  (null (plist-get state :ot-body))))
         (user-error
          "gdocs: publish refused: remote state could not be decoded"))
+       ((plist-get state :tabs)
+        (user-error
+         "gdocs: publish refused: multi-tab documents cannot be replaced safely"))
        ((and (cdr registered) remote-rev
              (not (string= (format "%s" (cdr registered))
                            (format "%s" remote-rev)))
@@ -10683,15 +11264,19 @@ where RESULT is a plist with `:revision', `:verified', `:lossy', and
                     link
                     (read-string "Google Docs URL or ID: ")))
          (doc-id (gdocs--extract-doc-id input))
+         (tab-id (and (stringp input)
+                      (string-match "[?&]tab=\\(t\\.[A-Za-z0-9]+\\)" input)
+                      (match-string 1 input)))
          (existing (seq-find
                     (lambda (b)
                       (with-current-buffer b
                         (and (derived-mode-p 'org-mode)
-                             (string= (or (org-entry-get (point-min) "GDOC_ID" t) "")
+                             (string= (or (gdocs--doc-id-from-buffer) "")
                                       doc-id))))
                     (buffer-list))))
     (if existing
-        (switch-to-buffer existing)
+        (progn (switch-to-buffer existing)
+               (when tab-id (gdocs--goto-tab tab-id)))
       ;; Use a placeholder buffer name; pull will set the real title.
       (let ((buffer (generate-new-buffer (format "*gdocs:%s*" doc-id))))
         (with-current-buffer buffer
@@ -10706,7 +11291,8 @@ where RESULT is a plist with `:revision', `:verified', `:lossy', and
                (with-current-buffer buffer
                  (let ((new-title (gdocs--top-property-value "GDOC_TITLE")))
                    (when (and new-title (not (string-empty-p new-title)))
-                     (rename-buffer (format "%s.org" new-title) t)))))))
+                     (rename-buffer (format "%s.org" new-title) t)))
+                 (when tab-id (gdocs--goto-tab tab-id))))))
           ;; The pull is asynchronous. Use an already stored GDOC_TITLE when
           ;; reopening a prepared buffer, otherwise keep the ID placeholder
           ;; until the fetched Drive metadata arrives in the callback.
@@ -10719,13 +11305,21 @@ where RESULT is a plist with `:revision', `:verified', `:lossy', and
           (gdocs-mode 1)
           (switch-to-buffer buffer))))))
 
+(defun gdocs--goto-tab (tab-id)
+  "Move to the heading for TAB-ID in the current Org buffer."
+  (goto-char (point-min))
+  (unless (and (re-search-forward
+                (format "^:GDOC_TAB: %s$" (regexp-quote tab-id)) nil t)
+               (progn (org-back-to-heading t)
+                      (equal (org-entry-get (point) "GDOC_TAB") tab-id)))
+    (user-error "gdocs: tab %s not present in this document" tab-id)))
+
 
 ;;; Minor mode
 
 (defun gdocs--has-id-p ()
   "Buffer has a GDOC_ID property."
-  (and (derived-mode-p 'org-mode)
-       (org-entry-get (point-min) "GDOC_ID" t)))
+  (gdocs--doc-id-from-buffer))
 
 (defun gdocs--auto-sync-tick ()
   "Sync this buffer with its remote Google Doc.

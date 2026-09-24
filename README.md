@@ -314,6 +314,10 @@ performs an initial pull. `gdocs-mode` auto-enables in any Org buffer that
 carries a `GDOC_ID` property, and the mode line shows an indicator while it is
 active.
 
+For a document with multiple tabs, pull puts every tab in the same Org buffer. Each tab is a heading with a `GDOC_TAB` property; nested tabs become nested headings, and headings within a tab are shifted below its heading. The document name appears once as the file's `#+title:`. A tab emoji appears both in its heading and in `GDOC_TAB_ICON`. Opening a URL with `?tab=…` moves to that tab after pull. Single-tab documents keep their existing unwrapped layout.
+
+Pushing a multi-tab document is supported for a deliberately narrow case: the buffer differs from the remote in **one tab**, that tab contains only plain, unstyled paragraphs, and the change is a single insertion or deletion. The save is scoped to that tab (each command is wrapped in the editor's tab namespace and `tab=` names it). After every response the document is refetched and accepted only when exactly one revision was added, the edited tab has the expected text, and every other tab's operations are unchanged. A throttled save that left the document untouched is replanned from the fresh state and retried (up to five attempts); any other outcome fails closed and asks you to pull. Edits touching several tabs, tabs with lists, tables, headings, chips or formatting, tab renames/moves, and content outside the tab headings are refused before any `/save`. `gdocs-publish-file` still refuses multi-tab documents.
+
 ### Source-file publication (one-way Org → Google Docs)
 
 For documents whose source of truth is a plain Org file (not a synced buffer), `gdocs-publish-file` publishes it as the full body of a Google Doc. The source file is never modified; the Google Doc is a projection.
@@ -333,6 +337,7 @@ These properties are maintained on the top-level node of every synced buffer:
 | `GDOC_REVISION`  | Staleness anchor — last known remote revision.|
 | `GDOC_CONTENT_HASH` | Hash baseline used to detect local changes. |
 | `GDOC_SYNCED_AT` | Timestamp of the last successful pull, push, or verified no-op.|
+| `GDOC_TABS` | Number of tabs in the pulled multi-tab document. |
 
 ## Configuration
 

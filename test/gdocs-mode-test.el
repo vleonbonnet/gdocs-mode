@@ -472,6 +472,292 @@
   (format "DOCS_modelChunk = %s;"
           (json-encode `((chunk . ,ops) (revision . ,revision)))))
 
+(defun gdocs-test--tab-ops ()
+  "Return a synthetic nested tab stream with local headings and an anchor."
+  (let ((second "Guide here\nSection\nBottom\n"))
+    (list '((ty . "mkch") (d (1 "First tab")))
+          '((ty . "ac") (d "t.pilot" (1 "Pilot guide") (1)))
+          '((ty . "ac") (d "t.child" (1 "Child") (1 0)))
+          '((ty . "ac") (d "t.emoji" (1 "Nested" 2 "😀") (1 0 0)))
+          '((ty . "utlp") (d (nil (1 "en"))))
+          '((ty . "is") (s . "Root\n"))
+          '((ty . "as") (st . "paragraph") (si . 5) (ei . 5)
+            (sm (ps_hd . 1)))
+          `((ty . "nm") (nmr "ksm" "t.pilot")
+            (nmc (ty . "is") (s . ,second)))
+          '((ty . "nm") (nmr "ksm" "t.pilot")
+            (nmc (ty . "as") (st . "paragraph") (si . 19) (ei . 19)
+                 (sm (ps_hd . 1))))
+          '((ty . "nm") (nmr "ksm" "t.pilot")
+            (nmc (ty . "as") (st . "doco_anchor") (si . 20) (ei . 25)
+                 (sm (das_a (cv (op . "set") (opValue . "kix.comment"))))))
+          '((ty . "nm") (nmr "ksm" "t.child")
+            (nmc (ty . "is") (s . "Child body\n")))
+          '((ty . "nm") (nmr "ksm" "t.emoji")
+            (nmc (ty . "is") (s . "Nested body\n")))
+          '((ty . "umv") (mv . 60)))))
+
+(defun gdocs-test--tab-html ()
+  "Build modelChunk HTML from the synthetic tab fixture."
+  (gdocs-test--html-for-ops
+   7 (mapcar (lambda (op)
+               (pcase (alist-get 'ty op)
+                 ("mkch" '((ty . "mkch") (d . [[1 "First tab"]])))
+                 ("ac"
+                  (let ((data (alist-get 'd op)))
+                    `((ty . "ac")
+                      (d . ,(vector (nth 0 data) (vconcat (nth 1 data))
+                                    (vconcat (nth 2 data)))))))
+                 ("utlp" '((ty . "utlp") (d . [[[] [1 "en"]]])))
+                 (_ op)))
+             (gdocs-test--tab-ops))))
+
+(ert-deftest gdocs-test-tabs-render-in-one-document ()
+  "Tab headings and their content headings form one Org outline."
+  (let* ((html (gdocs-test--tab-html))
+         (state (gdocs--parse-edit-state-html
+                 (concat "<title>Document name - Google Docs</title>" html)))
+         (tabs (plist-get state :tabs))
+         (body (cdr (gdocs--ot-decode-pipeline "synthetic" html state))))
+    (should (= (length tabs) 4))
+    (should (equal (mapcar (lambda (tab) (plist-get tab :ot-body)) tabs)
+                   '("Root\n" "Guide here\nSection\nBottom\n"
+                     "Child body\n" "Nested body\n")))
+    (should (string-match-p "^#\\+title: Document name$" body))
+    (should (string-match-p "^\\* First tab\n:PROPERTIES:\n:GDOC_TAB: t.0" body))
+    (should (string-match-p "^\\*\\* Root$" body))
+    (should (string-match-p "^\\* Pilot guide\n:PROPERTIES:\n:GDOC_TAB: t.pilot" body))
+    (should (string-match-p "^\\*\\* Section$" body))
+    (should (string-match-p "^\\*\\* Child\n:PROPERTIES:\n:GDOC_TAB: t.child" body))
+    (should (string-match-p
+             "^\\*\\*\\* 😀 Nested\n:PROPERTIES:\n:GDOC_TAB: t.emoji\n:GDOC_TAB_ICON: 😀"
+             body))
+    (should-not (string-match-p "unknown feature" body))
+    (with-temp-buffer
+      (insert body)
+      (org-mode)
+      (should (equal (gdocs--top-property-value "GDOC_TABS") "4"))
+      (should (string-prefix-p "* First tab\n" (gdocs--buffer-body-as-plain)))
+      (gdocs--goto-tab "t.emoji")
+      (should (looking-at "\\*\\*\\* 😀 Nested")))))
+
+(ert-deftest gdocs-test-tabs-comment-stays-in-own-tab ()
+  "An anchor local to the second tab cannot land on the first tab."
+  (let* ((tabs (gdocs--tabs-from-ops (gdocs-test--tab-ops)))
+         (render (car (gdocs--render-tab-tree tabs 7 "synthetic")))
+         (with-comment (gdocs--tabbed-comment-refs
+                        render tabs '((1 :text "note" :anchor "kix.comment")))))
+    (should (string-prefix-p "* First tab" with-comment))
+    (should (string-match-p "Bottom\\[fn:gdocs-comment-1\\]" with-comment))
+    (should (= (gdocs-test--count-substring with-comment
+                                            "[fn:gdocs-comment-1]") 1))))
+
+(ert-deftest gdocs-test-tabs-unknown-structure-fails-closed ()
+  "Unknown namespace and undeclared tabs never silently lose text."
+  (let ((ops (gdocs-test--tab-ops)))
+    (should-error
+     (gdocs--tabs-from-ops
+      (append ops '(((ty . "nm") (nmr "ksm" "t.missing")
+                     (nmc (ty . "is") (s . "Lost\n")))))))
+    (should-error
+     (gdocs--tabs-from-ops
+      (append ops '(((ty . "nm") (nmr "other" "t.pilot")
+                     (nmc (ty . "is") (s . "Lost\n")))))))
+    (should-error
+     (gdocs--tabs-from-ops
+      (append ops '(((ty . "ac")
+                     (d "t.unknown" (1 "Unknown") (9 0)))))))))
+
+(ert-deftest gdocs-test-tabs-single-declaration-remains-unwrapped ()
+  "A one-tab Google Doc keeps the old flat Org layout."
+  (let* ((ops '(((ty . "mkch") (d (1 "Only tab")))
+                ((ty . "is") (s . "Body\n"))))
+         (html (gdocs-test--html-for-ops
+                3 '(((ty . "mkch") (d . [[1 "Only tab"]]))
+                    ((ty . "is") (s . "Body\n")))))
+         (state (gdocs--parse-edit-state-html html))
+         (body (cdr (gdocs--ot-decode-pipeline "synthetic" html state))))
+    (should-not (gdocs--tabs-from-ops ops))
+    (should-not (plist-get state :tabs))
+    (should-not (string-match-p "^\\* Only tab" body))
+    (should (string-suffix-p "Body\n" body))))
+
+(ert-deftest gdocs-test-tabs-preflight-refuses-remote-write ()
+  "All write planners must refuse tabbed states before sending /save."
+  (let ((state (list :tabs (gdocs--tabs-from-ops (gdocs-test--tab-ops)))))
+    (should-error (gdocs--push-preflight state "" '(:kind :noop))
+                  :type 'user-error)))
+
+(ert-deftest gdocs-test-tabs-pull-hash-matches-buffer ()
+  "A tabbed pull establishes a clean document-wide baseline."
+  (let* ((html (gdocs-test--tab-html))
+         (state (gdocs--parse-edit-state-html html))
+         (body (cdr (gdocs--ot-decode-pipeline "synthetic" html state))))
+    (with-temp-buffer
+      (org-mode)
+      (insert body)
+      (should (equal (gdocs--current-body-hash)
+                     (gdocs--top-property-value "GDOC_CONTENT_HASH")))
+      (should (equal (gdocs--doc-id-from-buffer) "synthetic")))))
+
+(ert-deftest gdocs-test-tab-push-plans-one-text-operation ()
+  "Plan only the edited tab with an OT position local to that tab."
+  (let* ((gdocs-push-backend (quote ot-encode))
+         (html (gdocs-test--tab-html))
+         (state (gdocs--parse-edit-state-html html))
+         (body (nth 2 (gdocs--parse-pull-body
+                       (cdr (gdocs--ot-decode-pipeline
+                             "synthetic" html state)))))
+         (marker ":GDOC_TAB: t.child\n:END:\n")
+         (start (+ (string-match (regexp-quote marker) body)
+                   (length marker)))
+         (edited (concat (substring body 0 start) "Child body probe\n"
+                         (substring body (+ start (length "Child body\n")))))
+         (change (gdocs--tab-push-plan "synthetic" state edited)))
+    (should (equal (plist-get change :tab-id) "t.child"))
+    (should (equal (plist-get (plist-get change :plan) :commands)
+                   '(((ty . "is") (ibi . 11) (s . " probe")))))
+    (should-error
+     (gdocs--tab-push-plan
+      "synthetic" state
+      (replace-regexp-in-string "Guide here" "Guide there" edited t t))
+     :type 'user-error)
+    (should-error
+     (gdocs--tab-push-plan
+      "synthetic" state
+      (replace-regexp-in-string "\\*\\* Child" "** Renamed" body t t))
+     :type 'user-error)))
+
+(ert-deftest gdocs-test-tab-save-wraps-commands-and-selects-tab ()
+  "A tab-local save carries its namespace both in URL and command bundle."
+  (let* ((state (gdocs--state-for-tab
+                 (gdocs--parse-edit-state-html (gdocs-test--tab-html))
+                 "t.child"))
+         (gdocs-docs-tab "t.0")
+         (gdocs-auth-function (lambda () '(("Cookie" . "synthetic"))))
+         (gdocs--session-sid "synthetic-sid")
+         (gdocs--session-req-id 1)
+         request)
+    (cl-letf (((symbol-function 'gdocs--session-next-reqid) (lambda () 2))
+              ((symbol-function 'gdocs--curl-async)
+               (lambda (url _method _headers form callback)
+                 (setq request (list url form))
+                 (funcall callback
+                          ")]}'\n{\"revisionRanges\":[[8,8]],\"metadata\":{\"serverRevision\":8}}"
+                          200 nil))))
+      (gdocs--save-request-async
+       "synthetic" state '(((ty . "is") (ibi . 2) (s . "x")))
+       (lambda (_response err) (should-not err))))
+    (should (string-match-p "[?&]tab=t.child\\(?:&\\|\\'\\)" (car request)))
+    (should (string-match-p "nm" (url-unhex-string (cadr request))))
+    (should (string-match-p "t.child" (url-unhex-string (cadr request))))))
+
+(defun gdocs-test--tab-state-with-child (revision child-body)
+  "Return a parsed tab state at REVISION whose child tab holds CHILD-BODY."
+  (let ((state (gdocs--parse-edit-state-html (gdocs-test--tab-html))))
+    (setq state (plist-put state :revision revision))
+    (setq state (plist-put state :token "token"))
+    (setq state (plist-put state :ouid "ouid"))
+    (setq state
+          (plist-put
+           state :tabs
+           (mapcar (lambda (tab)
+                     (if (equal (plist-get tab :id) "t.child")
+                         (let ((tab (copy-sequence tab)))
+                           (setq tab (plist-put tab :ops
+                                                `(((ty . "is") (s . ,child-body)))))
+                           (plist-put tab :ot-body child-body))
+                       tab))
+                   (plist-get state :tabs))))
+    state))
+
+(ert-deftest gdocs-test-tab-save-outcome-classification ()
+  "A tab save is committed, untouched, or a conflict; never guessed."
+  (let ((before (gdocs-test--tab-state-with-child 7 "Child body\n")))
+    (should (eq (gdocs--tab-save-outcome
+                 "d" before before "t.child" "Child body probe\n")
+                :untouched))
+    (should (eq (gdocs--tab-save-outcome
+                 "d" before (gdocs-test--tab-state-with-child 8 "Child body probe\n")
+                 "t.child" "Child body probe\n")
+                :committed))
+    (should (eq (gdocs--tab-save-outcome
+                 "d" before (gdocs-test--tab-state-with-child 9 "Child body probe\n")
+                 "t.child" "Child body probe\n")
+                :conflict))
+    (should (eq (gdocs--tab-save-outcome
+                 "d" before (gdocs-test--tab-state-with-child 8 "Other\n")
+                 "t.child" "Child body probe\n")
+                :conflict))))
+
+(ert-deftest gdocs-test-tab-push-retries-throttle-then-verifies ()
+  "A throttled tab save is replanned from fresh state, then verified."
+  (let* ((gdocs-push-backend (quote ot-encode))
+         (gdocs--rate-limit-retry-delay 0)
+         (before (gdocs-test--tab-state-with-child 7 "Child body\n"))
+         (after (gdocs-test--tab-state-with-child 8 "Child body probe\n"))
+         (body (nth 2 (gdocs--parse-pull-body
+                       (cdr (gdocs--ot-decode-pipeline
+                             "d" (gdocs-test--tab-html) before)))))
+         (marker ":GDOC_TAB: t.child\n:END:\n")
+         (start (+ (string-match (regexp-quote marker) body) (length marker)))
+         (edited (concat (substring body 0 start) "Child body probe\n"
+                         (substring body (+ start (length "Child body\n")))))
+         (saves 0) (fetches 0) (released nil))
+    (with-temp-buffer
+      (org-mode)
+      (insert ":PROPERTIES:\n:GDOC_ID: d\n:GDOC_REVISION: 7\n:GDOC_TABS: 4\n:END:\n#+title: t\n\n"
+              edited)
+      (let ((local (gdocs--buffer-body-as-plain)))
+        (cl-letf (((symbol-function 'gdocs--save-request-async)
+                   (lambda (_d st commands cb)
+                     (cl-incf saves)
+                     (should (equal (plist-get st :tab-id) "t.child"))
+                     (should (= (length commands) 1))
+                     (if (= saves 1)
+                         (funcall cb nil '(:http-code 550 :err-code 13 :di 1))
+                       (funcall cb '((metadata (serverRevision . 7))
+                                     (revisionRanges (8 8)))
+                                nil))))
+                  ((symbol-function 'gdocs--fetch-edit-state-async)
+                   (lambda (_d cb)
+                     (cl-incf fetches)
+                     (funcall cb (if (< saves 2) before after) nil)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (_s _r f &rest _) (funcall f)))
+                  ((symbol-function 'gdocs--sync-release)
+                   (lambda (_o) (setq released t))))
+          (gdocs--tab-push-async "d" (current-buffer) "7" local before 'owner)))
+      (should released)
+      (should (= saves 2))
+      (should (equal (gdocs--top-property-value "GDOC_REVISION") "8")))))
+
+(ert-deftest gdocs-test-tab-push-plans-end-deletion-and-refuses-markup ()
+  "Deleting at the end of a tab is planned; inserted Org markup is refused."
+  (let* ((html (gdocs-test--tab-html))
+         (state (gdocs--parse-edit-state-html html))
+         (body (nth 2 (gdocs--parse-pull-body
+                       (cdr (gdocs--ot-decode-pipeline "d" html state)))))
+         (marker ":GDOC_TAB: t.child\n:END:\n")
+         (start (+ (string-match (regexp-quote marker) body) (length marker)))
+         (with (lambda (text)
+                 (concat (substring body 0 start) text
+                         (substring body (+ start (length "Child body\n")))))))
+    (should (equal (plist-get (plist-get (gdocs--tab-push-plan
+                                          "d" state (funcall with "Child\n"))
+                                         :plan)
+                              :commands)
+                   '(((ty . "ds") (si . 6) (ei . 10)))))
+    (should-error (gdocs--tab-push-plan "d" state (funcall with "Child *body*\n"))
+                  :type 'user-error)))
+
+(ert-deftest gdocs-test-tab-save-ack-revisions ()
+  "The tab endpoint acknowledges old serverRevision and new range end."
+  (should (gdocs--tab-save-ack-p
+           '((metadata (serverRevision . 5)) (revisionRanges (6 6))) 5))
+  (should-not (gdocs--tab-save-ack-p
+               '((metadata (serverRevision . 5)) (revisionRanges (7 7))) 5)))
+
 (defun gdocs-test--insert-op (body)
   "Construct an OT insert operation for BODY."
   `((ty . "is") (s . ,body)))
