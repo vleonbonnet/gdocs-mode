@@ -1002,7 +1002,7 @@ identified by GDOC_TAB properties, never by heading depth alone."
         (lambda (heading)
           (let ((start (org-element-property :begin heading)))
             (goto-char start)
-            (when-let ((id (org-entry-get start "GDOC_TAB" nil)))
+            (when-let* ((id (org-entry-get start "GDOC_TAB" nil)))
               (push (list :id id :start start
                           :level (org-element-property :level heading)
                           :title (org-get-heading t t t t)
@@ -1093,7 +1093,7 @@ a multi-tab push to one tab and one incremental model change per save."
                       :local local :remote remote) changes))))
     (when (> (length changes) 1)
       (user-error "gdocs: edit one tab at a time; multiple tab changes need separate saves"))
-    (when-let ((change (car changes)))
+    (when-let* ((change (car changes)))
       (let* ((scoped (plist-get change :state))
              (local (plist-get change :local))
              (remote (plist-get change :remote))
@@ -7066,7 +7066,7 @@ line, but never a second title paragraph."
 
 Only the first leading title is removed. A second, identical or different,
 `#+title:' remains available as the body Title paragraph."
-  (when-let ((region (gdocs--legacy-leading-title-region)))
+  (when-let* ((region (gdocs--legacy-leading-title-region)))
     (delete-region (car region) (cdr region))
     t))
 
