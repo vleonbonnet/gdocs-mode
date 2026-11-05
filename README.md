@@ -421,6 +421,4 @@ yet.
 - **Disclosed fallbacks, not silent loss.** Blocks the remote model cannot represent (quote/verse/center/example/special blocks, footnote definitions, horizontal rules, fixed-width lines) keep their text as ordinary content with a disclosed fallback instead of disappearing. Inline leaves (timestamps, entities, LaTeX fragments, footnote references, macros) are literalized in prose. Source-block language, checkbox structure inside lists, and rich Google-only formatting have no faithful round trip.
 - **Inline images are pull-only placeholders.** Downloading, uploading, moving, replacing, and deleting them through push are unsupported except for safe incremental text edits that prove the image was left untouched.
 - **Comments** are pulled as an editable local-only footnote and `* Comments` projection, stripped before push, and regenerated from remote comments on the next pull; local edits are never sent to Google. Suggestions and column layouts remain out of scope.
-- **Rate limiting.** Google's `/save` endpoint rejects malformed or
-excessively bursty requests; the mode persists a session SID to look like a
-single stable client.
+- **Rate limiting.** Google's `/save` endpoint rejects malformed or excessively bursty requests; the mode persists a session SID to look like a single stable client.  The endpoint reads that SID as a signed 64-bit integer and permanently refuses one with the top bit set (HTTP 550 / err 13), so the mode only generates SIDs below 2^63 and replaces an out-of-range SID it finds in `gdocs-session-file`.

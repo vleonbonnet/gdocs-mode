@@ -1404,7 +1404,14 @@ caller's `gdocs-auth-function' is used."
 ;; runs. Each run is a (:text :styles :link) plist.
 ;;
 ;; DOC   = (:revision N :doc-id S :title S :paragraphs (PARA ...)
-;;          :lists ALIST :inline-objects (OBJECT ...) :unsupported (CAP ...))
+;;          :lists ALIST :inline-objects (OBJECT ...) :unsupported (CAP ...)
+;;          :ot-length N)   ; decoded docs only: length of the OT body text
+;;
+;; A document's last paragraph is terminated by a newline Google keeps
+;; outside the OT body text, one position past its end.  When the body text
+;; itself ends with a newline, that last paragraph is empty and the decoder
+;; omits it; otherwise the decoded last paragraph has no newline in the
+;; body, and `:ot-length' is one less than the paragraphs' emitted length.
 ;; PARA  = (:kind :para|:heading|:title|:subtitle|:blank|:list|:code|:table
 ;;          :level N         ; heading level 1..5 (only for :heading)
 ;;          :list-id S       ; list entity id (only for :list)
@@ -1449,7 +1456,8 @@ caller's `gdocs-auth-function' is used."
      ("ds" . :recognized)
      ("as" . :attribute)
      ("ae" . :entity-definition)
-     ("te" . :entity-attachment))
+     ("te" . :entity-attachment)
+     ("umv" . :model-version))
     (:entity
      ("list" . :recognized)
      ("inline" . :recognized-not-editable)
@@ -1501,7 +1509,8 @@ Unknown values are classified as `:unknown'."
     (ts_bgc2 . :normalized) (ts_bgc2_i . :explicitness)
     (ts_va . :normalized) (ts_va_i . :explicitness)
     (ts_sc . :normalized) (ts_sc_i . :explicitness)
-    (ts_tw . :normalized) (ts_tw_i . :explicitness))
+    (ts_tw . :normalized) (ts_tw_i . :explicitness)
+    (ts_lsp . :normalized) (ts_lsp_i . :explicitness))
   "Classification table for observed text-style keys.
 
 The normalized entries are supported only for their canonical values.  Their
@@ -1598,6 +1607,14 @@ one of these types is NOT understood and stays fail-closed.")
   (and (member style gdocs--capability-document-attribute-types)
        (listp op)
        (equal (alist-get 'si op) (alist-get 'ei op))))
+
+(defun gdocs--model-version-op-p (op)
+  "Return non-nil when OP is a well-formed model-version marker.
+Google ends the model chunk of documents saved by a recent editor with
+`((ty . \"umv\") (mv . N))'."
+  (and (listp op)
+       (equal (alist-get 'ty op) "umv")
+       (natnump (alist-get 'mv op))))
 
 (defconst gdocs--capability-annotation-attribute-types
   '("bookmark_range" "comment" "ignore_spellcheck" "import_warnings"
@@ -2620,6 +2637,22 @@ same visible result as the canonical emitted object."
                     (gdocs--capability-number-equal-p type 0))))))
    (t nil)))
 
+(defun gdocs--capability-letter-spacing-default-p (value)
+  "Return non-nil when letter-spacing VALUE means no extra spacing.
+Google writes `ts_lsp' as `((lspp_points . 0.0) (lsp_type . 0))' on text
+and list levels it saves, which is the spacing text has without it."
+  (or (gdocs--capability-default-value-p value)
+      (and (listp value)
+           (cl-every (lambda (entry)
+                       (memq (car-safe entry) '(lspp_points lsp_type)))
+                     value)
+           (let ((points (assq 'lspp_points value))
+                 (type (assq 'lsp_type value)))
+             (and (or (null points)
+                      (gdocs--capability-number-equal-p (cdr points) 0))
+                  (or (null type)
+                      (gdocs--capability-number-equal-p (cdr type) 0)))))))
+
 (defun gdocs--capability-text-style-value-supported-p (key value)
   "Return non-nil when semantic text-style KEY/VALUE is round-trip safe."
   (pcase key
@@ -2647,6 +2680,8 @@ same visible result as the canonical emitted object."
      (or (gdocs--capability-default-value-p value)
          (gdocs--capability-number-equal-p
           value gdocs--capability-default-text-weight)))
+    ('ts_lsp
+     (gdocs--capability-letter-spacing-default-p value))
     (_ t)))
 
 (defun gdocs--capability-unsupported-value-report
@@ -2709,6 +2744,8 @@ same visible result as the canonical emitted object."
     ('ts_tw
      (or (gdocs--capability-default-value-p value)
          (gdocs--capability-number-equal-p value 400)))
+    ('ts_lsp
+     (gdocs--capability-letter-spacing-default-p value))
     (_ nil)))
 
 (defun gdocs--capability-list-text-style-features
@@ -3104,6 +3141,18 @@ report. Inline image reports are produced by
                    :feature-type (if (stringp type) type "unknown")
                    :refuse-push t)
                   reports))
+           ;; The model-version marker closes a document's model chunk and
+           ;; names the model version the editor saved it under.  It holds
+           ;; no content and sits outside the body, so a body replacement
+           ;; cannot remove it.  A marker without an integer version is not
+           ;; understood and stays fail-closed.
+           ((eq classification :model-version)
+            (unless (gdocs--model-version-op-p op)
+              (push (gdocs--capability-report-for-op
+                     :unknown-feature
+                     "A model-version marker has no usable version."
+                     op :feature-type "umv" :refuse-push t)
+                    reports)))
            ((equal type "is")
             (unless (stringp (alist-get 's op))
               (push (gdocs--capability-report-for-op
@@ -3743,6 +3792,7 @@ REVISION, DOC-ID and TITLE are stored as metadata."
             (setq i (1+ nl)))))))
     (gdocs-dm-make-doc :revision revision :doc-id doc-id :title title
                        :paragraphs (nreverse paragraphs)
+                       :ot-length body-len
                        :lists list-defs
                        :inline-objects (plist-get inline-analysis :objects)
                        :unsupported (plist-get inline-analysis :unsupported))))
@@ -6173,9 +6223,27 @@ fallback plan omits commands that would re-encode unsupported local entities."
          (new-raw (gdocs-dm-paragraphs new-doc))
          (old-norm (gdocs--normalize-paragraphs-for-ot old-raw))
          (new-norm (gdocs--normalize-paragraphs-for-ot new-raw))
+         (old-raw-len (gdocs--paragraphs-ot-length old-raw))
+         ;; The OT length the remote body actually has.  It is one short of
+         ;; OLD-RAW-LEN when the last paragraph's newline is the one Google
+         ;; keeps outside the body; see the doc-model schema.
+         (old-ot-len (or (plist-get old-doc :ot-length) old-raw-len))
+         (unterminated (and old-raw (= old-ot-len (1- old-raw-len))))
+         (old-map (gdocs--raw-indices-for-norm old-raw old-norm))
          (pre (gdocs--paragraphs-common-prefix old-norm new-norm))
          (suf (gdocs--paragraphs-common-suffix
                (nthcdr pre old-norm) (nthcdr pre new-norm)))
+         (pre (if (and unterminated
+                       (> pre 0)
+                       (= suf 0)
+                       (= pre (length old-norm))
+                       (< pre (length new-norm))
+                       (= (nth (1- pre) old-map) (1- (length old-raw))))
+                  ;; Appending after an unterminated last paragraph: no
+                  ;; insertion point lies past its text, so rewrite that
+                  ;; paragraph together with what follows it.
+                  (1- pre)
+                pre))
          (old-mid (cl-subseq old-norm pre
                              (- (length old-norm) suf)))
          (new-mid (cl-subseq new-norm pre
@@ -6192,13 +6260,11 @@ fallback plan omits commands that would re-encode unsupported local entities."
                (append old-mid new-mid))
       (list :commands
             (and (not classify-only)
-                 (gdocs-dm-to-save-commands
-                  (gdocs--paragraphs-ot-length old-raw) new-doc))
+                 (gdocs-dm-to-save-commands old-ot-len new-doc))
             :kind :full-replace
             :ranges nil))
      (t
-      (let* ((old-map (gdocs--raw-indices-for-norm old-raw old-norm))
-             ;; Raw span covering the common prefix: through the raw
+      (let* (;; Raw span covering the common prefix: through the raw
              ;; paragraph that produced the last normalized prefix entry.
              (prefix-last-raw (and (> pre 0)
                                    (nth (1- pre) old-map)))
@@ -6219,12 +6285,16 @@ fallback plan omits commands that would re-encode unsupported local entities."
                                raw-prefix-len))
                            ;; No common suffix: the middle extends to the
                            ;; end of the raw body, including trailing
-                           ;; normalized-away paragraphs.
+                           ;; normalized-away paragraphs, but not past the
+                           ;; body text: the newline Google keeps after an
+                           ;; unterminated last paragraph cannot be deleted.
                            (t
-                            (- (gdocs--paragraphs-ot-length old-raw)
-                               raw-prefix-len))))
-             (sub-doc (gdocs-dm-make-doc :paragraphs new-mid))
-             (built (gdocs-dm-to-ot sub-doc))
+                            (- old-ot-len raw-prefix-len))))
+             ;; NEW-MID is a slice of the already canonical NEW-NORM.
+             ;; Emit it as is: normalizing the slice on its own would drop
+             ;; a blank paragraph at its edges, which is only an edge of
+             ;; the slice, not of the document.
+             (built (gdocs--emit-paragraphs-ot new-mid))
              (mid-body (car built))
              (mid-style-ops (cdr built))
              (shifted-ops
@@ -7772,11 +7842,21 @@ stale buffer-local capability metadata cannot bypass policy."
     (unless (eq kind :noop)
       (cond
        ((eq kind :full-replace)
-        (let ((destructive
-               (cl-remove-if-not
-                (lambda (report)
-                  (eq (plist-get report :severity) :destructive))
-                blocking)))
+        (let* ((final-newline (1+ (length (or (plist-get state :ot-body) ""))))
+               (destructive
+                (cl-remove-if-not
+                 (lambda (report)
+                   (and (eq (plist-get report :severity) :destructive)
+                        ;; A full replacement rewrites the body text only.
+                        ;; The newline Google keeps after it, and the
+                        ;; paragraph attributes on that newline, stay.
+                        (not (and (plist-get report :preserve-untouched)
+                                  (not (plist-get report :refuse-push))
+                                  (eql (plist-get report :ot-start)
+                                       final-newline)
+                                  (eql (plist-get report :ot-end)
+                                       final-newline)))))
+                 blocking)))
           (when destructive
             (gdocs--push-capability-summary-error
              destructive :full-replace))))
@@ -8146,8 +8226,9 @@ burst budget entirely and keeps the push reliable.")
 (defconst gdocs--rate-limit-retry-delay 3
   "Seconds to wait before retrying a /save POST that returned HTTP 550.
 Short enough to recover from transient load-balancer blips, long enough
-not to hammer Google's throttle further. /save throttle is probabilistic
-per-request, not a hard session cooldown — see Push protocol.")
+not to hammer Google's throttle further.  A 550 / err 13 on every save
+of a session is not a throttle: it is a SID the endpoint refuses (see
+`gdocs--session-sid-valid-p').")
 
 (defvar gdocs--session-sid nil
   "Persistent session SID, shared across all /save calls from this client.
@@ -8164,11 +8245,12 @@ Each save bumps it and writes the new value back to disk.")
                     (or (getenv "XDG_CACHE_HOME")
                         (expand-file-name "~/.cache")))
   "Where to persist the SID + reqId pair between Emacs sessions.
-Cold-SID + reqId=1 on every save makes us look like dozens of new
-clients hammering one doc — Google's abuse heuristic returns
-HTTP 550 / err 13 deterministically (mis-diagnosed earlier as
-transient throttle). One persistent SID per workstation looks
-like one browser session and clears the rejection."
+A browser keeps one SID for its editing session and numbers its saves
+with `reqId'; persisting the pair lets saves from this workstation do
+the same.  The endpoint reads the SID as a signed 64-bit integer: one
+with its top bit set fails its first save with HTTP 550 / err 13 and
+then every later one, which earlier versions took for a throttle.  See
+`gdocs--session-sid-valid-p'."
   :type 'file
   :group 'gdocs-mode)
 
@@ -9143,11 +9225,16 @@ an explicit retry policy such as the bounded throttle retry."
    (t nil)))
 
 (defun gdocs--save-response-revision (response plan)
-  "Return PLAN's post-revision when every revision in RESPONSE matches it.
+  "Return PLAN's post-revision when RESPONSE acknowledges exactly that save.
 
-Both `serverRevision' and the terminal endpoint in `revisionRanges' are
-authoritative when supplied.  Missing, malformed, disagreeing, lower, or
-higher values signal an error so the caller reconciles against fresh content."
+The terminal endpoint of `revisionRanges' is the revision the save
+created and must equal PLAN's post-revision.  `serverRevision' is the
+revision the server applied the save on top of, one below it; earlier
+responses of the editors frontend reported the post-revision there
+instead, which is still accepted.  Without `revisionRanges' only that
+older shape identifies the save, so `serverRevision' must equal the
+post-revision.  Missing, malformed, disagreeing, lower, or higher values
+signal an error so the caller reconciles against fresh content."
   (let* ((expected (gdocs--save-revision-value
                     (plist-get plan :post-revision)))
          (metadata-cell (and (listp response) (assq 'metadata response)))
@@ -9162,13 +9249,17 @@ higher values signal an error so the caller reconciles against fresh content."
          (server-rev (and server-cell
                           (gdocs--save-revision-value (cdr server-cell))))
          (range-rev (and ranges-cell
-                         (gdocs--save-revision-value range-rev-cell)))
-         (supplied (delq nil (list server-rev range-rev))))
+                         (gdocs--save-revision-value range-rev-cell))))
     (unless (and expected
-                 supplied
+                 (or server-cell ranges-cell)
                  (or (null server-cell) server-rev)
                  (or (null ranges-cell) range-rev)
-                 (cl-every (lambda (revision) (= revision expected)) supplied))
+                 (if ranges-cell
+                     (and (= range-rev expected)
+                          (or (null server-cell)
+                              (= server-rev expected)
+                              (= server-rev (1- expected))))
+                   (= server-rev expected)))
       (user-error "gdocs: /save revision metadata did not exactly match expected rev %S"
                   (plist-get plan :post-revision)))
     expected))
@@ -9955,13 +10046,16 @@ crosses structural boundaries to be safe to push."
 
 (defun gdocs--session-load-from-disk ()
   "Populate `gdocs--session-sid' / `gdocs--session-req-id' from disk.
-Returns t if a session was loaded, nil if the file was absent or unreadable."
+Returns t if a session was loaded, nil if the file was absent, unreadable
+or held a SID that `gdocs--session-sid-valid-p' rejects."
   (when (file-readable-p gdocs-session-file)
     (condition-case _
         (with-temp-buffer
           (insert-file-contents gdocs-session-file)
           (let ((data (read (current-buffer))))
-            (when (and (plist-get data :sid)
+            ;; A SID persisted by an earlier version may have its top bit
+            ;; set; the endpoint refuses such a SID, so a new one is made.
+            (when (and (gdocs--session-sid-valid-p (plist-get data :sid))
                        (integerp (plist-get data :req-id)))
               (setq gdocs--session-sid (plist-get data :sid))
               (setq gdocs--session-req-id (plist-get data :req-id))
@@ -9980,16 +10074,29 @@ Returns t if a session was loaded, nil if the file was absent or unreadable."
                    :saved-at (float-time))
              (current-buffer)))))
 
+(defun gdocs--session-sid-valid-p (sid)
+  "Return non-nil when SID is a session id the /save endpoint accepts.
+A SID is 16 lowercase hex digits read as a signed 64-bit integer, so it
+must be below 2^63: the endpoint answers a SID whose top bit is set with
+HTTP 550/err 13 on its first save, and keeps refusing that SID on every
+later save."
+  (and (stringp sid)
+       (let ((case-fold-search nil))
+         (string-match-p "\\`[0-7][0-9a-f]\\{15\\}\\'" sid))))
+
+(defun gdocs--session-new-sid ()
+  "Return a random session id that `gdocs--session-sid-valid-p' accepts."
+  (format "%016x"
+          (logior (ash (random (expt 2 31)) 32)
+                  (random (expt 2 32)))))
+
 (defun gdocs--session-ensure ()
   "Make sure `gdocs--session-sid' / `gdocs--session-req-id' are populated.
 Loads from disk on first call; generates a fresh SID if no file exists."
   (unless (and gdocs--session-sid gdocs--session-req-id)
     (or (gdocs--session-load-from-disk)
         (progn
-          (setq gdocs--session-sid
-                (format "%016x"
-                        (logior (ash (random (expt 2 32)) 32)
-                                (random (expt 2 32)))))
+          (setq gdocs--session-sid (gdocs--session-new-sid))
           (setq gdocs--session-req-id 0)
           (gdocs--session-write-to-disk)))))
 

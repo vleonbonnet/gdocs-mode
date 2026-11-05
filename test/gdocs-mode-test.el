@@ -411,6 +411,33 @@
     (should (= (gdocs--session-next-reqid) 1))
     (should (file-exists-p gdocs-session-file))))
 
+(ert-deftest gdocs-test-session-sids-stay-below-two-to-the-sixty-three ()
+  "SIDs stay below 2^63; a persisted SID at or above it is replaced."
+  (dotimes (_ 200)
+    (should (gdocs--session-sid-valid-p (gdocs--session-new-sid))))
+  (should (gdocs--session-sid-valid-p "7fffffffffffffff"))
+  (should (gdocs--session-sid-valid-p "0000000000000000"))
+  (dolist (sid '("8000000000000000" "f00dfacecafe1234" "7fffffffffffffff0"
+                 "7FFFFFFFFFFFFFFF" "synthetic-sid" nil))
+    (should-not (gdocs--session-sid-valid-p sid)))
+  (make-directory (file-name-directory gdocs-session-file) t)
+  (unwind-protect
+      (progn
+        (with-temp-file gdocs-session-file
+          (prin1 '(:sid "c1d2e3f4a5b60718" :req-id 4 :saved-at 0) (current-buffer)))
+        (let ((gdocs--session-sid nil)
+              (gdocs--session-req-id nil))
+          (should (= (gdocs--session-next-reqid) 1))
+          (should (gdocs--session-sid-valid-p gdocs--session-sid)))
+        (with-temp-file gdocs-session-file
+          (prin1 '(:sid "41d2e3f4a5b60718" :req-id 4 :saved-at 0) (current-buffer)))
+        (let ((gdocs--session-sid nil)
+              (gdocs--session-req-id nil))
+          (should (= (gdocs--session-next-reqid) 5))
+          (should (equal gdocs--session-sid "41d2e3f4a5b60718"))))
+    (when (file-exists-p gdocs-session-file)
+      (delete-file gdocs-session-file))))
+
 (ert-deftest gdocs-test-suite-directory-cleanup-removes-persistent-state ()
   "The suite cleanup removes temporary persistent outputs recursively."
   (let* ((directory (make-temp-file "gdocs-mode-cleanup-test-" t))
@@ -2780,6 +2807,55 @@ END is the inclusive final OT position."
         (user-error (setq message (error-message-string err))))
       (should (string-match-p "unknown feature" message)))))
 
+(ert-deftest gdocs-test-model-version-marker-does-not-block-push ()
+  "The `umv' marker closing a recent document's model chunk is not content."
+  (let* ((ops (list (gdocs-test--insert-op "Title")
+                    '((ty . "as") (st . "language") (si . 0) (ei . 0)
+                      (sm . ((lgs_l . "en"))))
+                    '((ty . "umv") (mv . 13))))
+         (state (list :revision 5 :token "token" :ouid "ouid"
+                      :ot-body "Title" :ot-ops ops))
+         (reports (plist-get (gdocs--remote-capability-analysis state)
+                             :unsupported)))
+    (should-not (cl-some (lambda (report)
+                           (eq (plist-get report :kind) :unknown-feature))
+                         reports))
+    (should (gdocs--push-preflight state "Local\n" '(:kind :full-replace)))
+    ;; A marker without an integer version is still fail-closed.
+    (dolist (bad '(((ty . "umv")) ((ty . "umv") (mv . "13"))
+                   ((ty . "umv") (mv . -1))))
+      (let* ((bad-state (plist-put (copy-sequence state) :ot-ops
+                                   (list (gdocs-test--insert-op "Title") bad)))
+             (message nil))
+        (condition-case err
+            (gdocs--push-preflight bad-state "Local\n" '(:kind :full-replace))
+          (user-error (setq message (error-message-string err))))
+        (should (string-match-p "unknown feature" message))))))
+
+(ert-deftest gdocs-test-full-replace-keeps-attributes-on-the-final-newline ()
+  "Attributes on the newline past the body survive a full replacement."
+  (let* ((spacing (lambda (position)
+                    `((ty . "as") (st . "paragraph") (si . ,position)
+                      (ei . ,position) (sm . ((ps_sb . 24.0) (ps_sb_i . :json-false))))))
+         (final (list :revision 3 :token "token" :ouid "ouid" :ot-body "Title"
+                      :ot-ops (list (gdocs-test--insert-op "Title")
+                                    (funcall spacing 6))))
+         (inner (list :revision 3 :token "token" :ouid "ouid"
+                      :ot-body "Title\nBody"
+                      :ot-ops (list (gdocs-test--insert-op "Title\nBody")
+                                    (funcall spacing 6)))))
+    (should (cl-some (lambda (report)
+                       (eq (plist-get report :kind) :unsupported-paragraph))
+                     (plist-get (gdocs--remote-capability-analysis final)
+                                :unsupported)))
+    (should (gdocs--push-preflight final "Local\n" '(:kind :full-replace)))
+    ;; The same attribute on a newline inside the body would be discarded.
+    (let ((message nil))
+      (condition-case err
+          (gdocs--push-preflight inner "Local\n" '(:kind :full-replace))
+        (user-error (setq message (error-message-string err))))
+      (should (string-match-p "would discard" message)))))
+
 (ert-deftest gdocs-test-source-block-round-trips-through-ot-with-code-style ()
   "Src blocks keep their code font across the OT boundary."
   (let* ((source "#+begin_src python\nprint(1)\n\nprint(2)\n#+end_src\n")
@@ -3028,6 +3104,79 @@ END is the inclusive final OT position."
         (should (equal (gdocs-test--normalize-org (gdocs-dm-to-org decoded))
                        (gdocs-test--normalize-org
                         (gdocs-dm-to-org new))))))))
+
+(defun gdocs-test--apply-body-commands (body commands)
+  "Apply the `ds'/`is' COMMANDS to the OT BODY text the way Google does.
+Every document keeps one newline past BODY; an insertion may land just
+before it, but neither command may reach it."
+  (dolist (cmd commands body)
+    (pcase (alist-get 'ty cmd)
+      ("ds"
+       (let ((si (alist-get 'si cmd)) (ei (alist-get 'ei cmd)))
+         (should (<= 1 si ei (length body)))
+         (setq body (concat (substring body 0 (1- si))
+                            (substring body ei)))))
+      ("is"
+       (let ((ibi (alist-get 'ibi cmd)))
+         (should (<= 1 ibi (1+ (length body))))
+         (setq body (concat (substring body 0 (1- ibi))
+                            (alist-get 's cmd)
+                            (substring body (1- ibi)))))))))
+
+(ert-deftest gdocs-test-incremental-plan-keeps-blanks-at-the-edit-edges ()
+  "A blank paragraph at either edge of the edited region is not dropped."
+  (dolist (case '(("A\n" "A\n\nA\n")
+                  ("A\nA\n" "A\nA\n\nA\n")
+                  ("A\nA\n" "A\n\nA\nA\n")
+                  ("Dup.\nDup.\n" "Dup.\nDup.\n\nDup.\n")))
+    (let* ((remote (car case))
+           (local (cadr case))
+           (old (gdocs-dm-from-ops 1 "synthetic" nil remote
+                                   (list (gdocs-test--insert-op remote))))
+           (plan (gdocs-dm-to-incremental-save-plan
+                  old (gdocs-dm-from-org local))))
+      (should (eq (plist-get plan :kind) :incremental))
+      (should (equal (gdocs-test--apply-body-commands
+                      remote (plist-get plan :commands))
+                     local)))))
+
+(ert-deftest gdocs-test-incremental-plan-handles-an-unterminated-last-paragraph ()
+  "Edits respect the newline Google keeps after a non-empty last paragraph.
+That newline is outside the body text.  Edits must neither delete that newline nor insert past it, and appending
+re-emits the last paragraph so its paragraph style is written again."
+  (let ((heading-style '((ty . "as") (st . "paragraph") (si . 6) (ei . 6)
+                         (sm . ((ps_hd . 1) (ps_hd_i . :json-false))))))
+    (dolist (case '(("Title" "* Title\nNew\n" "Title\nNew\n")
+                    ("Title" "* Title\n\nNew\n" "Title\nNew\n")
+                    ("Title" "Other\n" "Other\n")))
+      (let* ((remote (car case))
+             (old (gdocs-dm-from-ops
+                   1 "synthetic" nil remote
+                   (list (gdocs-test--insert-op remote) heading-style)))
+             (plan (gdocs-dm-to-incremental-save-plan
+                    old (gdocs-dm-from-org (cadr case))))
+             (commands (plist-get plan :commands)))
+        (should (= (plist-get old :ot-length) 5))
+        (should (equal (gdocs-test--apply-body-commands remote commands)
+                       (nth 2 case)))
+        (when (string-prefix-p "* " (cadr case))
+          (should (cl-some (lambda (cmd)
+                             (and (equal (alist-get 'st cmd) "paragraph")
+                                  (= (alist-get 'si cmd) 6)
+                                  (equal (alist-get 'ps_hd (alist-get 'sm cmd))
+                                         1)))
+                           commands))))))
+  (dolist (case '(("A\nB" "A\n" "A\n")
+                  ("A\nB" "A\nC\nB\n" "A\nC\nB\n")
+                  ("A" "A\n\nB\n" "A\n\nB\n")))
+    (let* ((remote (car case))
+           (old (gdocs-dm-from-ops 1 "synthetic" nil remote
+                                   (list (gdocs-test--insert-op remote))))
+           (plan (gdocs-dm-to-incremental-save-plan
+                  old (gdocs-dm-from-org (cadr case)))))
+      (should (equal (gdocs-test--apply-body-commands
+                      remote (plist-get plan :commands))
+                     (nth 2 case))))))
 
 (ert-deftest gdocs-test-generated-save-command-shapes-ignore-unstable-ids ()
   "Save commands expose stable OT shapes without comparing generated IDs."
@@ -5447,6 +5596,38 @@ that a removed preflight guard would be observed as an unexpected success."
               :ranges ((:ot-start 3 :ot-end 3 :insert-at 3 :delete-count 0))))
      :type 'user-error)))
 
+(ert-deftest gdocs-test-default-letter-spacing-is-not-a-capability ()
+  "Zero letter spacing, which Google writes on saved text, is supported."
+  (let* ((body "styled\nlisted\n")
+         (zero '((lspp_points . 0.0) (lsp_type . 0)))
+         (ops (list (gdocs-test--insert-op body)
+                    `((ty . "as") (st . "text") (si . 1) (ei . 14)
+                      (sm . ((ts_lsp . ,zero) (ts_lsp_i . :json-false))))))
+         (state (list :revision 7 :ot-body body :ot-ops ops)))
+    (should-not (plist-get (gdocs--remote-capability-analysis state)
+                           :unsupported))
+    (should (gdocs--push-preflight state "changed\n" '(:kind :full-replace)))
+    (dolist (value (list zero :json-false nil))
+      (should (gdocs--capability-text-style-value-supported-p 'ts_lsp value))
+      (should (gdocs--capability-list-text-style-value-canonical-p
+               'ts_lsp value)))
+    (dolist (value '(((lspp_points . 1.5) (lsp_type . 0))
+                     ((lspp_points . 0.0) (lsp_type . 1))
+                     ((lspp_points . 0.0) (lsp_extra . 0))
+                     "0"))
+      (should-not (gdocs--capability-text-style-value-supported-p
+                   'ts_lsp value))
+      (should-not (gdocs--capability-list-text-style-value-canonical-p
+                   'ts_lsp value)))
+    (let ((spaced (list :revision 7 :ot-body body
+                        :ot-ops (list (gdocs-test--insert-op body)
+                                      '((ty . "as") (st . "text") (si . 1) (ei . 6)
+                                        (sm . ((ts_lsp (lspp_points . 2.0)
+                                                       (lsp_type . 0)))))))))
+      (should-error (gdocs--push-preflight spaced "changed\n"
+                                           '(:kind :full-replace))
+                    :type 'user-error))))
+
 (ert-deftest gdocs-test-auto-sync-never-selects-lossy-override ()
   "Auto-sync invokes the normal guarded push entry point only."
   (let ((gdocs-mode t)
@@ -7427,7 +7608,11 @@ that a removed preflight guard would be observed as an unexpected success."
              '(((metadata . ((serverRevision . 8))))
                ((revisionRanges . ((7 8))))
                ((metadata . ((serverRevision . "8")))
-                (revisionRanges . ((7 "8"))))))
+                (revisionRanges . ((7 "8"))))
+               ;; The current frontend reports the revision the save was
+               ;; applied on as serverRevision.
+               ((metadata . ((serverRevision . 7)))
+                (revisionRanges . ((8 8))))))
       (should (= (gdocs--save-response-revision response plan) 8)))
     (dolist (response
              '(((ok . t))
@@ -7438,7 +7623,13 @@ that a removed preflight guard would be observed as an unexpected success."
                ((revisionRanges . ((7 9))))
                ((revisionRanges . ((7 "bad"))))
                ((metadata . ((serverRevision . 8)))
-                (revisionRanges . ((8 9))))))
+                (revisionRanges . ((8 9))))
+               ((metadata . ((serverRevision . 6)))
+                (revisionRanges . ((8 8))))
+               ((metadata . ((serverRevision . 9)))
+                (revisionRanges . ((8 8))))
+               ((metadata . ((serverRevision . "bad")))
+                (revisionRanges . ((8 8))))))
       (should-error (gdocs--save-response-revision response plan)
                     :type 'user-error))))
 
