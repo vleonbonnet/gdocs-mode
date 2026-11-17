@@ -715,7 +715,7 @@
     (should (eq (gdocs--tab-save-outcome
                  "d" before (gdocs-test--tab-state-with-child 8 "Other\n")
                  "t.child" "Child body probe\n")
-                :conflict))))
+                :mismatch))))
 
 (ert-deftest gdocs-test-tab-push-retries-throttle-then-verifies ()
   "A throttled tab save is replanned from fresh state, then verified."
@@ -759,8 +759,8 @@
       (should (= saves 2))
       (should (equal (gdocs--top-property-value "GDOC_REVISION") "8")))))
 
-(ert-deftest gdocs-test-tab-push-plans-end-deletion-and-refuses-markup ()
-  "Deleting at the end of a tab is planned; inserted Org markup is refused."
+(ert-deftest gdocs-test-tab-push-plans-end-deletion-and-restyle ()
+  "Deleting at the end of a tab is planned; added emphasis restyles in place."
   (let* ((html (gdocs-test--tab-html))
          (state (gdocs--parse-edit-state-html html))
          (body (nth 2 (gdocs--parse-pull-body
@@ -775,8 +775,12 @@
                                          :plan)
                               :commands)
                    '(((ty . "ds") (si . 6) (ei . 10)))))
-    (should-error (gdocs--tab-push-plan "d" state (funcall with "Child *body*\n"))
-                  :type 'user-error)))
+    (should (equal (plist-get (plist-get (gdocs--tab-push-plan
+                                          "d" state (funcall with "Child *body*\n"))
+                                         :plan)
+                              :commands)
+                   '(((ty . "as") (st . "text") (si . 7) (ei . 10)
+                      (sm (ts_bd . t) (ts_bd_i . :json-false))))))))
 
 (ert-deftest gdocs-test-tab-save-ack-revisions ()
   "The tab endpoint acknowledges old serverRevision and new range end."
@@ -784,6 +788,172 @@
            '((metadata (serverRevision . 5)) (revisionRanges (6 6))) 5))
   (should-not (gdocs--tab-save-ack-p
                '((metadata (serverRevision . 5)) (revisionRanges (7 7))) 5)))
+
+(defconst gdocs-test--work-body
+  "Heading\nPlain red text here\nItem one\nItem two\nSee Docs now\nTail\n"
+  "OT body of the formatted tab in `gdocs-test--work-tab-ops'.")
+
+(defun gdocs-test--work-tab-ops ()
+  "Return a tab stream whose original tab is second and has an icon.
+Tab `t.work' comes first and holds a heading, red text, a list with a
+commented item and a link; `t.kid', a child of the original tab, is empty."
+  (let* ((body gdocs-test--work-body)
+         (work-ops
+          (list (gdocs-test--insert-op body)
+                (gdocs-test--paragraph-op body '(:kind :heading :level 1 :line 1))
+                `((ty . "as") (st . "text") (si . 15) (ei . 17)
+                  (sm (ts_fgc2 (hclr_color . "#ff0000") (clr_type . 0))
+                      (ts_fgc2_i . :json-false)))
+                (gdocs-test--list-definition-op '(:id "kix.list" :glyph :bullet))
+                (gdocs-test--list-binding-op body '(:id "kix.list" :line 3))
+                (gdocs-test--list-binding-op body '(:id "kix.list" :line 4))
+                `((ty . "as") (st . "doco_anchor") (si . 38) (ei . 45)
+                  (sm (das_a (cv (op . "set") (opValue "kix.comment")))))
+                (gdocs-test--link-range-op body "Docs" "https://docs.example")
+                (gdocs-test--text-range-op body '(:text "Docs" :styles (:underline))))))
+    (append
+     (list '((ty . "mkch") (d (1 "Root" 2 "🎏")))
+           '((ty . "ac") (d "t.work" (1 "Work") (0)))
+           '((ty . "ac") (d "t.kid" (1 "Kid") (1 0)))
+           '((ty . "is") (s . "Root body\n")))
+     (mapcar (lambda (op) `((ty . "nm") (nmr "ksm" "t.work") (nmc . ,op))) work-ops)
+     (list '((ty . "nm") (nmr "ksm" "t.kid")
+             (nmc (ty . "as") (st . "paragraph") (si . 1) (ei . 1)
+                  (sm (ps_hd_i . t))))))))
+
+(defun gdocs-test--work-state ()
+  "Return an edit state for `gdocs-test--work-tab-ops'."
+  (list :revision 7 :token "token" :ouid "ouid"
+        :tabs (gdocs--tabs-from-ops (gdocs-test--work-tab-ops))))
+
+(defun gdocs-test--work-plan (from to)
+  "Plan the push that replaces FROM with TO in the rendered work tab."
+  (let* ((state (gdocs-test--work-state))
+         (body (car (gdocs--render-tab-tree (plist-get state :tabs) 7 "d")))
+         (edited (string-replace from to body)))
+    (should-not (equal edited body))
+    (plist-get (gdocs--tab-push-plan "d" state edited) :plan)))
+
+(ert-deftest gdocs-test-tabs-original-tab-takes-free-position ()
+  "The `mkch' tab may carry an icon and sit after reordered tabs."
+  (let ((tabs (gdocs--tabs-from-ops (gdocs-test--work-tab-ops))))
+    (should (equal (mapcar (lambda (tab) (plist-get tab :id)) tabs)
+                   '("t.work" "t.0" "t.kid")))
+    (should (equal (mapcar (lambda (tab) (plist-get tab :path)) tabs)
+                   '((0) (1) (1 0))))
+    (should (equal (plist-get (nth 1 tabs) :icon) "🎏"))
+    (should (equal (plist-get (nth 1 tabs) :ot-body) "Root body\n"))
+    (should (equal (plist-get (nth 2 tabs) :ot-body) ""))
+    (should-error (gdocs--tabs-from-ops
+                   (append (gdocs-test--work-tab-ops)
+                           '(((ty . "ac") (d "t.extra" (1 "Extra") (5)))))))))
+
+(ert-deftest gdocs-test-tab-in-place-insert-keeps-unsupported-style ()
+  "Text typed inside a colored run inherits it and needs no style command."
+  (should (equal (plist-get (gdocs-test--work-plan "Plain red text" "Plain reddish text")
+                            :commands)
+                 '(((ty . "is") (ibi . 18) (s . "dish"))))))
+
+(ert-deftest gdocs-test-tab-in-place-text-after-link-drops-link ()
+  "Plain text typed after a link copies plain text's style and no link."
+  (let* ((commands (plist-get (gdocs-test--work-plan "_Docs_]] now" "_Docs_]]s now")
+                              :commands))
+         (text (nth 1 commands))
+         (link (nth 2 commands)))
+    (should (equal (car commands) '((ty . "is") (ibi . 55) (s . "s"))))
+    (should (equal (alist-get 'st text) "text"))
+    (should (eq (alist-get 'ts_un (alist-get 'sm text)) :json-false))
+    (should (equal link '((ty . "as") (st . "link") (si . 55) (ei . 55)
+                          (sm (lnks_link)))))))
+
+(ert-deftest gdocs-test-tab-in-place-list-item-and-restyle ()
+  "List item text and emphasis change in place, without list commands."
+  (should (equal (plist-get (gdocs-test--work-plan "- Item one" "- Item one done")
+                            :commands)
+                 '(((ty . "is") (ibi . 37) (s . " done")))))
+  (should (equal (plist-get (gdocs-test--work-plan "- Item two" "- *Item* two")
+                            :commands)
+                 '(((ty . "as") (st . "text") (si . 38) (ei . 41)
+                    (sm (ts_bd . t) (ts_bd_i . :json-false)))))))
+
+(ert-deftest gdocs-test-tab-in-place-refuses-losing-a-comment ()
+  "Replacing all the text a comment is anchored to is refused."
+  (should-error (gdocs-test--work-plan "- Item two" "- Zzz")
+                :type 'user-error)
+  (should (gdocs-test--work-plan "- Item two" "- Item")))
+
+(ert-deftest gdocs-test-tab-adds-and-removes-whole-paragraphs ()
+  "Paragraphs are added at the start of the next one and removed whole."
+  (let ((added (plist-get (gdocs-test--work-plan "Plain red text here"
+                                                 "New line\nPlain red text here")
+                          :commands)))
+    (should (equal (car added) '((ty . "is") (ibi . 9) (s . "New line\n"))))
+    (should (cl-every (lambda (command) (equal (alist-get 'st command) "text"))
+                      (cdr added))))
+  (should (equal (plist-get (gdocs-test--work-plan "\nTail" "") :commands)
+                 '(((ty . "ds") (si . 60) (ei . 64)))))
+  (should-error (gdocs-test--work-plan "- Item two" "- Item two\n- Item three")
+                :type 'user-error))
+
+(ert-deftest gdocs-test-tab-prediction-detects-unexpected-content ()
+  "A fresh state matches the prediction only when it decodes as planned."
+  (let* ((state (gdocs-test--work-state))
+         (scoped (gdocs--state-for-tab state "t.work"))
+         (raw (gdocs-dm-paragraphs
+               (gdocs--tab-model
+                (gdocs-dm-from-ops 7 "d" nil (plist-get scoped :ot-body)
+                                   (plist-get scoped :ot-ops)))))
+         (table (gdocs--tab-paragraph-table raw (plist-get scoped :ot-body)))
+         (prediction (gdocs--surgical-prediction raw table nil))
+         (changed (copy-tree state)))
+    (should (gdocs--tab-prediction-matches-p prediction state "t.work" "d"))
+    (setf (plist-get (car (plist-get changed :tabs)) :ot-body)
+          (string-replace "Tail" "Tall" gdocs-test--work-body))
+    (should-not (gdocs--tab-prediction-matches-p prediction changed "t.work" "d"))))
+
+(ert-deftest gdocs-test-org-equivalence-compares-chip-identity ()
+  "A changed chip label is a change even though its OT placeholder is not."
+  (should-not (gdocs--org-bodies-equivalent-p
+               "Lead: [[gdocs-chip:person:kix.a][Jane Doe]]\n"
+               "Lead: [[gdocs-chip:person:kix.a][Jane]]\n")))
+
+(ert-deftest gdocs-test-inherited-style-flag-means-unset ()
+  "A style key whose `_i' flag is t is inherited, so its value is not shown."
+  (should (equal (gdocs--styles-from-text-sm '((ts_bd . t) (ts_bd_i . t)))
+                 '(:bold nil)))
+  (should-not (plist-get (gdocs--styles-from-text-sm
+                          '((ts_ff . "Roboto Mono") (ts_ff_i . t)))
+                         :code)))
+
+(ert-deftest gdocs-test-emphasis-after-link-parses-back ()
+  "Emphasis right after a link's closing brackets is not emitted literally."
+  (let* ((runs (list (gdocs-dm-make-run "AA")
+                     (gdocs-dm-make-run "The " '(:italic))
+                     (gdocs-dm-make-run "Docs" '(:italic) "https://docs.example")
+                     (gdocs-dm-make-run "”" '(:italic))))
+         (org (gdocs--render-runs runs)))
+    (should-not (string-match-p "/”/" org))
+    (should (equal (gdocs-dm-runs-text
+                    (plist-get (car (gdocs-dm-paragraphs (gdocs-dm-from-org org)))
+                               :runs))
+                   "AAThe Docs”"))))
+
+(ert-deftest gdocs-test-bookmark-attachment-is-not-orphaned ()
+  "An attachment of a known non-object entity is not a missing definition."
+  (let* ((body "Text\n")
+         (ops (list (gdocs-test--insert-op body)
+                    '((ty . "ae") (et . "bookmark") (id . "id.mark"))
+                    '((ty . "te") (id . "id.mark") (spi . 2))))
+         (reports (plist-get (gdocs--decode-inline-objects ops body) :unsupported)))
+    (should-not (seq-some (lambda (report)
+                            (string-match-p "no matching definition"
+                                            (plist-get report :explanation)))
+                          reports))))
+
+(ert-deftest gdocs-test-ot-plain-view-keeps-non-ascii ()
+  "The plain view of an OT body holds characters outside ASCII."
+  (should (equal (gdocs--ot-plain-and-map (concat "é" (string gdocs--ot-table-open) "x"))
+                 (cons "éx" [1 3]))))
 
 (defun gdocs-test--insert-op (body)
   "Construct an OT insert operation for BODY."

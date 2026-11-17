@@ -314,9 +314,20 @@ performs an initial pull. `gdocs-mode` auto-enables in any Org buffer that
 carries a `GDOC_ID` property, and the mode line shows an indicator while it is
 active.
 
-For a document with multiple tabs, pull puts every tab in the same Org buffer. Each tab is a heading with a `GDOC_TAB` property; nested tabs become nested headings, and headings within a tab are shifted below its heading. The document name appears once as the file's `#+title:`. A tab emoji appears both in its heading and in `GDOC_TAB_ICON`. Opening a URL with `?tab=…` moves to that tab after pull. Single-tab documents keep their existing unwrapped layout.
+For a document with multiple tabs, pull puts every tab in the same Org buffer. Each tab is a heading with a `GDOC_TAB` property; nested tabs become nested headings, and headings within a tab are shifted below its heading. The document name appears once as the file's `#+title:`. A tab emoji appears both in its heading and in `GDOC_TAB_ICON`. The document's original tab may have an icon and may sit anywhere in the tab order. An empty tab pulls as an empty heading. Opening a URL with `?tab=…` moves to that tab after pull. Single-tab documents keep their existing unwrapped layout.
 
-Pushing a multi-tab document is supported for a deliberately narrow case: the buffer differs from the remote in **one tab**, that tab contains only plain, unstyled paragraphs, and the change is a single insertion or deletion. The save is scoped to that tab (each command is wrapped in the editor's tab namespace and `tab=` names it). After every response the document is refetched and accepted only when exactly one revision was added, the edited tab has the expected text, and every other tab's operations are unchanged. A throttled save that left the document untouched is replanned from the fresh state and retried (up to five attempts); any other outcome fails closed and asks you to pull. Edits touching several tabs, tabs with lists, tables, headings, chips or formatting, tab renames/moves, and content outside the tab headings are refused before any `/save`. `gdocs-publish-file` still refuses multi-tab documents.
+Push to a multi-tab document saves one changed tab per push. Changes inside existing paragraphs, including headings and list items, are written in place: only the changed characters are deleted, inserted or restyled. Colors, fonts, comments, bookmarks, chips, and paragraph and list formatting stay on the text they belong to. Google gives inserted text the style of the character before it, so new text that should look different copies the full style of the nearest text with the same link and code formatting. A plain, heading or code paragraph can also be added or removed whole. A new paragraph is inserted at the start of the paragraph after it, which keeps that paragraph's formatting.
+
+The push refuses these changes before any `/save`:
+
+- edits in more than one tab
+- adding or removing list items, tables, images or chips
+- changing or deleting a chip or image
+- deleting all of the text a comment is anchored to
+- adding a paragraph after the tab's last paragraph
+- renaming, moving, adding or deleting tabs, or content outside the tab headings
+
+After each save the document is fetched again. The push is accepted only when exactly one revision was added and the other tabs are unchanged. The edited tab must also decode to the predicted text and Org-visible styles, and keep every entity and comment anchor. A save that commits but does not read back as planned is reported, and you should pull. A throttled save that left the document untouched is planned again from the fresh state and retried, up to five attempts. `gdocs-publish-file` still refuses multi-tab documents.
 
 ### Source-file publication (one-way Org → Google Docs)
 
