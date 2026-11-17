@@ -321,7 +321,7 @@ Push to a multi-tab document saves one changed tab per push. Changes inside exis
 Paragraphs of any kind can be added or removed whole, at any place in the tab, including after its last paragraph:
 
 - A new paragraph is inserted at the start of the paragraph after it, which keeps that paragraph's formatting. It gets the default paragraph style, and a heading gets its level.
-- A new list item joins the Google list that its Org list continues, with the indentation of that list's items. An Org list that continues no Google list becomes a new Google list.
+- Org merges adjacent Google lists into one list, so a list item's Org level follows its indent: a list that Google indents like the second level of the list before it shows as nested under that list's item. A new list item copies the Google list, level and indent of the nearest item at its Org level, so it lines up with the items around it. An Org list that continues no Google list becomes a new Google list.
 - A table whose rows or columns change is replaced whole. Cell text edits stay in place.
 - Removing the last paragraphs of a tab leaves no empty paragraph at its end.
 - A heading that a link in the document points to shows its Google heading id in a drawer, `:GDOC_HEADING: h.example`. A new heading with that drawer gets the id, so links to a heading that was deleted and written again keep working. Adding the drawer to an existing heading gives it the id. An id that another heading of the tab has is refused.

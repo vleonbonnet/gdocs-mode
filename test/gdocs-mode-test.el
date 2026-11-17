@@ -1298,6 +1298,44 @@ A link also points to an id that no heading has yet."
     (should (eq (alist-get 'ps_il_i sm) t))
     (should-not (assq 'ps_hd_i sm))))
 
+(defun gdocs-test--indented-list-state ()
+  "Return a state where a second list starts at the first list's second level."
+  (let ((body "Notes\nFixing\nDetail\n"))
+    (gdocs-test--one-tab-state
+     body
+     (list (gdocs-test--list-definition-op '(:id "kix.a" :glyph :bullet))
+           (gdocs-test--list-definition-op '(:id "kix.b" :glyph :bullet))
+           '((ty . "as") (st . "list") (si . 6) (ei . 6) (sm (ls_id . "kix.a")))
+           '((ty . "as") (st . "list") (si . 13) (ei . 13) (sm (ls_id . "kix.b")))
+           '((ty . "as") (st . "paragraph") (si . 13) (ei . 13)
+             (sm (ps_il . 72.0) (ps_il_i . :json-false)))
+           '((ty . "as") (st . "list") (si . 20) (ei . 20) (sm (ls_id . "kix.b") (ls_nest . 1)))
+           '((ty . "as") (st . "paragraph") (si . 20) (ei . 20)
+             (sm (ps_il . 108.0) (ps_il_i . :json-false)))))))
+
+(ert-deftest gdocs-test-list-levels-follow-indentation ()
+  "A list indented like the second level of the list before it nests under it."
+  (let ((body (car (gdocs--render-tab-tree
+                    (plist-get (gdocs-test--indented-list-state) :tabs) 7 "d"))))
+    (should (string-search "- Notes\n  - Fixing\n    - Detail\n" body))
+    (should (equal (gdocs--visual-list-levels
+                    '((:kind :list :nest 0 :indent 36.0) (:kind :list :nest 0 :indent 36.0)
+                      (:kind :para) (:kind :list :nest 1 :indent 72.0)))
+                   '((:kind :list :nest 0 :indent 36.0 :list-nest 0)
+                     (:kind :list :nest 0 :indent 36.0 :list-nest 0)
+                     (:kind :para)
+                     (:kind :list :nest 0 :indent 72.0 :list-nest 1))))))
+
+(ert-deftest gdocs-test-new-item-copies-its-visual-level ()
+  "A new item copies the Google list and level of the item at its Org level."
+  (let* ((plan (gdocs-test--state-plan (gdocs-test--indented-list-state)
+                                       "  - Fixing\n" "  - Fixing\n  - Second\n"))
+         (binding (car (gdocs-test--commands-of plan "as" "list"))))
+    (should (equal (alist-get 'ls_id (alist-get 'sm binding)) "kix.b"))
+    (should (equal (alist-get 'ls_nest (alist-get 'sm binding)) 0))
+    (should (equal (alist-get 'ps_il (alist-get 'sm (car (gdocs-test--commands-of plan "as" "paragraph"))))
+                   72.0))))
+
 (defun gdocs-test--table-state ()
   "Return a state whose tab holds a one-row table and no final newline."
   (let ((table (gdocs--emit-table-body-and-ops
@@ -5712,13 +5750,16 @@ that a removed preflight guard would be observed as an unexpected success."
                      :key (lambda (item) (plist-get item :feature-type))
                      :test #'equal)))
       (should report)
+      ;; Org shows the jump one level deep, as it looks; Google's level stays.
       (should (equal (mapcar (lambda (paragraph)
-                               (plist-get paragraph :nest))
+                               (list (plist-get paragraph :list-nest)
+                                     (plist-get paragraph :nest)))
                              (seq-filter
                               (lambda (paragraph)
                                 (eq (plist-get paragraph :kind) :list))
                               (gdocs-dm-paragraphs doc)))
-                     nests))
+                     (cl-loop for nest in nests for level from 0
+                              collect (list nest level))))
       (should (plist-get report :render-directive))
       (should (string-match-p "^#\\+gdocs_unsupported_list_nesting: "
                               (gdocs-dm-to-org doc)))

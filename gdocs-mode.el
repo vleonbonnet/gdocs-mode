@@ -2252,8 +2252,11 @@ the decoder merely because they are decoded."
                (al  (alist-get 'ps_al sm)))
           (when (integerp hd) (setq cur (plist-put cur :heading hd)))
           (when (stringp hdid) (setq cur (plist-put cur :anchor hdid)))
-          (when (numberp il)  (setq cur (plist-put cur :indent-left il)))
-          (when (numberp ifl) (setq cur (plist-put cur :indent-first ifl)))
+          ;; A value whose `_i' flag is t is inherited: Google ignores it.
+          (cond ((eq (alist-get 'ps_il_i sm) t) (setq cur (plist-put cur :indent-left nil)))
+                ((numberp il) (setq cur (plist-put cur :indent-left il))))
+          (cond ((eq (alist-get 'ps_ifl_i sm) t) (setq cur (plist-put cur :indent-first nil)))
+                ((numberp ifl) (setq cur (plist-put cur :indent-first ifl))))
           (when (integerp al) (setq cur (plist-put cur :align al)))
           (if cell (setcdr cell cur) (push (cons si cur) out)))))
     out))
@@ -3953,7 +3956,14 @@ or heading, stays inline in its paragraph."
     (when (eq kind :list)
       (setq out (plist-put out :list-id list-id))
       (setq out (plist-put out :nest nest))
-      (setq out (plist-put out :glyph glyph)))
+      (setq out (plist-put out :glyph glyph))
+      (when (natnump nest)
+        (setq out (plist-put out :indent
+                             (or (and pa (plist-get pa :indent-left))
+                                 (plist-get (alist-get nest (alist-get list-id list-defs
+                                                                       nil nil #'equal))
+                                            :indent-left)
+                                 (* 36.0 (1+ nest)))))))
     (when (and (eq kind :para) (gdocs--paragraph-is-code-block runs))
       (setq out (plist-put out :kind :code)))
     (when ta
@@ -4047,6 +4057,34 @@ heading-adjacent blanks after the common normalization pass."
       (setq rest (cdr rest)))
     (nreverse out)))
 
+(defun gdocs--visual-list-levels (paragraphs)
+  "Return PARAGRAPHS with list levels that follow how the lists look.
+Org merges adjacent lists into one, so an item's Org level comes from
+its left indent among the list items around it, not from its level in
+its own Google list: a list whose first level Google indents like the
+second level of the list before it is nested under that list's item.
+Each item keeps its Google level as `:list-nest'.  A level is at most
+one deeper than the item before it, as in an Org list."
+  (let ((stack nil))
+    (mapcar
+     (lambda (paragraph)
+       (if (not (and (eq (plist-get paragraph :kind) :list)
+                     (numberp (plist-get paragraph :indent))))
+           (progn (setq stack nil) paragraph)
+         (let ((indent (plist-get paragraph :indent))
+               level)
+           (while (and stack (> (caar stack) (+ indent 0.5)))
+             (pop stack))
+           (setq level (cond ((null stack) 0)
+                             ((< (abs (- (caar stack) indent)) 0.5) (cdar stack))
+                             (t (1+ (cdar stack)))))
+           (unless (and stack (< (abs (- (caar stack) indent)) 0.5))
+             (push (cons indent level) stack))
+           (let ((copy (copy-sequence paragraph)))
+             (setq copy (plist-put copy :list-nest (plist-get paragraph :nest)))
+             (plist-put copy :nest level)))))
+     paragraphs)))
+
 (defun gdocs-dm-from-ops (revision doc-id title body ops)
   "Decode BODY (the OT body string) + OPS into a doc-model.
 REVISION, DOC-ID and TITLE are stored as metadata."
@@ -4093,7 +4131,7 @@ REVISION, DOC-ID and TITLE are stored as metadata."
             (push (gdocs--build-para pa lb nil runs list-defs) paragraphs)
             (setq i (1+ nl)))))))
     (gdocs-dm-make-doc :revision revision :doc-id doc-id :title title
-                       :paragraphs (nreverse paragraphs)
+                       :paragraphs (gdocs--visual-list-levels (nreverse paragraphs))
                        :ot-length body-len
                        :lists list-defs
                        :inline-objects (plist-get inline-analysis :objects)
@@ -8508,14 +8546,17 @@ An id another heading of the tab already has is refused."
 (defun gdocs--tab-list-map (decoded new prefix suffix pairs-in-mid)
   "Return a hash table from local Org list ids to remote list ids.
 DECODED and NEW are aligned at their PREFIX and SUFFIX paragraphs and at
-PAIRS-IN-MID, pairs of absolute indices.  A local list that continues a
-remote list keeps the remote list's id."
+PAIRS-IN-MID, pairs of absolute indices.  A local list that continues
+remote lists maps to all of their ids: Org merges adjacent Google lists
+into one, see `gdocs--visual-list-levels'."
   (let ((map (make-hash-table :test #'equal)))
     (cl-flet ((link (old fresh)
                 (when (and (eq (plist-get old :kind) :list)
                            (eq (plist-get fresh :kind) :list)
                            (plist-get fresh :list-id))
-                  (puthash (plist-get fresh :list-id) (plist-get old :list-id) map))))
+                  (cl-pushnew (plist-get old :list-id)
+                              (gethash (plist-get fresh :list-id) map)
+                              :test #'equal))))
       (dotimes (k prefix) (link (nth k decoded) (nth k new)))
       (dotimes (k suffix)
         (link (nth (- (length decoded) k 1) decoded) (nth (- (length new) k 1) new)))
@@ -8555,38 +8596,47 @@ POSITION may be the tab's final newline, one past its text."
 
 (defun gdocs--added-list-binding (context paragraph index newline)
   "Return the list commands for list item PARAGRAPH added near INDEX.
-NEWLINE is the item's newline position.  The item joins the remote list
-its Org list continues, see `gdocs--tab-list-map', copying an item of
-that list at its level; otherwise it starts a new list, defined once."
+NEWLINE is the item's newline position.  The item joins a remote list
+its Org list continues, see `gdocs--tab-list-map': it copies the nearest
+item of those lists at its Org level, with that item's Google list and
+Google level.  Without one, it takes the level that keeps the list's
+offset between Org and Google levels.  An item with no such item to
+copy, as when its Org list continues no remote list, starts a new list,
+defined once."
   (let* ((org-id (plist-get paragraph :list-id))
          (nest (or (plist-get paragraph :nest) 0))
-         (remote (gethash org-id (plist-get context :list-map)))
+         (remotes (gethash org-id (plist-get context :list-map)))
          (raw (plist-get context :raw))
          (table (plist-get context :table))
-         (item (lambda (id level)
+         (item (lambda (level)
                  (gdocs--class-newline
                   table index (list :list level (plist-get paragraph :glyph))
                   (lambda (_entry other)
-                    (equal (plist-get (nth other raw) :list-id) id)))))
+                    (member (plist-get (nth other raw) :list-id) remotes)))))
+         (same (and remotes (funcall item nest)))
+         (any-level (and remotes (not same)
+                         (cl-loop for level from 0 to 8
+                                  when (funcall item level) return level)))
+         (any (or same (and any-level (funcall item any-level))))
          (commands nil))
-    (if remote
-        (let* ((same (funcall item remote nest))
-               (any (or same
-                        (cl-loop for level from 0 to 8
-                                 thereis (funcall item remote level))))
-               (list-sm (copy-alist (gdocs--style-at context :list any)))
+    (if any
+        (let* ((list-sm (copy-alist (gdocs--style-at context :list any)))
+               (remote (alist-get 'ls_id list-sm))
+               (google-nest
+                (if same
+                    (or (alist-get 'ls_nest list-sm) 0)
+                  (max 0 (+ nest (- (or (alist-get 'ls_nest list-sm) 0) (or any-level 0))))))
                (paragraph-sm
                 (if same
                     (gdocs--style-at context :paragraph same)
                   (let* ((definition (gethash remote (plist-get (plist-get context :entities) :by-id)))
-                         (level (alist-get (intern (format "nl_%d" nest))
+                         (level (alist-get (intern (format "nl_%d" google-nest))
                                            (alist-get 'le_nb (alist-get 'epm definition)))))
-                    `((ps_il . ,(or (alist-get 'b_il level) (+ 36.0 (* 36 nest))))
+                    `((ps_il . ,(or (alist-get 'b_il level) (+ 36.0 (* 36 google-nest))))
                       (ps_il_i . :json-false)
-                      (ps_ifl . ,(or (alist-get 'b_ifl level) (+ 18.0 (* 36 nest))))
+                      (ps_ifl . ,(or (alist-get 'b_ifl level) (+ 18.0 (* 36 google-nest))))
                       (ps_ifl_i . :json-false))))))
-          (setf (alist-get 'ls_id list-sm) remote
-                (alist-get 'ls_nest list-sm) nest)
+          (setf (alist-get 'ls_nest list-sm) google-nest)
           (push `((ty . "as") (st . "list") (si . ,newline) (ei . ,newline) (sm . ,list-sm))
                 commands)
           (push (cons :paragraph paragraph-sm) commands))
