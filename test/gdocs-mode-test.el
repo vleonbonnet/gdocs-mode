@@ -615,6 +615,21 @@
     (should-error (gdocs--push-preflight state "" '(:kind :noop))
                   :type 'user-error)))
 
+(ert-deftest gdocs-test-empty-tab-may-define-entities ()
+  "An empty tab may define an unused entity; a tab of only entities is not empty."
+  (should (gdocs--tab-ops-decodable-p
+           '(((ty . "as") (st . "document") (si . 0) (ei . 0) (sm))
+             ((ty . "ae") (et . "list") (id . "kix.l") (epm))
+             ((ty . "as") (st . "text") (si . 0) (ei . 1) (sm)))))
+  (should-not (gdocs--tab-ops-decodable-p '(((ty . "ae") (et . "list") (id . "kix.l") (epm))))))
+
+(ert-deftest gdocs-test-edit-state-title-decodes-html ()
+  "The document title is read as HTML text."
+  (should (equal (plist-get (gdocs--parse-edit-state-html
+                             "<title>[P &amp; C] &quot;Plan&quot; &#8211; v2 - Google Docs</title>")
+                            :title)
+                 "[P & C] \"Plan\" \u2013 v2")))
+
 (ert-deftest gdocs-test-tabs-pull-hash-matches-buffer ()
   "A tabbed pull establishes a clean document-wide baseline."
   (let* ((html (gdocs-test--tab-html))

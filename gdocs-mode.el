@@ -46,6 +46,7 @@
 ;;; Code:
 
 (require 'org)
+(require 'xml)
 (require 'org-element)
 (require 'json)
 (require 'request)
@@ -1015,17 +1016,20 @@ commands when they are wrapped in a `ksm' namespace."
 (defun gdocs--tab-ops-decodable-p (ops)
   "Return non-nil when OPS hold a whole tab body.
 A tab with text has an `is' operation.  An empty tab has none: only
-`as' operations on its final newline at position 1, or zero-width
-document settings.  Anything else may be a body that was not sent, so
-it is not mistaken for an empty tab."
+`as' operations on its final newline at position 1, zero-width document
+settings, or entity definitions, which have no position, such as an
+unused list.  Anything else may be a body that was not sent, so it is not
+mistaken for an empty tab."
   (or (seq-some (lambda (op) (equal (alist-get 'ty op) "is")) ops)
       (and ops
            (seq-every-p (lambda (op)
-                          (and (equal (alist-get 'ty op) "as")
-                               (natnump (alist-get 'si op))
-                               (natnump (alist-get 'ei op))
-                               (<= (alist-get 'ei op) 1)))
-                        ops))))
+                          (or (equal (alist-get 'ty op) "ae")
+                              (and (equal (alist-get 'ty op) "as")
+                                   (natnump (alist-get 'si op))
+                                   (natnump (alist-get 'ei op))
+                                   (<= (alist-get 'ei op) 1))))
+                        ops)
+           (seq-some (lambda (op) (equal (alist-get 'ty op) "as")) ops))))
 
 (defun gdocs--tabs-from-ops (ops)
   "Split OPS into ordered tab plists, or signal on unknown tab structure.
@@ -9055,7 +9059,8 @@ Unrecognized tab structures signal rather than returning a partial body."
     (let ((title nil) (token nil) (ouid nil) (revision nil)
           (smv nil) (smb-seg nil) (ot-body nil) (build-label nil))
       (when (string-match "<title[^>]*>\\([^<]*\\)</title>" html)
-        (let ((raw (string-trim (match-string 1 html))))
+        ;; The title is HTML text: `&' arrives as `&amp;'.
+        (let ((raw (string-trim (xml-substitute-special (match-string 1 html)))))
           (setq title
                 (cond
                  ((string-empty-p raw) nil)
