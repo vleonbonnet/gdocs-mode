@@ -679,6 +679,28 @@
     (should (string-match-p "nm" (url-unhex-string (cadr request))))
     (should (string-match-p "t.child" (url-unhex-string (cadr request))))))
 
+(ert-deftest gdocs-test-tab-save-leaves-original-tab-unwrapped ()
+  "Commands for the original tab carry no tab namespace."
+  (let* ((state (gdocs--state-for-tab
+                 (gdocs--parse-edit-state-html (gdocs-test--tab-html))
+                 "t.0"))
+         (gdocs-auth-function (lambda () '(("Cookie" . "synthetic"))))
+         (gdocs--session-sid "synthetic-sid")
+         (gdocs--session-req-id 1)
+         request)
+    (cl-letf (((symbol-function 'gdocs--session-next-reqid) (lambda () 2))
+              ((symbol-function 'gdocs--curl-async)
+               (lambda (url _method _headers form callback)
+                 (setq request (list url form))
+                 (funcall callback
+                          ")]}'\n{\"revisionRanges\":[[8,8]],\"metadata\":{\"serverRevision\":8}}"
+                          200 nil))))
+      (gdocs--save-request-async
+       "synthetic" state '(((ty . "is") (ibi . 2) (s . "x")))
+       (lambda (_response err) (should-not err))))
+    (should (string-match-p "[?&]tab=t.0\\(?:&\\|\\'\\)" (car request)))
+    (should-not (string-match-p "ksm" (url-unhex-string (cadr request))))))
+
 (defun gdocs-test--tab-state-with-child (revision child-body)
   "Return a parsed tab state at REVISION whose child tab holds CHILD-BODY."
   (let ((state (gdocs--parse-edit-state-html (gdocs-test--tab-html))))
@@ -1041,6 +1063,22 @@ commented item and a link; `t.kid', a child of the original tab, is empty."
     (should (= (alist-get 'tv_s (alist-get 'tv (alist-get 'dfie_ts date)))
                (+ 1794850440.0 (* 2 86400))))
     (should (equal (alist-get 'dfie_dt date) "Nov 18, 2026 5:34 PM"))))
+
+(ert-deftest gdocs-test-tab-in-place-keeps-unknown-styles-it-does-not-touch ()
+  "An unknown style blocks only the in-place edits that touch it."
+  (let ((state (gdocs-test--one-tab-state
+                "Alpha one\nBeta two\n"
+                '(((ty . "as") (st . "field") (si . 1) (ei . 5) (sm (fd_x . 1)))
+                  ((ty . "ae") (et . "dropdown-definition") (id . "kix.dd")
+                   (epm (ddd_n . "Status")))))))
+    (let ((commands (plist-get (gdocs-test--state-plan state "Beta two" "Beta three")
+                               :commands)))
+      (should commands)
+      (should (cl-every (lambda (command)
+                          (> (or (alist-get 'si command) (alist-get 'ibi command)) 10))
+                        commands)))
+    (should-error (gdocs-test--state-plan state "Alpha one" "Alpah one")
+                  :type 'user-error)))
 
 (defun gdocs-test--table-state ()
   "Return a state whose tab holds a one-row table and no final newline."

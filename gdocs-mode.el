@@ -1002,6 +1002,12 @@ before it left it."
              converted))
          commands)))))
 
+(defun gdocs--tab-namespaced-p (tab-id)
+  "Return non-nil when commands for TAB-ID go in the tab's namespace.
+The document's original tab, `t.0', has none: Google rejects its
+commands when they are wrapped in a `ksm' namespace."
+  (and tab-id (not (equal tab-id "t.0"))))
+
 (defun gdocs--root-tab (tabs)
   "Return the document's original tab, `t.0', among TABS."
   (seq-find (lambda (tab) (equal (plist-get tab :id) "t.0")) tabs))
@@ -8028,6 +8034,16 @@ kept and only the day changes."
                 (dfie_p (tres_tv . "MMM d, y") (fres_usd . "") (fres_frt . 0))
                 (dfie_tpt . 0))))))
 
+(defun gdocs--empty-op-values (tree)
+  "Return TREE with each empty `opValue' as an empty vector.
+Decoding turns Google's empty JSON arrays into nil, which would encode
+back as null; Google rejects a null `opValue'."
+  (cond ((and (consp tree) (eq (car tree) 'opValue) (null (cdr tree)))
+         (cons 'opValue []))
+        ((consp tree)
+         (cons (gdocs--empty-op-values (car tree)) (gdocs--empty-op-values (cdr tree))))
+        (t tree)))
+
 (defun gdocs--entity-creation (identity entities)
   "Return (IDENTITY . AE) for a new entity that recreates object IDENTITY.
 IDENTITY is a stable object identity from `gdocs--inline-object-identity';
@@ -8067,7 +8083,7 @@ image must reuse an image already uploaded to the document."
                                     (plist-get entities :images))))
                (unless source
                  (user-error "gdocs: Push refused: a new image must reuse one already in the document; uploading images is not supported"))
-               (let ((copy (copy-tree (alist-get 'epm source))))
+               (let ((copy (gdocs--empty-op-values (copy-tree (alist-get 'epm source)))))
                  (setf (alist-get 'i_wth (alist-get 'ee_eo copy))
                        (float (plist-get identity :width)))
                  (setf (alist-get 'i_ht (alist-get 'ee_eo copy))
@@ -9923,20 +9939,28 @@ stale buffer-local capability metadata cannot bypass policy."
         (let* ((ranges (plist-get plan :ranges))
                ;; An in-place plan never rewrites styles or paragraph and
                ;; list attributes, so they are kept even where the scanner
-               ;; cannot place them.
+               ;; cannot place them.  It never touches an entity that is not
+               ;; attached to the text either.
                (blocking (if (plist-get plan :surgical)
                              (cl-remove-if
                               (lambda (report)
-                                (memq (plist-get report :kind)
-                                      '(:unsupported-style :unsupported-paragraph
-                                        :unsupported-entity :document-settings
-                                        :annotation-state)))
+                                (or (memq (plist-get report :kind)
+                                          '(:unsupported-style :unsupported-paragraph
+                                            :unsupported-entity :document-settings
+                                            :annotation-state))
+                                    (and (eq (plist-get report :kind) :unknown-entity)
+                                         (not (gdocs--capability-report-range report)))))
                               blocking)
                            blocking))
                (hard (cl-remove-if-not
                       (lambda (report)
-                        (or (plist-get report :refuse-push)
-                            (not (plist-get report :preserve-untouched))))
+                        (and (or (plist-get report :refuse-push)
+                                 (not (plist-get report :preserve-untouched)))
+                             ;; An unknown style stays on its characters
+                             ;; unless an in-place edit touches them.
+                             (not (and (plist-get plan :surgical)
+                                       (eq (plist-get report :kind) :unknown-feature)
+                                       (gdocs--capability-report-range report)))))
                       blocking))
                (unranged (cl-remove-if
                           #'gdocs--capability-report-range blocking))
@@ -10364,7 +10388,7 @@ of OT ops (alists). Returns parsed JSON response (XSSI-stripped)."
                       doc-id qs))
          (commands (gdocs--commands-to-utf16
                     commands (or (plist-get state :ot-body) "")))
-         (commands (if (plist-get state :tab-id)
+         (commands (if (gdocs--tab-namespaced-p (plist-get state :tab-id))
                        (mapcar (lambda (op)
                                  `((ty . "nm")
                                    (nmr . ["ksm" ,(plist-get state :tab-id)])
@@ -10834,7 +10858,7 @@ On curl error, ERR is a string."
                       doc-id qs))
          (commands (gdocs--commands-to-utf16
                     commands (or (plist-get state :ot-body) "")))
-         (commands (if (plist-get state :tab-id)
+         (commands (if (gdocs--tab-namespaced-p (plist-get state :tab-id))
                        (mapcar (lambda (op)
                                  `((ty . "nm")
                                    (nmr . ["ksm" ,(plist-get state :tab-id)])
