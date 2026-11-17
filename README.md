@@ -20,11 +20,11 @@ Remote images are represented by explicit remote-object placeholders: standalone
 images use `#+gdocs_inline_object:` and images embedded in prose use  
 `@@gdocs-inline-object:image ENTITY WIDTHxHEIGHT content-id=CONTENT@@`; the  
 image bytes are not downloaded.  
-Date and person smart chips are decoded the same way and rendered as Org chip  
+Date, person and file smart chips are decoded the same way and rendered as Org chip  
 links whose hidden target carries the remote identity, for example  
-`[[gdocs-chip:date ENTITY][2026-09-24 Thu]]`; the description shows the  
-payload (an Org-style date or the contact name) with the `org-date` face on  
-date chips. The semantic value behind the link is what push matching compares, so  
+`[[gdocs-chip:date:ENTITY][2026-09-24 Thu]]`; the description shows the  
+payload (an Org-style date, the contact name or the file's title) with the `org-date` face on  
+date chips. A file chip's target also holds the file's URL, and opening the link opens the file. The semantic value behind the link is what push matching compares, so  
 a reformatted description that parses to the same calendar date still matches. Rendered  
 tables pad their cells so every row shares the same display widths, and emphasis markers  
 are placed so Org actually parses the result (boundary whitespace moves  
@@ -157,11 +157,12 @@ as an explicit remote placeholder such as:
 
 The placeholder is metadata, not prose and not an Org image link. Its entity ID, object kind, content ID, and dimensions form its stable identity. Do not edit, remove, move, or recreate it and then push: a full-replacement push is refused rather than silently deleting the remote image. A safe incremental edit may proceed only when the remote image is matched to its unchanged local placeholder and the edit range is proven not to touch it. In a single-tab document, image creation, deletion, movement, duplication, metadata changes, and ambiguous entity-to-placeholder associations remain refused. A push to a multi-tab document can delete and copy images, see [Usage](#usage).
 
-Date and person smart chips follow the same policy with `date`/`person` object  
+Date, person and file smart chips follow the same policy with `date`/`person`/`file` object  
 kinds. They render as Org chip links such as  
-`[[gdocs-chip:date:kix.example][2026-09-24 Thu]]` and  
-`[[gdocs-chip:person:kix.example][Jane Doe]]`; Org hides the target and shows  
-only the description. The chip's semantic value (calendar date or contact name)  
+`[[gdocs-chip:date:kix.example][2026-09-24 Thu]]`,  
+`[[gdocs-chip:person:kix.example][Jane Doe]]` and  
+`[[gdocs-chip:file:kix.example:https://docs.google.com/document/d/ID/edit][Plan]]`; Org hides the target and shows  
+only the description. The chip's semantic value (calendar date, contact name, or file URL and title)  
 is the editable-identity field: an unchanged chip is preserved by incremental  
 edits that do not touch it. In a single-tab document, creating, deleting,  
 moving, or editing a chip is refused before any `/save`. A push to a multi-tab  
@@ -326,6 +327,7 @@ Chips and images can be added, changed and deleted:
 
 - A date chip is written `[[gdocs-chip:date:new][2026-11-20 Fri]]`. Changing the date of a chip that shows a time keeps that time.
 - A person chip needs an email. Write `[[gdocs-chip:person:jane@example.com][Jane Doe]]`, or use the name of a person chip already in the document.
+- A file chip is written `[[gdocs-chip:file:URL][Title]]`. Its file type comes from a chip of the same file in the document, or from the URL for Google Docs, Sheets and Slides. Changing a file chip's title or URL replaces the chip.
 - A new image must reuse an image already in the document: copy its `#+gdocs_inline_object:` line. Uploading an image is not supported.
 - A deleted chip or image is deleted from the document, not only from the text.
 

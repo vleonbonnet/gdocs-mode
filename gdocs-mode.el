@@ -1609,7 +1609,8 @@ caller's `gdocs-auth-function' is used."
      ("list" . :recognized)
      ("inline" . :recognized-not-editable)
      ("date" . :recognized-not-editable)
-     ("person" . :recognized-not-editable))
+     ("person" . :recognized-not-editable)
+     ("first-party-link" . :recognized-not-editable))
     (:attribute
      ("text" . :recognized)
      ("link" . :recognized)
@@ -2358,10 +2359,11 @@ image `*' placeholder, and carry no visible text of their own.")
 (defconst gdocs--chip-link-prefix "gdocs-chip"
   "Org link protocol used to render date/person chips locally.
 
-The full syntax is `[[gdocs-chip:date ENTITY][DATE]]' and
-`[[gdocs-chip:person ENTITY][NAME]]'.  Org displays only the
+The full syntax is `[[gdocs-chip:date:ENTITY][DATE]]',
+`[[gdocs-chip:person:ENTITY][NAME]]' and
+`[[gdocs-chip:file:ENTITY:URL][TITLE]]'.  Org displays only the
 description (with `org-date' face for date chips), keeping the remote
-identity in the hidden link path.")
+identity in the hidden link path.  A new file chip may omit ENTITY.")
 
 (defun gdocs--valid-chip-label-p (label)
   "Return non-nil when LABEL can be embedded in a chip placeholder."
@@ -2398,14 +2400,46 @@ fallback for older payloads."
                          (nth 0 (plist-get object :ymd)))))
       (plist-get object :label)))
 
+(defconst gdocs--chip-entity-types
+  '(("date" . :chip-date) ("person" . :chip-person) ("first-party-link" . :chip-file))
+  "Google entity types decoded as chips, with their object kinds.
+A `first-party-link' entity is a file chip: a link to a Google Drive
+file shown with the file's title.")
+
+(defun gdocs--file-chip-object (op)
+  "Decode file chip definition OP, a `first-party-link' entity, or nil.
+The file's URL is the chip's `:chip-value' and the title it shows its
+`:label' and `:title'.  Both are part of its identity, so a push writes
+a changed title too.  Google may update the title when the file is
+renamed."
+  (let* ((epm (alist-get 'epm op))
+         (url (alist-get 'fple-u epm))
+         (title (alist-get 'fple-t epm)))
+    (when (and (stringp (alist-get 'id op))
+               (gdocs--valid-chip-label-p url)
+               (not (string-match-p "[[:space:]]" url)))
+      (list :kind :inline-object
+            :object-kind :chip-file
+            :entity-id (alist-get 'id op)
+            :label (if (gdocs--valid-chip-label-p title) title url)
+            :title (if (gdocs--valid-chip-label-p title) title url)
+            :ymd nil
+            :chip-value url))))
+
 (defun gdocs--chip-entity-object (op)
-  "Decode a date/person chip `ae' entity definition OP into an object plist.
+  "Decode a chip `ae' entity definition OP into an object plist.
 
 The chip's semantic payload becomes its stable `:chip-value' (the
-calendar date for date chips, the contact name for person chips), which
-is what push matching compares; `:label' retains Google's display text
-for the Org rendering.  A changed semantic value is reported as a
-changed object rather than silently rewritten."
+calendar date for date chips, the contact name for person chips, the
+URL for file chips), which is what push matching compares; `:label'
+retains Google's display text for the Org rendering.  A changed semantic
+value is reported as a changed object rather than silently rewritten."
+  (if (equal (alist-get 'et op) "first-party-link")
+      (gdocs--file-chip-object op)
+    (gdocs--date-person-chip-object op)))
+
+(defun gdocs--date-person-chip-object (op)
+  "Decode a date or person chip definition OP, see `gdocs--chip-entity-object'."
   (let* ((type (alist-get 'et op))
          (epm (alist-get 'epm op))
          (label (if (equal type "date")
@@ -2449,7 +2483,7 @@ parse returns nil so the marker fails closed."
                               (1+ (length gdocs--chip-link-prefix)))))))
       (when (and (stringp full)
                  (string-match
-                  "\\`\\(date\\|person\\):\\([^[:space:]]+\\)\\'" full))
+                  "\\`\\(date\\|person\\|file\\):\\([^[:space:]]+\\)\\'" full))
         (let* ((kind (match-string 1 full))
                (entity-id (match-string 2 full))
                (begin (org-element-property :contents-begin el))
@@ -2457,25 +2491,47 @@ parse returns nil so the marker fails closed."
                (desc (and begin end
                           (buffer-substring-no-properties begin end))))
           (when (gdocs--valid-chip-label-p desc)
-            (if (equal kind "date")
-                (let ((ymd (gdocs--chip-date-parse desc)))
-                  (and ymd
-                       (list :kind :inline-object
-                             :object-kind :chip-date
-                             :entity-id entity-id
-                             :label desc
-                             :ymd ymd
-                             :chip-value (format "%04d-%02d-%02d"
-                                                 (nth 0 ymd)
-                                                 (nth 1 ymd)
-                                                 (nth 2 ymd)))))
-              (and (gdocs--valid-inline-object-id-p entity-id)
-                   (list :kind :inline-object
-                         :object-kind :chip-person
-                         :entity-id entity-id
-                         :label desc
-                         :ymd nil
-                         :chip-value desc)))))))))
+            (pcase kind
+              ("date"
+               (let ((ymd (gdocs--chip-date-parse desc)))
+                 (and ymd
+                      (list :kind :inline-object
+                            :object-kind :chip-date
+                            :entity-id entity-id
+                            :label desc
+                            :ymd ymd
+                            :chip-value (format "%04d-%02d-%02d"
+                                                (nth 0 ymd)
+                                                (nth 1 ymd)
+                                                (nth 2 ymd))))))
+              ("file"
+               (let ((target (gdocs--file-chip-target entity-id)))
+                 (and target
+                      (list :kind :inline-object
+                            :object-kind :chip-file
+                            :entity-id (car target)
+                            :label (gdocs--unescape-org-inline desc t)
+                            :title (gdocs--unescape-org-inline desc t)
+                            :ymd nil
+                            :chip-value (cdr target)))))
+              (_
+               (and (gdocs--valid-inline-object-id-p entity-id)
+                    (list :kind :inline-object
+                          :object-kind :chip-person
+                          :entity-id entity-id
+                          :label desc
+                          :ymd nil
+                          :chip-value desc))))))))))
+
+(defun gdocs--file-chip-target (path)
+  "Return (ENTITY . URL) for the PATH of a file chip link, or nil.
+PATH is `ENTITY:URL', or a bare URL for a new chip, whose entity is then
+the URL itself."
+  (cond ((string-match "\\`\\(https?\\|drive\\):" path)
+         (cons path path))
+        ((string-match "\\`\\([^:]+\\):\\(https?:.+\\)\\'" path)
+         (and (gdocs--valid-inline-object-id-p (match-string 1 path))
+              (cons (match-string 1 path) (match-string 2 path))))))
 
 (defun gdocs--chip-org-link (object)
   "Render chip OBJECT as an Org link; the description is what Org shows."
@@ -2490,37 +2546,50 @@ parse returns nil so the marker fails closed."
              gdocs--chip-link-prefix
              (plist-get object :entity-id)
              (or (plist-get object :label) "")))
+    (:chip-file
+     ;; A title may hold brackets; it is escaped as a link description.
+     (format "[[%s:file:%s:%s][%s]]"
+             gdocs--chip-link-prefix
+             (plist-get object :entity-id)
+             (org-link-escape (plist-get object :chip-value))
+             (gdocs--escape-org-inline
+              (or (plist-get object :label) (plist-get object :chip-value)) t)))
     (_ (user-error "gdocs: invalid inline-object marker metadata"))))
 
 (defun gdocs--chip-link-face (path)
   "Return the Org face for a chip link with PATH.
 Date chips render with the `org-date' face so they look like ordinary
-Org timestamps; person chips use the ordinary link face."
-  (if (string-prefix-p "person:" path) 'org-link 'org-date))
+Org timestamps; person and file chips use the ordinary link face."
+  (if (string-prefix-p "date:" path) 'org-date 'org-link))
 
 (org-link-set-parameters
  gdocs--chip-link-prefix
  :follow #'gdocs--chip-link-follow
  :face #'gdocs--chip-link-face)
 
-(defun gdocs--chip-link-follow (path _arg)
-  "Follow handler for chip links: chips are pull-only remote objects."
-  (user-error
-   "gdocs: remote chip %s is pull-only; edit it in Google Docs and pull" path))
+(defun gdocs--chip-link-follow (path arg)
+  "Follow the chip link with PATH.  ARG is passed to the file's link.
+A file chip opens its file like an ordinary link, so a Google Docs file
+opens through `gdocs-mode'.  Other chips have nothing to open."
+  (if-let* ((target (and (string-prefix-p "file:" path)
+                         (gdocs--file-chip-target (substring path 5)))))
+      (org-link-open-from-string (org-link-make-string (cdr target)) arg)
+    (user-error "gdocs: chip %s has nothing to open" path)))
 
 (defun gdocs--inline-object-is-image-p (object)
   "Return non-nil when inline OBJECT is an image placeholder."
   (eq (plist-get object :object-kind) :image))
 
 (defconst gdocs--inline-object-identity-keys
-  '(:entity-id :kind :object-kind :content-id :width :height :chip-value)
+  '(:entity-id :kind :object-kind :content-id :width :height :chip-value :title)
   "Stable fields that identify an inline object for comparison.
 
 OT positions, decoder-only vectors, and source metadata are deliberately not
 part of this identity.  Width and height remain part of the identity because
 changing either changes the rendered object and cannot be preserved by a text
-only incremental edit.  A chip's `:chip-value' (calendar date or contact
-name) participates for the same reason; its display label does not.")
+only incremental edit.  A chip's `:chip-value' (calendar date, contact
+name or file URL) participates for the same reason; its display label
+does not.  A file chip's `:title' does, because Org shows it as is.")
 
 (defun gdocs--inline-object-canonical-value (key value)
   "Normalize VALUE for stable inline-object identity KEY.
@@ -2574,13 +2643,15 @@ operation order is deliberately ignored.  The result is a plist with
       (when (listp op)
         (cond
          ((and (equal (alist-get 'ty op) "ae")
-               (not (member (alist-get 'et op) '("inline" "date" "person"))))
+               (not (equal (alist-get 'et op) "inline"))
+               (not (assoc (alist-get 'et op) gdocs--chip-entity-types)))
           ;; Other entity types are reported, with their attachment
           ;; positions, by the generic capability scanner.
           (when (stringp (alist-get 'id op))
             (puthash (alist-get 'id op) t other-entities)))
          ((and (equal (alist-get 'ty op) "ae")
-               (member (alist-get 'et op) '("inline" "date" "person")))
+               (or (equal (alist-get 'et op) "inline")
+                   (assoc (alist-get 'et op) gdocs--chip-entity-types)))
           (let* ((id (alist-get 'id op))
                  (kind (if (equal (alist-get 'et op) "inline")
                            :inline-image :remote-chip))
@@ -2698,7 +2769,7 @@ operation order is deliberately ignored.  The result is a plist with
                    (if (equal type "inline")
                        "Inline images are pull-only; the current OT encoder can preserve one only when it is left untouched."
                      (format "Remote %s chips are pull-only; the current OT encoder can preserve one only when it is left untouched."
-                             (if (equal type "date") "date" "person")))
+                             (if (equal type "first-party-link") "file" type)))
                    :entity-id id
                    :ot-start spi :ot-end spi
                    :preserve-untouched t :refuse-push nil
@@ -3418,9 +3489,9 @@ report. Inline image reports are produced by
                   nil))
                ;; Inline definitions are validated by the image decoder.
                ((equal entity-type "inline") nil)
-               ;; Date/person chip definitions are validated by the same
-               ;; decoder; its pull-only report covers them.
-               ((member entity-type '("date" "person")) nil)
+               ;; Chip definitions are validated by the same decoder; its
+               ;; pull-only report covers them.
+               ((assoc entity-type gdocs--chip-entity-types) nil)
                ((eq entity-class :recognized-not-editable)
                 (push (gdocs--capability-report
                        :unsupported-entity
@@ -3801,11 +3872,17 @@ text without inline markup."
                  runs)))
 
 (defun gdocs--build-para (pa lb ta runs list-defs)
-  "Assemble one paragraph plist from attrs."
-  (let* ((inline-object (and (= (length runs) 1)
+  "Assemble one paragraph plist from attrs.
+A plain paragraph holding only an image is a standalone object, as its
+Org view `#+gdocs_inline_object:' is.  A chip, or an image in a list item
+or heading, stays inline in its paragraph."
+  (let* ((paragraph-kind (gdocs--paragraph-kind pa lb))
+         (inline-object (and (length= runs 1)
+                             (eq paragraph-kind :para)
+                             (gdocs--inline-object-is-image-p
+                              (plist-get (car runs) :inline-object))
                              (plist-get (car runs) :inline-object)))
-         (kind (if inline-object :inline-object
-                 (gdocs--paragraph-kind pa lb)))
+         (kind (if inline-object :inline-object paragraph-kind))
          (heading (and pa (plist-get pa :heading)))
          (anchor (and pa (plist-get pa :anchor)))
          (list-id (and lb (plist-get lb :list-id)))
@@ -3814,7 +3891,7 @@ text without inline markup."
          (out (list :kind kind :runs runs)))
     (when inline-object
       (dolist (key '(:entity-id :object-kind :content-id :width :height
-                                :label :ymd :chip-value :ot-position))
+                                :label :title :ymd :chip-value :ot-position))
         (when (plist-member inline-object key)
           (setq out (plist-put out key (plist-get inline-object key))))))
     (when (and (eq kind :heading) heading)
@@ -6439,7 +6516,7 @@ comparison; decoder-only inline-object metadata does not."
                          (numberp (plist-get object :width))
                          (numberp (plist-get object :height))))
                    ((memq (plist-get object :object-kind)
-                          '(:chip-date :chip-person))
+                          '(:chip-date :chip-person :chip-file))
                     (gdocs--valid-chip-label-p
                      (plist-get object :chip-value)))
                    (t nil)))
@@ -7191,10 +7268,18 @@ CONTEXT is the plist `gdocs--tab-surgical-commands' builds."
          (deleted (plist-get edit :delete))
          (inserted (plist-get edit :insert))
          (position (+ (plist-get entry :start) offset))
-         (left (and (> offset 0) (gdocs--cell-attributes (aref cells (1- offset)))))
          (inherited (and (> position 1) (aref text-styles (- position 2))))
          (inherited-link (and (> position 1)
                               (gdocs--sm-link-url (aref link-styles (- position 2)))))
+         (left-cell (and (> offset 0) (aref cells (1- offset))))
+         ;; A chip or image has no Org-visible style of its own, but text
+         ;; typed after it takes its character style, so that style counts.
+         (left (cond ((null left-cell) nil)
+                     ((nth 3 left-cell)
+                      (cons (gdocs--styles-active-keys
+                             (gdocs--styles-from-text-sm inherited))
+                            inherited-link))
+                     (t (gdocs--cell-attributes left-cell))))
          (commands nil))
     (when (> deleted 0)
       (push `((ty . "ds") (si . ,position) (ei . ,(+ position deleted -1)))
@@ -7205,24 +7290,41 @@ CONTEXT is the plist `gdocs--tab-surgical-commands' builds."
             commands)
       (dolist (command (gdocs--entity-commands inserted position))
         (push command commands))
-      (dolist (run (gdocs--cell-runs inserted))
-        (let* ((attributes (nth 2 run))
-               (from (+ position (nth 0 run)))
-               (to (+ from (nth 1 run) -1)))
-          (unless (equal attributes left)
-            (let ((source (gdocs--style-source table index offset
-                                               (+ offset deleted) attributes)))
-              (push `((ty . "as") (st . "text") (si . ,from) (ei . ,to)
-                      (sm . ,(gdocs--copied-text-sm
-                              inherited
-                              (and source (<= source (length text-styles))
-                                   (aref text-styles (1- source)))
-                              (car attributes))))
-                    commands)))
-          (unless (equal (cdr attributes) inherited-link)
-            (push `((ty . "as") (st . "link") (si . ,from) (ei . ,to)
-                    (sm . ,(gdocs--link-sm (cdr attributes))))
-                  commands)))))
+      (let ((styled (make-vector (length inserted) inherited)))
+        (dolist (run (gdocs--cell-runs inserted))
+          (let* ((attributes (nth 2 run))
+                 (from (+ position (nth 0 run)))
+                 (to (+ from (nth 1 run) -1)))
+            (unless (equal attributes left)
+              (let* ((source (gdocs--style-source table index offset
+                                                  (+ offset deleted) attributes))
+                     (sm (gdocs--copied-text-sm
+                          inherited
+                          (and source (<= source (length text-styles))
+                               (aref text-styles (1- source)))
+                          (car attributes))))
+                (cl-loop for k from (nth 0 run) repeat (nth 1 run)
+                         do (aset styled k sm))
+                (push `((ty . "as") (st . "text") (si . ,from) (ei . ,to) (sm . ,sm))
+                      commands)))
+            (unless (equal (cdr attributes) inherited-link)
+              (push `((ty . "as") (st . "link") (si . ,from) (ei . ,to)
+                      (sm . ,(gdocs--link-sm (cdr attributes))))
+                    commands))))
+        ;; An object that replaces an object, such as a chip whose title
+        ;; changed, keeps the replaced object's character style.
+        (cl-loop with old = (cl-loop for k from offset below (+ offset deleted)
+                                     when (nth 3 (aref cells k))
+                                     collect (+ (plist-get entry :start) k))
+                 for cell across inserted
+                 for k from 0
+                 when (and old (nth 3 cell))
+                 do (let ((source (aref text-styles (1- (pop old)))))
+                      (unless (equal source (aref styled k))
+                        (push `((ty . "as") (st . "text")
+                                (si . ,(+ position k)) (ei . ,(+ position k))
+                                (sm . ,(gdocs--copied-sm (aref styled k) source)))
+                              commands))))))
     (nreverse commands)))
 
 (defun gdocs--surgical-restyle-commands (edit table text-styles)
@@ -8050,8 +8152,10 @@ IDENTITY is a stable object identity from `gdocs--inline-object-identity';
 the returned identity carries the fresh id that AE, an `ae' operation,
 defines.  ENTITIES is the document's entity table, see
 `gdocs--doc-entities'.  A person chip needs an email: the Org link target
-gives it, or another person chip in the document with the same name.  An
-image must reuse an image already uploaded to the document."
+gives it, or another person chip in the document with the same name.  A
+file chip takes its file type from a chip of the same file in the
+document, or from its URL, see `gdocs--file-chip-mime-type'.  An image
+must reuse an image already uploaded to the document."
   (let* ((kind (plist-get identity :object-kind))
          (local-id (plist-get identity :entity-id))
          (previous (gethash local-id (plist-get entities :by-id)))
@@ -8089,21 +8193,40 @@ image must reuse an image already uploaded to the document."
                  (setf (alist-get 'i_ht (alist-get 'ee_eo copy))
                        (float (plist-get identity :height)))
                  copy)))
+            (:chip-file
+             (let* ((url (plist-get identity :chip-value))
+                    (mime (or (alist-get 'fple-mt (gethash url (plist-get entities :files)))
+                              (gdocs--file-chip-mime-type url))))
+               `((fple-u . ,url)
+                 (fple-t . ,(plist-get identity :title))
+                 ,@(and mime `((fple-mt . ,mime))))))
             (_ (user-error "gdocs: Push refused: this kind of remote object cannot be created")))))
     (cons (plist-put (copy-sequence identity) :entity-id id)
           `((ty . "ae")
-            (et . ,(pcase kind (:chip-person "person") (:chip-date "date") (_ "inline")))
+            (et . ,(or (car (rassq kind gdocs--chip-entity-types)) "inline"))
             (id . ,id) (epm . ,epm)))))
+
+(defun gdocs--file-chip-mime-type (url)
+  "Return the Google file type of URL for a new file chip, or nil.
+Google Docs, Sheets and Slides URLs have a known type.  For any other
+URL the chip has no type, as Google writes for a calendar event."
+  (cond ((string-match-p "\\`https://docs\\.google\\.com/document/" url)
+         "application/vnd.google-apps.kix")
+        ((string-match-p "\\`https://docs\\.google\\.com/spreadsheets/" url)
+         "application/vnd.google-apps.ritz")
+        ((string-match-p "\\`https://docs\\.google\\.com/presentation/" url)
+         "application/vnd.google-apps.punch")))
 
 (defun gdocs--doc-entities (state)
   "Return the entity table of the whole document in STATE.
 It is a plist of hash tables: `:by-id' maps an entity id to its `ae'
 operation, `:emails' a person chip's name to its email, `:images' an
-uploaded image's content id to its `ae' operation, and `:taken' holds
-every id in use."
+uploaded image's content id to its `ae' operation, `:files' a file
+chip's URL to its entity properties, and `:taken' holds every id in use."
   (let ((by-id (make-hash-table :test #'equal))
         (emails (make-hash-table :test #'equal))
         (images (make-hash-table :test #'equal))
+        (files (make-hash-table :test #'equal))
         (taken (make-hash-table :test #'equal)))
     (dolist (tab (or (plist-get state :tabs) (list state)))
       (dolist (op (or (plist-get tab :ops) (plist-get tab :ot-ops)))
@@ -8116,8 +8239,10 @@ every id in use."
                                    (stringp (alist-get 'per_e epm)))
                           (puthash (alist-get 'per_n epm) (alist-get 'per_e epm) emails)))
               ("inline" (let ((content (alist-get 'i_cid (alist-get 'ee_eo epm))))
-                          (when (stringp content) (puthash content op images)))))))))
-    (list :by-id by-id :emails emails :images images :taken taken)))
+                          (when (stringp content) (puthash content op images))))
+              ("first-party-link" (when (stringp (alist-get 'fple-u epm))
+                                    (puthash (alist-get 'fple-u epm) epm files))))))))
+    (list :by-id by-id :emails emails :images images :files files :taken taken)))
 
 (defun gdocs--created-cells (cells entities)
   "Return CELLS with each object cell turned into a new entity.
@@ -9724,7 +9849,8 @@ metadata are ignored."
                  (value-b (plist-get b :chip-value)))
              (and (gdocs--valid-chip-label-p value-a)
                   (gdocs--valid-chip-label-p value-b)
-                  (equal value-a value-b)))))))
+                  (equal value-a value-b)
+                  (equal (plist-get a :title) (plist-get b :title))))))))
 
 (defun gdocs--capability-object-matches-p (object remote-objects)
   "Return non-nil when OBJECT has exactly one matching remote object.

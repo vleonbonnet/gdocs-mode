@@ -1080,6 +1080,91 @@ commented item and a link; `t.kid', a child of the original tab, is empty."
     (should-error (gdocs-test--state-plan state "Alpha one" "Alpah one")
                   :type 'user-error)))
 
+(defconst gdocs-test--file-url
+  "https://docs.google.com/document/d/FILE/edit?tab=t.0#heading=h.x"
+  "URL of the file chip in `gdocs-test--file-chip-state'.")
+
+(defun gdocs-test--file-chip-state ()
+  "Return a state whose tab has an italic list item holding a file chip."
+  (let ((body (concat "Intro\n" (string gdocs--ot-chip-codepoint) "\nTail\n")))
+    (gdocs-test--one-tab-state
+     body
+     `(,(gdocs-test--list-definition-op '(:id "kix.list" :glyph :bullet))
+       ((ty . "as") (st . "list") (si . 8) (ei . 8) (sm (ls_id . "kix.list") (ls_nest . 0)))
+       ((ty . "as") (st . "text") (si . 7) (ei . 8) (sm (ts_it . t) (ts_it_i . :json-false)))
+       ((ty . "ae") (et . "first-party-link") (id . "kix.f")
+        (epm (fple-u . ,gdocs-test--file-url)
+             (fple-t . "[Draft] Plan")
+             (fple-mt . "application/vnd.google-apps.kix")))
+       ((ty . "te") (id . "kix.f") (spi . 7))))))
+
+(ert-deftest gdocs-test-file-chip-renders-as-a-link ()
+  "A file chip renders as a chip link that keeps its list item and reads back."
+  (let* ((state (gdocs-test--file-chip-state))
+         (body (car (gdocs--render-tab-tree (plist-get state :tabs) 7 "d")))
+         (object (seq-some (lambda (run) (plist-get run :inline-object))
+                           (mapcan (lambda (paragraph)
+                                     (copy-sequence (plist-get paragraph :runs)))
+                                   (gdocs-dm-paragraphs (gdocs-dm-from-org body))))))
+    (should (string-search
+             (concat "- [[gdocs-chip:file:kix.f:" gdocs-test--file-url "][\u200b[\u200bDraft\u200b]\u200b Plan]]\n")
+             body))
+    (should-not (string-search (string gdocs--ot-chip-codepoint) body))
+    (should (equal (plist-get object :entity-id) "kix.f"))
+    (should (equal (plist-get object :chip-value) gdocs-test--file-url))
+    (should (equal (plist-get object :title) "[Draft] Plan"))
+    (should (equal (plist-get (gdocs-test--state-plan state "Tail" "Tail.") :commands)
+                   '(((ty . "is") (ibi . 13) (s . ".")))))))
+
+(ert-deftest gdocs-test-file-chip-link-opens-its-file ()
+  "Following a file chip opens its URL; other chips have nothing to open."
+  (let (opened)
+    (cl-letf (((symbol-function 'org-link-open-from-string)
+               (lambda (link &optional _arg) (setq opened link))))
+      (gdocs--chip-link-follow (concat "file:kix.f:" gdocs-test--file-url) nil)
+      (should (equal opened (concat "[[" gdocs-test--file-url "]]")))
+      (should-error (gdocs--chip-link-follow "person:kix.p" nil) :type 'user-error))))
+
+(ert-deftest gdocs-test-tab-creates-file-chips ()
+  "New file chips take their file type from the document or their URL."
+  (let* ((sheet "https://docs.google.com/spreadsheets/d/S/edit")
+         (plan (gdocs-test--state-plan
+                (gdocs-test--file-chip-state) "Tail"
+                (concat "Tail [[gdocs-chip:file:" sheet "][Sheet]]"
+                        " [[gdocs-chip:file:" gdocs-test--file-url "][Copy]]"
+                        " [[gdocs-chip:file:https://example.com/x][Ext]]")))
+         (entities (mapcar (lambda (command) (alist-get 'epm command))
+                           (gdocs-test--commands-of plan "ae"))))
+    (should (equal entities
+                   `(((fple-u . ,sheet) (fple-t . "Sheet")
+                      (fple-mt . "application/vnd.google-apps.ritz"))
+                     ((fple-u . ,gdocs-test--file-url) (fple-t . "Copy")
+                      (fple-mt . "application/vnd.google-apps.kix"))
+                     ((fple-u . "https://example.com/x") (fple-t . "Ext")))))
+    (should (equal (mapcar (lambda (command) (alist-get 'et command))
+                           (gdocs-test--commands-of plan "ae"))
+                   '("first-party-link" "first-party-link" "first-party-link")))
+    (should (length= (plist-get plan :created-ids) 3))))
+
+(ert-deftest gdocs-test-tab-file-chip-title-change-replaces-it ()
+  "A changed title replaces the chip, which keeps its character style."
+  (let* ((plan (gdocs-test--state-plan (gdocs-test--file-chip-state)
+                                       "Plan]]" "Plan v2]]"))
+         (commands (plist-get plan :commands)))
+    (should (equal (car commands) '((ty . "de") (id . "kix.f") (et . "first-party-link"))))
+    (should (equal (alist-get 'fple-t (alist-get 'epm (car (gdocs-test--commands-of plan "ae"))))
+                   "[Draft] Plan v2"))
+    (should (equal (plist-get plan :removed-ids) '("kix.f")))
+    (should (eq (alist-get 'ts_it (alist-get 'sm (car (last commands)))) t))))
+
+(ert-deftest gdocs-test-tab-text-after-a-chip-gets-its-own-style ()
+  "Text typed after a chip does not keep the chip's character style."
+  (let ((commands (plist-get (gdocs-test--state-plan (gdocs-test--file-chip-state)
+                                                     "Plan]]" "Plan]] next")
+                             :commands)))
+    (should (equal (car commands) '((ty . "is") (ibi . 8) (s . " next"))))
+    (should (eq (alist-get 'ts_it (alist-get 'sm (nth 1 commands))) :json-false))))
+
 (defun gdocs-test--table-state ()
   "Return a state whose tab holds a one-row table and no final newline."
   (let ((table (gdocs--emit-table-body-and-ops
