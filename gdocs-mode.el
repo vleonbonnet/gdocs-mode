@@ -415,8 +415,11 @@ discard."
            (eq char ?\t)
            (eq (get-char-code-property char 'general-category) 'Zs))))
 
-(defconst gdocs--org-link-description-sentinel (string #x200b)
-  "Invisible separator used to keep Org subscript/LaTeX syntax literal.")
+(defconst gdocs--org-link-description-sentinel (string #x2060)
+  "Invisible word joiner used to keep Org subscript/LaTeX syntax literal.
+It surrounds brackets, underscores and backslashes in a link description.
+Org does not count it as whitespace, so emphasis around such text still
+parses.  Older pulls used U+200B, which the parser still removes.")
 
 (defun gdocs--debug-context-suffix (text)
   "Return a short suffix of TEXT suitable for debug diagnostics.
@@ -790,10 +793,11 @@ ephemeral local projection that the next pull regenerates)."
 
 (defun gdocs--append-comments-section (body comments)
   "Return BODY with the rendered COMMENTS section appended.
-Exactly one blank line separates the body from the `* Comments'
-heading; without comments BODY passes through unchanged."
+One blank line of padding separates the body from the `* Comments'
+heading, after any blank lines that are the body's own empty
+paragraphs; without comments BODY passes through unchanged."
   (if comments
-      (concat (string-trim-right body) "\n"
+      (concat body (if (string-suffix-p "\n" body) "" "\n")
               (gdocs--render-comments-section comments))
     body))
 
@@ -1197,8 +1201,14 @@ identified by GDOC_TAB properties, never by heading depth alone."
                     (let ((text (buffer-substring-no-properties
                                  (plist-get entry :body-start)
                                  (if next (plist-get next :start) (point-max)))))
+                      ;; One blank line before the next tab heading is
+                      ;; padding; the others are the tab's empty paragraphs.
+                      (when (and next (string-suffix-p "\n\n" text))
+                        (setq text (substring text 0 -1)))
                       (with-temp-buffer
-                        (insert (string-trim-right text) "\n")
+                        (insert text)
+                        (unless (or (string-empty-p text) (string-suffix-p "\n" text))
+                          (insert "\n"))
                         (goto-char (point-min))
                         (while (re-search-forward "^\\(\\*+\\) " nil t)
                           (let ((stars (match-string 1)))
@@ -2272,22 +2282,31 @@ value so malformed values remain available to capability validation."
       0)))
 
 (defun gdocs--decode-list-bindings (ops)
-  "Walk list-style ops; return alist OT-POS → decoded list attributes."
-  (let (out)
+  "Walk list-style ops; return alist OT-POS → decoded list attributes.
+Google merges the keys of successive list styles at a position, so they
+are merged here too.  A binding left without a list id, as when a null
+`ls_id' cleared it, is no list.  A checklist item is `:checked' when its
+`ls_c' state is 1."
+  (let ((merged nil))
     (dolist (op ops)
       (when (and (equal (alist-get 'ty op) "as")
                  (equal (alist-get 'st op) "list"))
         (let* ((si (alist-get 'si op))
-               (sm (alist-get 'sm op))
-               (id (alist-get 'ls_id sm))
-               (nest (gdocs--effective-list-nesting-level sm))
-               (text-style (alist-get 'ls_ts sm 'unset)))
-          ;; A binding without a list id clears the paragraph's list.
-          (push (cons si (and (stringp id)
-                              (list :list-id id :nest nest
-                                    :text-style text-style)))
-                out))))
-    out))
+               (cell (or (assq si merged)
+                         (car (push (cons si nil) merged)))))
+          (dolist (entry (alist-get 'sm op))
+            (setf (alist-get (car entry) (cdr cell)) (cdr entry))))))
+    (mapcar
+     (lambda (cell)
+       (let* ((sm (cdr cell))
+              (id (alist-get 'ls_id sm)))
+         (cons (car cell)
+               (and (stringp id)
+                    (list :list-id id
+                          :nest (gdocs--effective-list-nesting-level sm)
+                          :text-style (alist-get 'ls_ts sm 'unset)
+                          :checked (eql (alist-get 'c_cs (alist-get 'ls_c sm)) 1))))))
+     merged)))
 
 (defun gdocs--decode-table-attrs (ops)
   "Walk table-style ops; return alist OT-POS → (:table-id S :cols N).
@@ -3802,12 +3821,13 @@ absent opValue clears an anchor and is skipped."
     (nreverse out)))
 
 (defun gdocs--list-glyph-kind (defs list-id nest)
-  "Look up list LIST-ID's NEST level in DEFS. Return :bullet or :number."
+  "Look up list LIST-ID's NEST level in DEFS.
+Return :bullet, :checkbox or :number."
   (let* ((nests (cdr (assoc list-id defs)))
          (entry (cdr (assq nest nests)))
          (gt (plist-get entry :gt)))
-    ;; Per recon: gt=9 → bullet; gt=10/13/15 → numbered.
-    (if (eq gt 9) :bullet :number)))
+    ;; Glyph type 9 is a bullet, 17 a checkbox, others number the items.
+    (pcase gt (9 :bullet) (17 :checkbox) (_ :number))))
 
 (defun gdocs--build-runs
     (body ts-vec start end &optional link-vec inline-object-vec)
@@ -3957,6 +3977,8 @@ or heading, stays inline in its paragraph."
       (setq out (plist-put out :list-id list-id))
       (setq out (plist-put out :nest nest))
       (setq out (plist-put out :glyph glyph))
+      (when (eq glyph :checkbox)
+        (setq out (plist-put out :checked (and lb (plist-get lb :checked)))))
       (when (natnump nest)
         (setq out (plist-put out :indent
                              (or (and pa (plist-get pa :indent-left))
@@ -3980,82 +4002,32 @@ or heading, stays inline in its paragraph."
 (defun gdocs--normalize-paragraphs (paragraphs)
   "Return the canonical paragraph sequence for PARAGRAPHS.
 
-Google Docs can represent visual whitespace as several consecutive empty
-paragraphs.  Org has no useful representation for the distinction, so this
-normalization intentionally keeps at most one `:blank' paragraph, removes
-leading and trailing empty paragraphs, and is lossy for repeated empties.
-
-An empty paragraph between two `:code' paragraphs has a defined meaning: it
-is an empty source line.  Such a paragraph is converted to an empty `:code'
-paragraph rather than allowing the renderer to close and reopen the source
-block.  This keeps source-block boundaries intact and makes the operation
-idempotent.  Other single empty paragraphs remain available to represent a
-meaningful paragraph break, for example between a paragraph and a list.  A
-single blank adjacent to a heading-like paragraph is retained here so the
-renderer can observe and reuse it instead of adding another one."
-  (let ((collapsed nil)
-        (previous-blank nil))
-    ;; First collapse adjacent blanks.  Do not mutate the model supplied by a
-    ;; caller: the same decoded model may also be used by the OT diff path.
-    (dolist (para paragraphs)
-      (if (eq (plist-get para :kind) :blank)
-          (unless previous-blank
-            (push para collapsed)
-            (setq previous-blank t))
-        (push para collapsed)
-        (setq previous-blank nil)))
-    (setq collapsed (nreverse collapsed))
-    ;; Blank paragraphs at either document edge are only visual padding.  In
-    ;; particular, don't let an OT body ending in several newlines turn into
-    ;; a visibly padded Org file.
-    (while (and collapsed
-                (eq (plist-get (car collapsed) :kind) :blank))
-      (setq collapsed (cdr collapsed)))
-    (setq collapsed (nreverse collapsed))
-    (while (and collapsed
-                (eq (plist-get (car collapsed) :kind) :blank))
-      (setq collapsed (cdr collapsed)))
-    (setq collapsed (nreverse collapsed))
-    ;; A generic blank between code paragraphs is part of the source block,
-    ;; not a paragraph separator outside it.  The first pass guarantees that
-    ;; there is at most one such entry to convert.
-    (let ((out nil)
-          (rest collapsed))
-      (while rest
-        (let* ((para (car rest))
-               (next (cadr rest))
-               (previous (car out)))
-          (if (and (eq (plist-get para :kind) :blank)
-                   (eq (plist-get previous :kind) :code)
-                   (eq (plist-get next :kind) :code))
-              (push (list :kind :code
-                          :runs (list (gdocs-dm-make-run ""))) out)
-            (push para out)))
-        (setq rest (cdr rest)))
-      (nreverse out))))
+Every empty paragraph is kept: Org shows each one as a blank line, see
+`gdocs--dm-to-org-1'.  An empty paragraph between two `:code' paragraphs
+is an empty source line, so it becomes an empty `:code' paragraph rather
+than closing and reopening the source block."
+  (let* ((vector (vconcat paragraphs))
+         (size (length vector))
+         (code-at (lambda (k step)
+                    ;; Whether the first non-blank paragraph from K is code.
+                    (let ((k k))
+                      (while (and (< -1 k size)
+                                  (eq (plist-get (aref vector k) :kind) :blank))
+                        (setq k (+ k step)))
+                      (and (< -1 k size) (eq (plist-get (aref vector k) :kind) :code))))))
+    (cl-loop for paragraph across vector
+             for k from 0
+             collect (if (and (eq (plist-get paragraph :kind) :blank)
+                              (funcall code-at (1- k) -1)
+                              (funcall code-at (1+ k) 1))
+                         (list :kind :code :runs (list (gdocs-dm-make-run "")))
+                       paragraph))))
 
 (defun gdocs--normalize-paragraphs-for-ot (paragraphs)
-  "Return PARAGRAPHS canonicalized for remote OT emission/diffing.
-
-`gdocs--normalize-paragraphs' retains one blank adjacent to a heading so the
-Org renderer can reuse it.  That blank is presentation-only, however: the OT
-model represents the heading paragraph itself and must not receive a new
-remote empty paragraph just because Org needs visual padding.  Remove those
-heading-adjacent blanks after the common normalization pass."
-  (let ((normalized (gdocs--normalize-paragraphs paragraphs))
-        (out nil)
-        (rest nil))
-    (setq rest normalized)
-    (while rest
-      (let ((para (car rest))
-            (next (cadr rest))
-            (previous (car out)))
-        (unless (and (eq (plist-get para :kind) :blank)
-                     (or (gdocs--heading-kind-p (plist-get previous :kind))
-                         (gdocs--heading-kind-p (plist-get next :kind))))
-          (push para out)))
-      (setq rest (cdr rest)))
-    (nreverse out)))
+  "Return PARAGRAPHS canonicalized for remote OT emission and diffing.
+Every empty paragraph is a real paragraph, see `gdocs--normalize-paragraphs':
+the blank line Org shows as padding around a heading is not one."
+  (gdocs--normalize-paragraphs paragraphs))
 
 (defun gdocs--visual-list-levels (paragraphs)
   "Return PARAGRAPHS with list levels that follow how the lists look.
@@ -4190,6 +4162,10 @@ function returns."
              (concat gdocs--org-link-description-sentinel
                      (string char)
                      gdocs--org-link-description-sentinel))
+            ;; The parser drops a lone invisible marker, so a real one is
+            ;; doubled, see `gdocs--unescape-org-inline'.
+            ((memq char '(#x2060 #x200c))
+             (string char char))
             ((memq char gdocs--org-inline-escape-chars)
              (concat "\\" (string char)))
             (t (string char))))
@@ -4737,16 +4713,18 @@ A tab's headings are shifted below the tab's own heading, so LEVEL may be
 deeper than any Google Docs heading level."
   (make-string (max 1 level) ?*))
 
-(defun gdocs--render-list-bullet (glyph nest &optional ordinal indent)
+(defun gdocs--render-list-bullet (glyph nest &optional ordinal indent checked)
   "Return the leading bullet text for a list item.
-GLYPH is :bullet or :number; NEST is 0-based. ORDINAL is the 1-based
-sequence number within the current numbered list at this nest level
-\(only used when GLYPH is :number; defaults to 1). INDENT, when non-nil,
-is the syntax-aware leading column computed from the parent item marker."
+GLYPH is :bullet, :checkbox or :number; NEST is 0-based. ORDINAL is the
+1-based sequence number within the current numbered list at this nest
+level \(only used when GLYPH is :number; defaults to 1). INDENT, when
+non-nil, is the syntax-aware leading column computed from the parent
+item marker.  A checklist item shows its state, CHECKED or not."
   (concat (make-string (or indent (* 2 (max 0 nest))) ?\s)
-          (if (eq glyph :number)
-              (format "%d. " (or ordinal 1))
-            "- ")))
+          (pcase glyph
+            (:number (format "%d. " (or ordinal 1)))
+            (:checkbox (if checked "- [X] " "- [ ] "))
+            (_ "- "))))
 
 (defun gdocs--org-display-width (text)
   "Display width of TEXT as Org renders it, hiding link targets.
@@ -4826,7 +4804,8 @@ ORDINAL applies to numbered list items only — see `gdocs--render-list-bullet'.
       (:list
        (let* ((glyph (plist-get para :glyph))
               (nest (or (plist-get para :nest) 0)))
-         (concat (gdocs--render-list-bullet glyph nest ordinal list-indent)
+         (concat (gdocs--render-list-bullet glyph nest ordinal list-indent
+                                            (plist-get para :checked))
                  text)))
       (:code text)
       (:table (gdocs--render-table-para para))
@@ -5001,10 +4980,10 @@ text starting with `- ', is rendered literally, see
 Code blocks: contiguous :kind=:code paragraphs are wrapped in a single
 \\#+begin_src/\\#+end_src block. Lists, headings, tables and plain
 paragraphs each emit one line (terminated by \\n). Empty paragraphs are
-normalized before rendering. A heading, Title, or Subtitle receives exactly
-one blank line on each side where adjacent content exists; an existing blank
-paragraph satisfies that rule. Padding is applied to paragraph entries rather
-than to the final text, so it never appears inside a source block."
+each one blank line, at the start and end of the text too. Between two
+entries one of which is a heading, Title, or Subtitle, one more blank line
+is padding.  Padding is applied to paragraph entries rather than to the
+final text, so it never appears inside a source block."
   (let ((paras (gdocs--normalize-paragraphs (gdocs-dm-paragraphs doc)))
         (entries nil)
         (code-lines nil)
@@ -5055,9 +5034,10 @@ than to the final text, so it never appears inside a source block."
                 (when (eq glyph :number)
                   (setq ordinal (1+ (gethash counter-key list-counters 0)))
                   (puthash counter-key ordinal list-counters))
-                (let* ((marker (if (eq glyph :number)
-                                   (format "%d. " (or ordinal 1))
-                                 "- "))
+                (let* ((marker (pcase glyph
+                                 (:number (format "%d. " (or ordinal 1)))
+                                 (:checkbox "- [ ] ")
+                                 (_ "- ")))
                        (content-indent (+ list-indent (length marker))))
                   (puthash nest content-indent list-content-indents)
                   (let (deeper-indents)
@@ -5081,24 +5061,25 @@ than to the final text, so it never appears inside a source block."
                                  (list "#+end_src")))
             entries))
     (setq entries (nreverse entries))
-    ;; Add padding from the logical neighboring entries. The look-ahead is
-    ;; important: an explicit blank paragraph after a heading must not be
-    ;; accompanied by another synthetic blank. Since normalized entries
-    ;; contain at most one blank, applying this pass again cannot add anything.
-    (let ((out nil))
-      (cl-loop for tail on entries
-               for entry = (car tail)
-               for next = (cadr tail)
-               do (let ((heading (plist-get entry :heading))
-                        (lines (plist-get entry :lines)))
-                    (when (and heading out
-                               (not (string-empty-p (car out))))
-                      (push "" out))
-                    (dolist (line lines)
-                      (push line out))
-                    (when (and heading next
-                               (not (plist-get next :blank)))
-                      (push "" out))))
+    ;; Each empty paragraph is one blank line.  Between two entries one of
+    ;; which is a heading, one more blank line is padding, which the parser
+    ;; drops again, see `gdocs--org-with-meaningful-blanks'.
+    (let ((out nil)
+          (previous nil)
+          (blanks 0))
+      (dolist (entry entries)
+        (if (plist-get entry :blank)
+            (cl-incf blanks)
+          (dotimes (_ (+ blanks
+                         (if (and previous
+                                  (or (plist-get previous :heading)
+                                      (plist-get entry :heading)))
+                             1 0)))
+            (push "" out))
+          (dolist (line (plist-get entry :lines))
+            (push line out))
+          (setq previous entry blanks 0)))
+      (dotimes (_ blanks) (push "" out))
       (let* ((final (nreverse out))
              (explicit-unsupported
               (seq-some (lambda (para)
@@ -5688,9 +5669,11 @@ visible content."
     (when paragraph (gdocs--paragraph-content-runs paragraph))))
 
 (defun gdocs--item-glyph (item)
-  "Return :bullet or :number based on the item's leading bullet text."
+  "Return :bullet, :checkbox or :number for ITEM.
+An item with a checkbox, checked or not, is a checklist item."
   (let ((bullet (plist-get (cadr item) :bullet)))
     (cond
+     ((memq (plist-get (cadr item) :checkbox) '(on off)) :checkbox)
      ((null bullet) :bullet)
      ((string-match-p "^[0-9]+[.)]" bullet) :number)
      (t :bullet))))
@@ -5715,11 +5698,10 @@ prefix runs.  Both are disclosed fallbacks, not structural support."
          (checkbox (plist-get props :checkbox))
          (tag (plist-get props :tag))
          (runs nil))
-    (when checkbox
-      (let ((marker (pcase checkbox
-                      ('on "[X] ") ('off "[ ] ") ('trans "[-] ")
-                      ('intermediate "[-] ")
-                      (_ nil))))
+    ;; A checked or unchecked box is the item's checklist state, see
+    ;; `gdocs--item-glyph'; only a partial state stays as literal text.
+    (when (memq checkbox '(trans intermediate))
+      (let ((marker "[-] "))
         (when marker
           (push (gdocs-dm-make-run marker) runs))))
     (when tag
@@ -5743,11 +5725,13 @@ plain lists recurse normally."
                (paragraph (gdocs--org-item-paragraph item))
                (runs (append (gdocs--org-item-prefix-runs item)
                              (gdocs--org-item-runs item)))
-               (model (list :kind :list
-                            :glyph glyph
-                            :nest nest
-                            :list-id (gdocs--org-list-id plain-list glyph ids)
-                            :runs runs)))
+               (model (append (list :kind :list
+                                    :glyph glyph
+                                    :nest nest
+                                    :list-id (gdocs--org-list-id plain-list glyph ids)
+                                    :runs runs)
+                              (and (eq glyph :checkbox)
+                                   (list :checked (eq (plist-get (cadr item) :checkbox) 'on))))))
           (push (if source-spans
                     (gdocs--org-annotate-paragraph
                      model
@@ -5928,35 +5912,61 @@ source text.  It is removed before `gdocs-dm-from-org' returns its model."
   "Return non-nil when PARAGRAPH is a heading-like keyword entry."
   (gdocs--heading-kind-p (plist-get paragraph :kind)))
 
-(defun gdocs--org-with-meaningful-blanks (paragraphs)
-  "Insert meaningful source blank paragraphs into PARAGRAPHS.
+(defun gdocs--org-blank-lines (from to)
+  "Return how many lines after line FROM and before line TO are blank.
+Lines are numbered from 1 in the current buffer; a line past the end of
+the buffer is not counted."
+  (save-excursion
+    (let ((count 0)
+          (last (line-number-at-pos (point-max))))
+      ;; After a final newline, the buffer's last line is empty but not a line.
+      (when (eq (char-before (point-max)) ?\n)
+        (cl-decf last))
+      (goto-char (point-min))
+      (forward-line from)
+      (cl-loop for line from (1+ from) below (min to (1+ last))
+               do (progn (when (looking-at-p "[ \t]*$") (cl-incf count))
+                         (forward-line 1)))
+      count)))
 
-Org-element treats ordinary blank lines as formatting (`:post-blank') rather
-than elements.  The doc-model needs one explicit blank paragraph when that
-line separates ordinary content, otherwise rendering a pulled document with
-such a paragraph would not be idempotent.  Blank lines adjacent to headings,
-Title, or Subtitle entries are synthetic Org padding and are deliberately
-discarded.  Source-block spans are treated as one protected region so empty
-source lines remain :code paragraphs instead."
+(defun gdocs--org-with-meaningful-blanks (paragraphs)
+  "Insert the empty paragraphs that blank lines stand for into PARAGRAPHS.
+
+Org-element treats blank lines as formatting (`:post-blank') rather than
+elements.  Each blank line is one empty paragraph, at the start and end
+of the text too, except one blank line between two entries one of which
+is a heading, Title, or Subtitle: that line is padding, see
+`gdocs--dm-to-org-1'.  Lines that hold no content, such as drawers, are
+not blank.  Source-block spans are treated as one protected region so
+empty source lines remain :code paragraphs instead.  Must run in the
+buffer that PARAGRAPHS were parsed from."
   (let ((out nil)
-        (previous nil))
+        (previous nil)
+        (blank (list :kind :blank :runs nil)))
     (dolist (paragraph paragraphs)
       (let* ((current-start (plist-get paragraph :gdocs-source-start-line))
-             (previous-end (and previous
-                                (plist-get previous :gdocs-source-end-line)))
+             (previous-end (if previous
+                               (plist-get previous :gdocs-source-end-line)
+                             0))
              (current-group (plist-get paragraph :gdocs-source-group))
              (previous-group (and previous
                                   (plist-get previous :gdocs-source-group)))
-             (blank-gap (and current-start previous-end
-                             (> (- current-start previous-end) 1))))
-        (when (and previous blank-gap
-                   (not (and current-group previous-group
-                             (eq current-group previous-group)))
-                   (not (gdocs--org-heading-kind-p previous))
-                   (not (gdocs--org-heading-kind-p paragraph)))
-          (push (list :kind :blank :runs nil) out))
+             (blanks (if (and current-start previous-end
+                              (not (and current-group previous-group
+                                        (eq current-group previous-group))))
+                         (gdocs--org-blank-lines previous-end current-start)
+                       0))
+             (padding (if (and previous
+                               (or (gdocs--org-heading-kind-p previous)
+                                   (gdocs--org-heading-kind-p paragraph)))
+                          1 0)))
+        (dotimes (_ (max 0 (- blanks padding)))
+          (push (copy-sequence blank) out))
         (push paragraph out)
         (setq previous paragraph)))
+    (when-let* ((end (and previous (plist-get previous :gdocs-source-end-line))))
+      (dotimes (_ (gdocs--org-blank-lines end most-positive-fixnum))
+        (push (copy-sequence blank) out)))
     ;; Remove the transient span keys without changing any user-visible model
     ;; fields.  `plist-put' with nil would leave the keys present, so rebuild
     ;; each plist explicitly.
@@ -6492,15 +6502,18 @@ Bullet glyphs cycle ●/○/■ across levels; numbered uses no glyph string
        (let* ((id (car entry))
               (glyph (cdr entry))
               (numbered (eq glyph :number))
+              (checkbox (eq glyph :checkbox))
               (ts (gdocs--ts-block-canonical))
               (levels
                (cl-loop
                 for n from 0 to 8
                 collect
-                (let* ((gt (if numbered (gdocs--numbered-glyph-type n) 9))
+                (let* ((gt (cond (numbered (gdocs--numbered-glyph-type n))
+                                 (checkbox 17)
+                                 (t 9)))
                        (b-il (float (* 36 (1+ n))))
                        (b-ifl (float (+ 18 (* 36 n))))
-                       (gs (if numbered "" (aref bullet-glyphs n)))
+                       (gs (if (or numbered checkbox) "" (aref bullet-glyphs n)))
                        (b-gf (format "%%%d%s" n (if numbered "." ""))))
                   (cons (intern (format "nl_%d" n))
                         `((b_gf . ,b-gf)
@@ -6761,6 +6774,7 @@ rendered docs.  Malformed tables are never equal."
                   (plist-get p2 :level)))
          (equal (plist-get p1 :nest) (plist-get p2 :nest))
          (equal (plist-get p1 :glyph) (plist-get p2 :glyph))
+         (eq (plist-get p1 :checked) (plist-get p2 :checked))
          ;; Only an Org view carries a heading id, see `gdocs--heading-drawer'.
          (equal (plist-get p1 :heading-id) (plist-get p2 :heading-id))
          (if (eq kind :table)
@@ -7447,11 +7461,13 @@ CONTEXT is the plist `gdocs--tab-surgical-commands' builds."
                               commands))))))
     (nreverse commands)))
 
-(defun gdocs--surgical-restyle-commands (edit table text-styles)
+(defun gdocs--surgical-restyle-commands (edit table text-styles &optional list-styles)
   "Return the commands of restyle EDIT, using TABLE and TEXT-STYLES.
 EDIT is a plist with `:index', `:offset', `:length', `:from' and `:to'.
 Only the style keys that change are sent, so the rest of each
-character's style stays."
+character's style stays.  A restyle of a paragraph's whole text also
+restyles its newline and, for a list item, its bullet, whose style is
+in LIST-STYLES, as the Google Docs editor does."
   (let* ((index (plist-get edit :index))
          (entry (aref table index))
          (offset (plist-get edit :offset))
@@ -7490,9 +7506,21 @@ character's style stays."
                    (push (cons 'ts_fgc2_i (alist-get 'ts_fgc2_i copied :json-false)) sm))
           (push '(ts_fgc2_i . t) sm))))
     (when sm
-      (push `((ty . "as") (st . "text") (si . ,position) (ei . ,end)
-              (sm . ,(nreverse sm)))
-            commands))
+      (let* ((whole (and (zerop offset)
+                         (length= (plist-get entry :cells) size)))
+             (newline (1+ end))
+             (bullet (and whole list-styles (<= newline (length list-styles))
+                          (aref list-styles (1- newline)))))
+        (push `((ty . "as") (st . "text") (si . ,position) (ei . ,(if whole newline end))
+                (sm . ,(reverse sm)))
+              commands)
+        (when (alist-get 'ls_id bullet)
+          (let ((ls-ts (copy-alist (alist-get 'ls_ts bullet))))
+            (dolist (entry sm)
+              (setf (alist-get (car entry) ls-ts) (cdr entry)))
+            (push `((ty . "as") (st . "list") (si . ,newline) (ei . ,newline)
+                    (sm (ls_ts . ,ls-ts)))
+                  commands)))))
     (unless (equal (cdr from) (cdr to))
       (push `((ty . "as") (st . "link") (si . ,position) (ei . ,end)
               (sm . ,(gdocs--link-sm (cdr to))))
@@ -7588,27 +7616,40 @@ at their start and end."
 (defun gdocs--paragraph-pairs (old new)
   "Return the pairs (I . J) where NEW[J] is paragraph OLD[I] edited.
 OLD and NEW are vectors.  Similar paragraphs, see
-`gdocs--paragraphs-similar-p', anchor the pairing as a longest common
-subsequence.  Between two anchors, as many old as new paragraphs with the
+`gdocs--paragraphs-similar-p', anchor the pairing as a heaviest common
+subsequence, where an unchanged paragraph weighs more than a similar one:
+a paragraph is not rewritten into a similar new one when it also appears
+unchanged.  Between two anchors, as many old as new paragraphs with the
 same structures pair one to one: that is a rewrite, not a replacement.
 The pairs are in ascending order."
   (let* ((n (length old)) (m (length new)) (width (1+ m))
          (table (make-vector (* (1+ n) width) 0))
+         (weight (lambda (x y)
+                   (cond ((gdocs--paragraph-equal-p (aref old x) (aref new y)) 3)
+                         ((gdocs--paragraphs-similar-p (aref old x) (aref new y)) 2)
+                         (t 0))))
+         (weights (make-vector (* (1+ n) width) 0))
          (i 0) (j 0) anchors pairs (previous-i 0) (previous-j 0))
     (cl-loop for x from (1- n) downto 0
              do (cl-loop for y from (1- m) downto 0
-                         do (aset table (+ (* x width) y)
-                                  (if (gdocs--paragraphs-similar-p (aref old x) (aref new y))
-                                      (1+ (aref table (+ (* (1+ x) width) (1+ y))))
-                                    (max (aref table (+ (* (1+ x) width) y))
+                         do (let ((w (funcall weight x y)))
+                              (aset weights (+ (* x width) y) w)
+                              (aset table (+ (* x width) y)
+                                    (max (if (> w 0)
+                                             (+ w (aref table (+ (* (1+ x) width) (1+ y))))
+                                           0)
+                                         (aref table (+ (* (1+ x) width) y))
                                          (aref table (+ (* x width) (1+ y))))))))
     (while (and (< i n) (< j m))
-      (cond ((gdocs--paragraphs-similar-p (aref old i) (aref new j))
-             (push (cons i j) anchors) (cl-incf i) (cl-incf j))
-            ((>= (aref table (+ (* (1+ i) width) j))
-                 (aref table (+ (* i width) (1+ j))))
-             (cl-incf i))
-            (t (cl-incf j))))
+      (let ((w (aref weights (+ (* i width) j))))
+        (cond ((and (> w 0)
+                    (= (aref table (+ (* i width) j))
+                       (+ w (aref table (+ (* (1+ i) width) (1+ j))))))
+               (push (cons i j) anchors) (cl-incf i) (cl-incf j))
+              ((>= (aref table (+ (* (1+ i) width) j))
+                   (aref table (+ (* i width) (1+ j))))
+               (cl-incf i))
+              (t (cl-incf j)))))
     (dolist (anchor (append (nreverse anchors) (list (cons n m))))
       (let ((old-gap (- (car anchor) previous-i))
             (new-gap (- (cdr anchor) previous-j)))
@@ -7675,11 +7716,38 @@ is the `ue' operation that Google Docs itself sends."
                     (epm (dde-sii . ,(alist-get 'di-id option))
                          (dde-fdv . ,(alist-get 'di-dv option)))))))
 
-(defun gdocs--paragraph-text-edits (index before after entities &optional lead)
+(defun gdocs--real-attributes (cells before decoded lead from to)
+  "Return CELLS with the real attributes of the text they sit next to.
+CELLS are inserted between cells FROM and TO of BEFORE, the paragraph's
+Org view, whose cell K is cell K+LEAD of DECODED, the paragraph as
+decoded.  An Org view may show less than the paragraph holds, such as a
+paragraph rendered without emphasis so that it reads back exactly.  A
+cell that looks like its neighbor in the Org view takes the neighbor's
+decoded attributes, so new text keeps the look of the text around it."
+  (let ((neighbors (delq nil (list (and (> from 0) (1- from))
+                                   (and (length> before to) to)))))
+    (mapcar
+     (lambda (cell)
+       (if (nth 3 cell)
+           cell
+         (let ((match (seq-find (lambda (k)
+                                  (and (null (nth 3 (aref before k)))
+                                       (equal (gdocs--cell-attributes cell)
+                                              (gdocs--cell-attributes (aref before k)))
+                                       (length> decoded (+ k lead))))
+                                neighbors)))
+           (if match
+               (let ((real (aref decoded (+ match lead))))
+                 (append (list (nth 0 cell) (nth 1 real) (nth 2 real)) (nthcdr 3 cell)))
+             cell))))
+     cells)))
+
+(defun gdocs--paragraph-text-edits (index before after entities &optional lead decoded)
   "Return the in-place edits that turn paragraph BEFORE into AFTER.
 INDEX is the paragraph's position among the decoded tab paragraphs and
 ENTITIES the document's entity table.  BEFORE's text starts LEAD cells
-into the decoded paragraph, see `gdocs--cells-shown-offset'.  Return
+into DECODED, the cells of the decoded paragraph, see
+`gdocs--cells-shown-offset' and `gdocs--real-attributes'.  Return
 `:restructure' when the edit changes a table's rows or cells: such a
 table is replaced whole."
   (let* ((before-cells (gdocs--paragraph-cells before))
@@ -7705,9 +7773,14 @@ table is replaced whole."
                 (push (list :index index :offset offset
                             :delete (- (nth 1 part) (nth 0 part))
                             :insert (vconcat (gdocs--created-cells
-                                              (append (seq-subseq after-cells (nth 2 part)
-                                                                  (nth 3 part))
-                                                      nil)
+                                              (let ((cells (append (seq-subseq after-cells (nth 2 part)
+                                                                               (nth 3 part))
+                                                                   nil)))
+                                                (if decoded
+                                                    (gdocs--real-attributes
+                                                     cells before-cells decoded (or lead 0)
+                                                     (nth 0 part) (nth 1 part))
+                                                  cells))
                                               entities)))
                       edits))))))
       (dolist (span (gdocs--cells-restyles before-cells after-cells hunks))
@@ -7785,12 +7858,20 @@ table whose rows or cells change is replaced whole."
                                     (gdocs--paragraph-cells before)))))
                    (paragraph-edits (and located
                                          (gdocs--paragraph-text-edits
-                                          anchor before after entities located))))
+                                          anchor before after entities located
+                                          (plist-get entry :cells)))))
               (cond
                ((and located (not (eq paragraph-edits :restructure)))
                 (setq edits (append paragraph-edits edits))
                 (when-let* ((id (gdocs--heading-id-change after (nth anchor raw) raw)))
                   (push (list :index anchor :heading-id id
+                              :offset (length (plist-get entry :cells)))
+                        edits))
+                (when (and (eq (plist-get after :glyph) :checkbox)
+                           (eq (plist-get (nth anchor raw) :glyph) :checkbox)
+                           (not (eq (plist-get after :checked)
+                                    (plist-get (nth anchor raw) :checked))))
+                  (push (list :index anchor :checked (plist-get after :checked)
                               :offset (length (plist-get entry :cells)))
                         edits)))
                ((gdocs--paragraph-equal-p before after))
@@ -7969,7 +8050,9 @@ An addition after the last paragraph starts one past the tab's text."
   "Return the order of EDIT among edits at one position, lowest first.
 The characters at a position are restyled or replaced, and paragraphs
 removed from it, before paragraphs are added in front of it."
-  (cond ((or (plist-member edit :length) (plist-member edit :heading-id)) 0)
+  (cond ((or (plist-member edit :length) (plist-member edit :heading-id)
+             (plist-member edit :checked))
+         0)
         ((plist-member edit :offset) 1)
         ((plist-member edit :remove) 2)
         (t 3)))
@@ -8062,7 +8145,8 @@ save.  Entities left without an attachment are deleted, see
         (cond
          ((plist-member edit :length)
           (setq commands (append commands (gdocs--surgical-restyle-commands
-                                           edit table (plist-get context :text))))
+                                           edit table (plist-get context :text)
+                                           (plist-get context :list))))
           (push (list :ot-start start :ot-end (+ start (plist-get edit :length) -1)
                       :delete-count 0 :restyle t)
                 ranges))
@@ -8070,6 +8154,11 @@ save.  Entities left without an attachment are deleted, see
           (setq commands (append commands
                                  (list (gdocs--heading-id-command
                                         start (plist-get edit :heading-id)))))
+          (push (list :ot-start start :ot-end start :delete-count 0 :restyle t) ranges))
+         ((plist-member edit :checked)
+          (setq commands (append commands
+                                 (list `((ty . "as") (st . "list") (si . ,start) (ei . ,start)
+                                         (sm (ls_c (c_cs . ,(if (plist-get edit :checked) 1 0))))))))
           (push (list :ot-start start :ot-end start :delete-count 0 :restyle t) ranges))
          ((plist-get edit :update)
           (setq commands (append commands (list (plist-get edit :update))))
@@ -8163,11 +8252,14 @@ tab.  `gdocs--tab-prediction-matches-p' compares a fresh state with it."
   (let ((by-index (make-hash-table))
         (added (make-hash-table))
         (heading-ids (make-hash-table))
+        (checks (make-hash-table))
         (removed nil)
         (out nil))
     (dolist (edit edits)
       (cond ((plist-member edit :heading-id)
              (puthash (plist-get edit :index) (plist-get edit :heading-id) heading-ids))
+            ((plist-member edit :checked)
+             (puthash (plist-get edit :index) (if (plist-get edit :checked) :yes :no) checks))
             ((plist-member edit :add)
              (puthash (plist-get edit :index)
                       (append (gethash (plist-get edit :index) added)
@@ -8182,7 +8274,9 @@ tab.  `gdocs--tab-prediction-matches-p' compares a fresh state with it."
                          do (push (append (list :class (gdocs--prediction-class paragraph)
                                                 :cells (gdocs--prediction-cells (plist-get item :cells)))
                                           (and (plist-get paragraph :heading-id)
-                                               (list :heading-id (plist-get paragraph :heading-id))))
+                                               (list :heading-id (plist-get paragraph :heading-id)))
+                                          (and (eq (plist-get paragraph :glyph) :checkbox)
+                                               (list :checked (and (plist-get paragraph :checked) t))))
                                   out)
                          when (and (eq (plist-get paragraph :kind) :table)
                                    (or rest (length> raw index)))
@@ -8219,7 +8313,11 @@ tab.  `gdocs--tab-prediction-matches-p' compares a fresh state with it."
                                                cells))))))
              (append (list :class (gdocs--prediction-class paragraph) :cells cells)
                      (and (gethash index heading-ids)
-                          (list :heading-id (gethash index heading-ids)))))
+                          (list :heading-id (gethash index heading-ids)))
+                     (and (eq (plist-get paragraph :glyph) :checkbox)
+                          (list :checked (if (gethash index checks)
+                                             (eq (gethash index checks) :yes)
+                                           (and (plist-get paragraph :checked) t))))))
            out))
       (emit-added (length raw)))
     (nreverse out)))
@@ -8227,7 +8325,8 @@ tab.  `gdocs--tab-prediction-matches-p' compares a fresh state with it."
 (defun gdocs--tab-prediction-matches-p (prediction state tab-id doc-id)
   "Return non-nil when TAB-ID of STATE decodes to PREDICTION.
 DOC-ID names the document.  Text, objects and Org-visible styles must
-match paragraph by paragraph, and so must the heading ids the plan gives."
+match paragraph by paragraph, and so must the heading ids the plan gives
+and the state of checklist items."
   (let* ((scoped (gdocs--state-for-tab state tab-id))
          (raw (gdocs-dm-paragraphs
                (gdocs--tab-model
@@ -8241,6 +8340,8 @@ match paragraph by paragraph, and so must the heading ids the plan gives."
                         (gdocs--prediction-class paragraph))
                  (or (null (plist-get expected :heading-id))
                      (equal (plist-get expected :heading-id) (plist-get paragraph :anchor)))
+                 (or (not (plist-member expected :checked))
+                     (eq (plist-get expected :checked) (and (plist-get paragraph :checked) t)))
                  (equal (plist-get expected :cells)
                         (gdocs--prediction-cells (gdocs--paragraph-cells paragraph)))))
           raw prediction))))
@@ -8637,6 +8738,9 @@ defined once."
                       (ps_ifl . ,(or (alist-get 'b_ifl level) (+ 18.0 (* 36 google-nest))))
                       (ps_ifl_i . :json-false))))))
           (setf (alist-get 'ls_nest list-sm) google-nest)
+          (when (eq (plist-get paragraph :glyph) :checkbox)
+            (setf (alist-get 'ls_c list-sm)
+                  `((c_cs . ,(if (plist-get paragraph :checked) 1 0)))))
           (push `((ty . "as") (st . "list") (si . ,newline) (ei . ,newline) (sm . ,list-sm))
                 commands)
           (push (cons :paragraph paragraph-sm) commands))
@@ -8648,7 +8752,12 @@ defined once."
                                            (list (cons fresh (plist-get paragraph :glyph)))))
                         (push definition commands))
                       fresh))))
-        (push (gdocs--emit-list-style-op id nest newline) commands)
+        (push (let ((op (gdocs--emit-list-style-op id nest newline)))
+                (when (eq (plist-get paragraph :glyph) :checkbox)
+                  (setf (alist-get 'ls_c (alist-get 'sm op))
+                        `((c_cs . ,(if (plist-get paragraph :checked) 1 0)))))
+                op)
+              commands)
         (push (cons :paragraph `((ps_il . ,(+ 36.0 (* 36 nest))) (ps_il_i . :json-false)
                                  (ps_ifl . ,(+ 18.0 (* 36 nest))) (ps_ifl_i . :json-false)))
               commands)))
@@ -9866,6 +9975,10 @@ excluded. Numeric and user-named Org footnotes remain pushable content."
            (end (gdocs--find-local-subtree-start body-start))
            (text (buffer-substring-no-properties body-start end))
            (text (replace-regexp-in-string "\r\n" "\n" text))
+           ;; One blank line before the `* Comments' heading is padding.
+           (text (if (and (< end (point-max)) (string-suffix-p "\n\n" text))
+                     (substring text 0 -1)
+                   text))
            ;; The reserved namespace belongs only to Google's generated
            ;; comment projection; ordinary Org footnotes are user content.
            (text (replace-regexp-in-string
@@ -10648,13 +10761,13 @@ marker are required so unrelated local-marked subtrees remain pushable."
             (let ((drawer (buffer-substring-no-properties
                            (match-beginning 0) (match-end 0))))
               (when (string-match-p "^:GDOC_LOCAL:[ \t]+t[ \t]*$" drawer)
+                ;; Blank lines before the heading are kept: all but one
+                ;; are empty paragraphs, see `gdocs--buffer-body-as-plain'.
                 (setq found
                       (save-excursion
                         (goto-char head-bol)
                         (skip-chars-backward " \t\n" start)
-                        (if (= (point) start)
-                            start
-                          (min head-bol (1+ (line-end-position)))))))))))
+                        (if (= (point) start) start head-bol))))))))
       (or found (point-max)))))
 
 (defun gdocs--export-txt-length (doc-id)

@@ -32,7 +32,11 @@ outside the markers and links). Pull parses its own Org text back. A paragraph
 whose text does not read back exactly is rendered again without emphasis. If  
 it still does not read back, for example plain text that starts with `- `, its  
 markup characters are protected by invisible characters (U+2060 before, U+200C  
-after) that push removes.  
+after) that push removes. In a link description, brackets, underscores and  
+backslashes are surrounded by U+2060 (word joiner) for the same reason. Org does  
+not count U+2060 as whitespace, so emphasis around such a description still  
+parses. A real U+2060 or U+200C in a description is doubled. Older pulls used  
+U+200B, which push still removes.  
 Comments are pulled into an editable local-only, ephemeral projection. Comments  
 with unambiguous anchors get reserved `[fn:gdocs-comment-N]` references, and all  
 fetched comments are listed in a local `* Comments` subtree. You may edit that  
@@ -130,19 +134,13 @@ or otherwise indeterminate outcomes fail closed without a final hash baseline.
 Pull/render uses a structural spacing policy rather than rewriting the final
 text with a regular expression:
 
-- heading, `#+title:`, and `#+subtitle:` entries have exactly one blank line
-before and after them when neighboring content exists;
-- consecutive Google Docs empty paragraphs are reduced to one meaningful Org
-blank line, while leading/trailing empty paragraphs are discarded;
-- empty paragraphs between source-code paragraphs remain empty source lines,
-and heading padding is never inserted inside a source block;
-- lists stay contiguous unless the source contains a meaningful blank
-paragraph.
+- every Google Docs empty paragraph is one Org blank line, including empty paragraphs at the start and end of the document or tab;
+- between two entries one of which is a heading, `#+title:`, or `#+subtitle:`, one more blank line is padding: a heading directly after a paragraph has one blank line before it, and a heading after one empty paragraph has two;
+- one blank line before the next tab heading and before the generated `* Comments` heading is padding too;
+- empty paragraphs between source-code paragraphs remain empty source lines, and heading padding is never inserted inside a source block;
+- lists stay contiguous unless a blank line separates them.
 
-Repeated empty paragraphs are intentionally handled lossily: Google Docs'
-arbitrary visual vertical spacing has no stable Org equivalent. The normalized
-paragraph model is also used by the OT emitter and paragraph diff, so a
-synthetic heading blank cannot become a new remote paragraph on every cycle.
+Add or remove empty paragraphs by adding or removing blank lines. Push parses blank lines with the same rule, so padding never becomes a new remote paragraph.
 
 ### Supported content
 
@@ -316,7 +314,13 @@ active.
 
 For a document with multiple tabs, pull puts every tab in the same Org buffer. Each tab is a heading with a `GDOC_TAB` property; nested tabs become nested headings, and headings within a tab are shifted below its heading. The document name appears once as the file's `#+title:`. A tab emoji appears both in its heading and in `GDOC_TAB_ICON`. The document's original tab may have an icon and may sit anywhere in the tab order. An empty tab pulls as an empty heading. Opening a URL with `?tab=…` moves to that tab after pull. Single-tab documents keep their existing unwrapped layout.
 
-Push to a multi-tab document saves one changed tab per push. Changes inside existing paragraphs, including headings, list items and table cells, are written in place: only the changed characters are deleted, inserted or restyled. Colors, fonts, comments, bookmarks, chips, and paragraph and list formatting stay on the text they belong to. Google gives inserted text the style of the character before it, so new text that should look different copies the full style of the nearest text with the same link and code formatting.
+Push to a multi-tab document saves one changed tab per push. Changes inside existing paragraphs, including headings, list items and table cells, are written in place: only the changed characters are deleted, inserted or restyled. Colors, fonts, comments, bookmarks, chips, and paragraph and list formatting stay on the text they belong to. Google gives inserted text the style of the character before it, so new text that should look different copies the full style of the nearest text with the same link and code formatting. Org may show a paragraph with less styling than it has, for example without an underline that Org cannot express; text inserted next to text that looks the same in Org takes that text's real style.
+
+A restyle of a paragraph's whole text, such as striking a whole list item, also restyles its newline and its bullet, as the Google Docs editor does.
+
+Push pairs each old paragraph with its new version before it computes edits. A paragraph that appears unchanged in the new text is kept, rather than rewritten into a similar new paragraph next to it.
+
+Google Docs checklists show as Org checkboxes, `- [ ] item` and `- [X] item`. Changing a box checks or unchecks the item. A new item with a checkbox becomes a checklist item with that state. The partial state `[-]` has no Google equivalent and stays literal text.
 
 Paragraphs of any kind can be added or removed whole, at any place in the tab, including after its last paragraph:
 
@@ -446,7 +450,7 @@ and requires browser-session cookie authentication. OAuth bearer tokens can be
 used for reads but do not support `/save`; there is no hardened credential story
 yet.
 - **Format fidelity is best-effort.** Headings, paragraphs, inline emphasis, lists, tables, and code blocks round-trip.
-- **Disclosed fallbacks, not silent loss.** Blocks the remote model cannot represent (quote/verse/center/example/special blocks, footnote definitions, horizontal rules, fixed-width lines) keep their text as ordinary content with a disclosed fallback instead of disappearing. Inline leaves (timestamps, entities, LaTeX fragments, footnote references, macros) are literalized in prose. Source-block language, checkbox structure inside lists, and rich Google-only formatting have no faithful round trip.
+- **Disclosed fallbacks, not silent loss.** Blocks the remote model cannot represent (quote/verse/center/example/special blocks, footnote definitions, horizontal rules, fixed-width lines) keep their text as ordinary content with a disclosed fallback instead of disappearing. Inline leaves (timestamps, entities, LaTeX fragments, footnote references, macros) are literalized in prose. Source-block language, the partial checkbox state `[-]`, and rich Google-only formatting such as font sizes have no faithful round trip.
 - **Inline images are placeholders.** Image bytes are never downloaded or uploaded. In a multi-tab document, push can delete an image or copy one already in the document. In a single-tab document, push only keeps images untouched.
 - **Comments** are pulled as an editable local-only footnote and `* Comments` projection, stripped before push, and regenerated from remote comments on the next pull; local edits are never sent to Google. Suggestions and column layouts remain out of scope.
 - **Rate limiting.** Google's `/save` endpoint rejects malformed or excessively bursty requests; the mode persists a session SID to look like a single stable client.  The endpoint reads that SID as a signed 64-bit integer and permanently refuses one with the top bit set (HTTP 550 / err 13), so the mode only generates SIDs below 2^63 and replaces an out-of-range SID it finds in `gdocs-session-file`.

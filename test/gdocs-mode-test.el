@@ -1122,7 +1122,7 @@ commented item and a link; `t.kid', a child of the original tab, is empty."
                                      (copy-sequence (plist-get paragraph :runs)))
                                    (gdocs-dm-paragraphs (gdocs-dm-from-org body))))))
     (should (string-search
-             (concat "- [[gdocs-chip:file:kix.f:" gdocs-test--file-url "][\u200b[\u200bDraft\u200b]\u200b Plan]]\n")
+             (concat "- [[gdocs-chip:file:kix.f:" gdocs-test--file-url "][\u2060[\u2060Draft\u2060]\u2060 Plan]]\n")
              body))
     (should-not (string-search (string gdocs--ot-chip-codepoint) body))
     (should (equal (plist-get object :entity-id) "kix.f"))
@@ -1198,7 +1198,7 @@ commented item and a link; `t.kid', a child of the original tab, is empty."
        ((ty . "te") (id . "kix.ph") (spi . 15))))))
 
 (defconst gdocs-test--open-chip
-  "[[gdocs-chip:dropdown:kix.dd][\u200b[\u200bOpen\u200b]\u200b]]"
+  "[[gdocs-chip:dropdown:kix.dd][\u2060[\u2060Open\u2060]\u2060]]"
   "The Org link of the dropdown in `gdocs-test--dropdown-state'.")
 
 (ert-deftest gdocs-test-dropdown-and-placeholder-chips-render ()
@@ -1335,6 +1335,89 @@ A link also points to an id that no heading has yet."
     (should (equal (alist-get 'ls_nest (alist-get 'sm binding)) 0))
     (should (equal (alist-get 'ps_il (alist-get 'sm (car (gdocs-test--commands-of plan "as" "paragraph"))))
                    72.0))))
+
+(ert-deftest gdocs-test-tab-keeps-trailing-empty-paragraphs ()
+  "A tab's trailing empty paragraphs survive extraction; padding does not count."
+  (let* ((state (gdocs-test--one-tab-state "Text\n\n\n"))
+         (body (car (gdocs--render-tab-tree (plist-get state :tabs) 7 "d")))
+         (local (alist-get "t.work" (gdocs--remote-tab-bodies state "d") nil nil #'equal)))
+    (should (string-search ":END:\nText\n\n\n\n* Root" body))
+    (should (equal local "Text\n\n\n"))
+    (should (equal (mapcar (lambda (paragraph) (plist-get paragraph :kind))
+                           (gdocs-dm-paragraphs (gdocs-dm-from-org local)))
+                   '(:para :blank :blank)))
+    (should-not (gdocs--tab-push-plan "d" state body))
+    (should (equal (plist-get (plist-get (gdocs--tab-push-plan
+                                          "d" state (string-replace "Text\n\n\n\n" "Text\n\n\n" body))
+                                         :plan)
+                              :commands)
+                   '(((ty . "ds") (si . 7) (ei . 7)))))))
+
+(ert-deftest gdocs-test-comments-section-padding-is-not-content ()
+  "The blank line before `* Comments' is padding, not an empty paragraph."
+  (with-temp-buffer
+    (insert ":PROPERTIES:\n:GDOC_ID: d\n:END:\n"
+            (gdocs--append-comments-section "Body\n\n" '((1 :text "note" :anchor "kix.a"))))
+    (org-mode)
+    (should (equal (gdocs--buffer-body-as-plain) "Body\n\n"))))
+
+(defun gdocs-test--checklist-state (&optional checked)
+  "Return a state with a two-item checklist; the first item is CHECKED."
+  (let ((body "Do this\nDo that\nTail\n"))
+    (gdocs-test--one-tab-state
+     body
+     `(((ty . "ae") (et . "list") (id . "kix.c")
+        (epm (le_nb (nl_0 (b_gt . 17) (b_gs . "") (b_gf . "%0") (b_il . 36.0) (b_ifl . 18.0)))))
+       ((ty . "as") (st . "list") (si . 8) (ei . 8)
+        (sm (ls_id . "kix.c") (ls_c (c_cs . ,(if checked 1 0)) (c_tdai))))
+       ((ty . "as") (st . "list") (si . 16) (ei . 16) (sm (ls_id . "kix.c")))
+       ;; A partial style later at the same position keeps the list.
+       ((ty . "as") (st . "list") (si . 16) (ei . 16) (sm (ls_c (c_cs . 0))))))))
+
+(ert-deftest gdocs-test-checklist-items-show-and-push-their-state ()
+  "A checklist renders Org checkboxes, and a changed box updates its item."
+  (let* ((state (gdocs-test--checklist-state t))
+         (body (car (gdocs--render-tab-tree (plist-get state :tabs) 7 "d")))
+         (unchecked (gdocs-test--state-plan state "- [X] Do this" "- [ ] Do this"))
+         (added (gdocs-test--state-plan state "- [ ] Do that\n" "- [ ] Do that\n- [X] Third\n")))
+    (should (string-search "- [X] Do this\n- [ ] Do that\n" body))
+    (should (equal (plist-get unchecked :commands)
+                   '(((ty . "as") (st . "list") (si . 8) (ei . 8) (sm (ls_c (c_cs . 0)))))))
+    (should (eq (plist-get (car (plist-get unchecked :expect)) :checked) nil))
+    (should (equal (alist-get 'ls_c (alist-get 'sm (car (gdocs-test--commands-of added "as" "list"))))
+                   '((c_cs . 1))))))
+
+(ert-deftest gdocs-test-new-text-keeps-the-real-style-of-its-neighbor ()
+  "Text typed in a paragraph whose Org view dropped a style keeps that style."
+  ;; Org cannot underline part of a word, so the line shows plain.
+  (let* ((body "Underline text\nTail\n")
+         (state (gdocs-test--one-tab-state
+                 body
+                 (list '((ty . "as") (st . "text") (si . 1) (ei . 5)
+                         (sm (ts_un . t) (ts_un_i . :json-false))))))
+         (rendered (car (gdocs--render-tab-tree (plist-get state :tabs) 7 "d")))
+         (line (seq-find (lambda (l) (string-search "line text" l))
+                         (split-string rendered "\n")))
+         (plan (gdocs-test--state-plan state line (string-replace "Under" "UnderX" line))))
+    (should (equal line "Underline text"))
+    (should (equal (car (plist-get plan :commands)) '((ty . "is") (ibi . 6) (s . "X"))))
+    (should-not (gdocs-test--commands-of plan "as" "text"))))
+
+(ert-deftest gdocs-test-whole-item-restyle-covers-newline-and-bullet ()
+  "Striking an item's whole text strikes its newline and bullet, like Docs."
+  (let* ((plan (gdocs-test--state-plan (gdocs-test--checklist-state) "- [ ] Do that" "- [ ] +Do that+"))
+         (commands (plist-get plan :commands)))
+    (should (equal (car commands)
+                   '((ty . "as") (st . "text") (si . 9) (ei . 16)
+                     (sm (ts_st . t) (ts_st_i . :json-false)))))
+    (should (equal (alist-get 'ts_st (alist-get 'ls_ts (alist-get 'sm (nth 1 commands)))) t))))
+
+(ert-deftest gdocs-test-pairing-prefers-an-unchanged-paragraph ()
+  "A paragraph that appears unchanged is not rewritten into a similar new one."
+  (let ((old (vector (list :kind :para :runs (list (gdocs-dm-make-run "X p.m. update")))))
+        (new (vector (list :kind :para :runs (list (gdocs-dm-make-run "X a.m. update")))
+                     (list :kind :para :runs (list (gdocs-dm-make-run "X p.m. update"))))))
+    (should (equal (gdocs--paragraph-pairs old new) '((0 . 1))))))
 
 (defun gdocs-test--table-state ()
   "Return a state whose tab holds a one-row table and no final newline."
@@ -2514,7 +2597,7 @@ END is the inclusive final OT position."
       (should (memq :italic (plist-get nested :styles))))))
 
 (ert-deftest gdocs-test-render-title-subtitle-headings-and-blank-padding ()
-  "Title keywords and repeated blank paragraphs render deterministically."
+  "Title keywords pad like headings; each empty paragraph is a blank line."
   (let* ((fixture (gdocs-test--fixture "styles"))
          (model (gdocs-dm-make-doc
                  :paragraphs
@@ -2526,10 +2609,10 @@ END is the inclusive final OT position."
                   (plist-get fixture :repeated-blank-model))))
          (org (gdocs-dm-to-org model)))
     (should (equal (gdocs-test--normalize-org org)
-                   "#+title: Same Name\n\n#+subtitle: A subtitle\n\nBefore\n\n** Heading\n\nAfter\n"))))
+                   "#+title: Same Name\n\n#+subtitle: A subtitle\n\nBefore\n\n\n\n** Heading\n\n\n\nAfter\n"))))
 
 (ert-deftest gdocs-test-canonical-heading-spacing-policy ()
-  "Heading-like entries use one idempotent blank line of padding."
+  "Heading-like entries get one blank line of padding besides their empties."
   (let ((para (lambda (kind text &optional level)
                 (list :kind kind
                       :level level
@@ -2548,17 +2631,22 @@ END is the inclusive final OT position."
                           (funcall blank)
                           (funcall blank)
                           (funcall para :para "After"))
-                    "Before\n\n** Heading\n\nAfter\n")
+                    "Before\n\n\n\n** Heading\n\n\n\nAfter\n")
               (cons (list (funcall para :heading "One" 1)
                           (funcall para :heading "Two" 1))
                     "* One\n\n* Two\n")))
       (should (equal (gdocs-dm-to-org
                       (gdocs-dm-make-doc
                        :paragraphs (car paragraphs-and-expected)))
-                     (cdr paragraphs-and-expected))))))
+                     (cdr paragraphs-and-expected)))
+      (should (equal (mapcar (lambda (paragraph) (plist-get paragraph :kind))
+                             (gdocs-dm-paragraphs
+                              (gdocs-dm-from-org (cdr paragraphs-and-expected))))
+                     (mapcar (lambda (paragraph) (plist-get paragraph :kind))
+                             (car paragraphs-and-expected)))))))
 
 (ert-deftest gdocs-test-canonical-blank-model-and-org-round-trip ()
-  "Repeated, edge, and meaningful blanks have a stable lossy policy."
+  "Every empty paragraph is a blank line, at the edges too, and reads back."
   (let ((para (lambda (kind text)
                 (list :kind kind
                       :runs (when text (list (gdocs-dm-make-run text)))))))
@@ -2575,14 +2663,15 @@ END is the inclusive final OT position."
                    (funcall para :blank nil))))
            (first (gdocs-dm-to-org model))
            (second (gdocs-dm-to-org (gdocs-dm-from-org first))))
-      (should (equal first "First\n\nSecond\n"))
-      (should (equal first second)))
-    ;; A blank between ordinary content and a list is meaningful; without it
-    ;; list entries remain contiguous with the preceding paragraph.
+      (should (equal first "\n\nFirst\n\n\nSecond\n\n\n"))
+      (should (equal first second))
+      (should (equal (mapcar (lambda (paragraph) (plist-get paragraph :kind))
+                             (gdocs-dm-paragraphs (gdocs-dm-from-org first)))
+                     '(:blank :blank :para :blank :blank :para :blank :blank))))
     (should (equal
              (gdocs-dm-to-org
               (gdocs-dm-from-org "Paragraph\n\n\n- one\n- two\n"))
-             "Paragraph\n\n- one\n- two\n"))
+             "Paragraph\n\n\n- one\n- two\n"))
     (should (equal
              (gdocs-dm-to-org
               (gdocs-dm-from-org "Paragraph\n- one\n- two\n"))
@@ -2620,8 +2709,8 @@ END is the inclusive final OT position."
                                  (funcall code "")
                                  (funcall code "beta"))))
              "* Code\n\n#+begin_src text\nalpha\n\nbeta\n#+end_src\n"))
-    ;; A generic blank between code paragraphs is normalized to the same
-    ;; empty source line rather than splitting the block.
+    ;; Each empty paragraph between code paragraphs is an empty source
+    ;; line, rather than splitting the block.
     (should (equal
              (gdocs-dm-to-org
               (gdocs-dm-make-doc
@@ -2629,18 +2718,18 @@ END is the inclusive final OT position."
                                  (list :kind :blank :runs nil)
                                  (list :kind :blank :runs nil)
                                  (funcall code "beta"))))
-             "#+begin_src text\nalpha\n\nbeta\n#+end_src\n"))))
+             "#+begin_src text\nalpha\n\n\nbeta\n#+end_src\n"))))
 
 (ert-deftest gdocs-test-canonical-spacing-does-not-create-diff-noise ()
   "Canonical render/parse cycles compare equal at paragraph granularity."
   (let* ((source "Before\n\n\n* Heading\n\n\nAfter\n")
          (first (gdocs-dm-to-org (gdocs-dm-from-org source)))
          (second (gdocs-dm-to-org (gdocs-dm-from-org first))))
-    (should (equal first "Before\n\n* Heading\n\nAfter\n"))
+    (should (equal first source))
     (should (equal first second))
     (should-not (gdocs--diff-paragraphs first second))
-    ;; Explicit Google blanks around a heading normalize to the same model as
-    ;; synthetic Org padding, so an incremental push has no spacing-only ops.
+    ;; One Google empty paragraph on each side of a heading is one blank line
+    ;; besides the padding, so an incremental push has no spacing-only ops.
     (let* ((old (gdocs-dm-make-doc
                  :paragraphs
                  (list (list :kind :para
@@ -3598,12 +3687,17 @@ END is the inclusive final OT position."
          (doc (gdocs-dm-from-org source))
          (paras (gdocs-dm-paragraphs doc)))
     (should (= (length paras) 3))
+    ;; A checkbox is a checklist item's state, not text.
     (should (equal (gdocs-dm-runs-text (plist-get (nth 0 paras) :runs))
-                   "[ ] unchecked item"))
+                   "unchecked item"))
+    (should (equal (mapcar (lambda (paragraph)
+                             (list (plist-get paragraph :glyph) (plist-get paragraph :checked)))
+                           paras)
+                   '((:checkbox nil) (:checkbox t) (:bullet nil))))
     ;; An indented line inside an item is one Org paragraph: its literal
     ;; newline and indent are preserved in the runs.
     (should (equal (gdocs-dm-runs-text (plist-get (nth 1 paras) :runs))
-                   "[X] done item\n  continued prose"))
+                   "done item\n  continued prose"))
     (should (equal (gdocs-dm-runs-text (plist-get (nth 2 paras) :runs))
                    "plain"))))
 
@@ -3754,7 +3848,7 @@ END is the inclusive final OT position."
                  3 "synthetic" nil ot-body
                  (cons (gdocs-test--insert-op ot-body) heading-styles)))
            (new (gdocs-dm-from-org
-                 "Before\n\n* Heading\n\nChanged\n\nMore\n"))
+                 "Before\n\n\n* Heading\n\n\nChanged\n\nMore\n"))
            (plan (gdocs-dm-to-incremental-save-plan old new))
            (commands (plist-get plan :commands))
            (ds (seq-find (lambda (cmd) (equal (alist-get 'ty cmd) "ds"))
@@ -3762,11 +3856,11 @@ END is the inclusive final OT position."
            (is (seq-find (lambda (cmd) (equal (alist-get 'ty cmd) "is"))
                          commands)))
       (should (eq (plist-get plan :kind) :incremental))
-      ;; The common prefix is Before + Heading (the raw blanks between them
-      ;; are normalization-only); the replaced raw mid ends the body.
-      (should (= (alist-get 'si ds) 17))
+      ;; The common prefix is Before, its empty paragraph, Heading and the
+      ;; empty paragraph after it; the replaced raw mid ends the body.
+      (should (= (alist-get 'si ds) 18))
       (should (= (alist-get 'ei ds) 23))
-      (should (= (alist-get 'ibi is) 17))
+      (should (= (alist-get 'ibi is) 18))
       ;; Applying the plan (deletion + insertion + shifted style ops) to
       ;; the raw body reproduces the new document.  Style ops for the
       ;; untouched prefix (the Heading's ps_hd) live on the server and are
@@ -4614,8 +4708,7 @@ re-emits the last paragraph so its paragraph style is written again."
          (with-ref (gdocs--inline-comment-refs
                     body "Text and named\n"
                     '(("kix.comment" 1 . 4)) comments))
-         (pulled (concat (string-trim-right with-ref) "\n\n"
-                         (gdocs--render-comments-section comments))))
+         (pulled (gdocs--append-comments-section with-ref comments)))
     (with-temp-buffer
       (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Title\n:END:\nOld\n")
       (org-mode)
