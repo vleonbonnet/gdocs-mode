@@ -37,12 +37,11 @@ backslashes are surrounded by U+2060 (word joiner) for the same reason. Org does
 not count U+2060 as whitespace, so emphasis around such a description still  
 parses. A real U+2060 or U+200C in a description is doubled. Older pulls used  
 U+200B, which push still removes.  
-Comments are pulled into an editable local-only, ephemeral projection. Comments  
-with unambiguous anchors get reserved `[fn:gdocs-comment-N]` references, and all  
-fetched comments are listed in a local `* Comments` subtree. You may edit that  
-projection locally, but only its reserved references and generated subtree are  
-stripped before push; ordinary numeric and named Org footnotes remain content.  
-Pull fails visibly if the remote body already uses the reserved namespace.
+Comments are pulled into a local `* Comments` subtree, see [Comments](#comments).  
+A thread with an unambiguous anchor gets a reserved `[fn:gdocs-comment-N]`  
+reference in the text. Only these references and the generated subtree are  
+stripped before a body push; ordinary numeric and named Org footnotes remain  
+content. Pull fails visibly if the remote body already uses the reserved namespace.
 - **Push** — converts the local Org buffer back to Google Docs format and
 writes it remotely. The configured `gdocs-push-backend` determines whether the
 push is a full replacement/re-encoding, a model-level incremental update, or a
@@ -141,6 +140,31 @@ text with a regular expression:
 - lists stay contiguous unless a blank line separates them.
 
 Add or remove empty paragraphs by adding or removing blank lines. Push parses blank lines with the same rule, so padding never becomes a new remote paragraph.
+
+### Comments
+
+Each comment thread is a `**` entry under `* Comments`, titled with its author and first line. The thread's text is the footnote definition that its reference in the text points to. Each reply is a `***` entry titled with its author and time; a reply that resolved or reopened its thread says so in its title. Every entry has its Google id in `GDOC_COMMENT`.
+
+```org
+** DONE Ann Example: Are these all scheduled?
+:PROPERTIES:
+:GDOC_COMMENT: doco.example
+:GDOC_RESOLVED: t
+:END:
+[fn:gdocs-comment-4] Are these all scheduled?
+
+*** Bob Example [2026-11-16 Mon 10:43]
+:PROPERTIES:
+:GDOC_COMMENT: doco.reply
+:END:
+Yes, all scheduled.
+```
+
+A resolved thread is `DONE`. To reply, add a `***` entry without an id under the thread: its body is the reply, or its title when the body is empty. To resolve a thread, mark it `DONE`; to reopen it, remove `DONE`. `:LOGGING: nil` on `* Comments` keeps Org from logging these state changes. Replies and state changes make the buffer dirty, so auto-sync sends them.
+
+A push sends comment changes before the body. Each change resends its thread, as Google returned it, with one new record, as the Docs editor does. The change is confirmed when the response shows the new record and the thread's state. The reply's entry then gets its id, and the thread its new `GDOC_RESOLVED`. A reply to a resolved thread reopens it, as in the Docs editor; a thread that stays `DONE` is then resolved again. Replies are posted as you. A new `**` entry without an id is not sent, since a new thread needs an anchor in the text; the push logs a warning.
+
+Each comment post raises the document revision without changing its text. After the posts, the document is fetched again; if its Org view did not change, the buffer takes the new revision, so a body edit in the same push is not refused.
 
 ### Supported content
 
@@ -452,5 +476,5 @@ yet.
 - **Format fidelity is best-effort.** Headings, paragraphs, inline emphasis, lists, tables, and code blocks round-trip.
 - **Disclosed fallbacks, not silent loss.** Blocks the remote model cannot represent (quote/verse/center/example/special blocks, footnote definitions, horizontal rules, fixed-width lines) keep their text as ordinary content with a disclosed fallback instead of disappearing. Inline leaves (timestamps, entities, LaTeX fragments, footnote references, macros) are literalized in prose. Source-block language, the partial checkbox state `[-]`, and rich Google-only formatting such as font sizes have no faithful round trip.
 - **Inline images are placeholders.** Image bytes are never downloaded or uploaded. In a multi-tab document, push can delete an image or copy one already in the document. In a single-tab document, push only keeps images untouched.
-- **Comments** are pulled as an editable local-only footnote and `* Comments` projection, stripped before push, and regenerated from remote comments on the next pull; local edits are never sent to Google. Suggestions and column layouts remain out of scope.
+- **Comments**: a push sends new replies and resolves or reopens threads. It cannot start a new thread, edit or delete a comment, or post as anyone but you. Suggestions and column layouts remain out of scope.
 - **Rate limiting.** Google's `/save` endpoint rejects malformed or excessively bursty requests; the mode persists a session SID to look like a single stable client.  The endpoint reads that SID as a signed 64-bit integer and permanently refuses one with the top bit set (HTTP 550 / err 13), so the mode only generates SIDs below 2^63 and replaces an out-of-range SID it finds in `gdocs-session-file`.

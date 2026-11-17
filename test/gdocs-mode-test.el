@@ -1357,7 +1357,8 @@ A link also points to an id that no heading has yet."
   "The blank line before `* Comments' is padding, not an empty paragraph."
   (with-temp-buffer
     (insert ":PROPERTIES:\n:GDOC_ID: d\n:END:\n"
-            (gdocs--append-comments-section "Body\n\n" '((1 :text "note" :anchor "kix.a"))))
+            (gdocs--append-comments-section
+             "Body\n\n" (list (list :id "doco.a" :anchor "kix.a" :text "note"))))
     (org-mode)
     (should (equal (gdocs--buffer-body-as-plain) "Body\n\n"))))
 
@@ -1418,6 +1419,326 @@ A link also points to an id that no heading has yet."
         (new (vector (list :kind :para :runs (list (gdocs-dm-make-run "X a.m. update")))
                      (list :kind :para :runs (list (gdocs-dm-make-run "X p.m. update"))))))
     (should (equal (gdocs--paragraph-pairs old new) '((0 . 1))))))
+
+;; -*- lexical-binding: t; -*-
+(defun gdocs-test--docos-author (name)
+  "Return a response author record for NAME."
+  (vector name nil "//photo" "42" t nil :json-false nil :json-false 1))
+
+(defun gdocs-test--docos-record (id thread text author time &optional action key)
+  "Return a response comment record shaped like Google's."
+  (vector id thread (vector "text/html" text) (vector "text/plain" text)
+          (gdocs-test--docos-author author) time time nil nil action key nil nil
+          (vector author nil (vector "//photo") t) :json-false nil nil nil [0 0 0] nil
+          (vector nil text)))
+
+(defun gdocs-test--docos-thread (id text author &rest options)
+  "Return a response thread bundle; OPTIONS are :replies :resolved :anchor."
+  (let ((record (gdocs-test--docos-record id id text author 1700000000000)))
+    (aset record 7 (and (plist-get options :replies)
+                        (vconcat (plist-get options :replies))))
+    (vector id record 1700000000000 1700000000000
+            (vector "doc" (vector "text/plain" "Title"))
+            (if (plist-get options :resolved) t :json-false) nil
+            (or (plist-get options :anchor) "kix.a"))))
+
+(defun gdocs-test--docos-response (threads &optional timestamp)
+  "Return a `/docos/p/sync' response body holding THREADS."
+  (concat ")]}'\n\n"
+          (json-serialize
+           (gdocs--docos-nulls
+            (vector (vector "sr" (vconcat threads) (or timestamp 1700000000001))
+                    (vector "di" 44))))))
+
+(defun gdocs-test--docos-sample ()
+  "Return a response with an open thread, a resolved one and an empty one."
+  (gdocs-test--docos-response
+   (list (gdocs-test--docos-thread
+          "doco.open" "Is this right?" "Ann"
+          :replies (list (gdocs-test--docos-record
+                          "doco.r1" "doco.open" "Yes" "Bob" 1700000100000)))
+         (gdocs-test--docos-thread
+          "doco.done" "Schedule it" "Cid" :resolved t :anchor "kix.b"
+          :replies (list (gdocs-test--docos-record
+                          "doco.r2" "doco.done" "" "Cid" 1700000200000 0)))
+         ;; Google returns some empty threads without a record.
+         (vector "doco.empty" nil 1 1 nil nil nil nil))))
+
+(defun gdocs-test--sample-threads ()
+  "Return the parsed threads of `gdocs-test--docos-sample'."
+  (plist-get (gdocs--parse-docos-threads (gdocs-test--docos-sample)) :threads))
+
+(ert-deftest gdocs-test-comment-threads-parse-with-state-and-actions ()
+  "Threads parse with authors, replies, actions and resolved state."
+  (let* ((parsed (gdocs--parse-docos-threads (gdocs-test--docos-sample)))
+         (threads (plist-get parsed :threads)))
+    (should (= (plist-get parsed :timestamp) 1700000000001))
+    (should (equal (mapcar (lambda (thread)
+                             (list (plist-get thread :id) (plist-get thread :author)
+                                   (and (plist-get thread :resolved) t)
+                                   (plist-get thread :anchor)))
+                           threads)
+                   '(("doco.open" "Ann" nil "kix.a") ("doco.done" "Cid" t "kix.b"))))
+    (should (equal (mapcar (lambda (reply)
+                             (list (plist-get reply :id) (plist-get reply :author)
+                                   (plist-get reply :text) (plist-get reply :action)))
+                           (append (plist-get (nth 0 threads) :replies)
+                                   (plist-get (nth 1 threads) :replies)))
+                   '(("doco.r1" "Bob" "Yes" nil) ("doco.r2" "Cid" "" 0))))))
+
+(ert-deftest gdocs-test-comment-threads-render-as-entries ()
+  "A thread is a `**' entry, DONE when resolved, with `***' replies."
+  (should (equal (gdocs--render-comments-section (gdocs-test--sample-threads))
+                 (concat
+                  "\n* Comments\n:PROPERTIES:\n:GDOC_LOCAL: t\n:LOGGING: nil\n:END:\n"
+                  "\n** Ann: Is this right?\n:PROPERTIES:\n:GDOC_COMMENT: doco.open\n:END:\n"
+                  "[fn:gdocs-comment-1] Is this right?\n"
+                  "\n*** Bob " (gdocs--comment-time 1700000100000)
+                  "\n:PROPERTIES:\n:GDOC_COMMENT: doco.r1\n:END:\nYes\n"
+                  "\n** DONE Cid: Schedule it\n:PROPERTIES:\n:GDOC_COMMENT: doco.done\n"
+                  ":GDOC_RESOLVED: t\n:END:\n"
+                  "[fn:gdocs-comment-2] Schedule it\n"
+                  "\n*** Cid " (gdocs--comment-time 1700000200000)
+                  " resolved\n:PROPERTIES:\n:GDOC_COMMENT: doco.r2\n:END:\n")))
+  (should (equal (gdocs--comment-text-lines "* not a heading\n\n\n[fn:1] x")
+                 "\u2060* not a heading\n\n\u2060[fn:1] x"))
+  (should (equal (gdocs--comment-thread-title (list :author "A" :text "see :tag:"))
+                 "A: see :tag: …")))
+
+(defmacro gdocs-test--with-comments-buffer (&rest body)
+  "Run BODY in an Org buffer holding a pulled doc with the sample comments."
+  (declare (indent 0))
+  `(with-temp-buffer
+     (insert ":PROPERTIES:\n:GDOC_ID: d\n:GDOC_REVISION: 3\n:END:\nBody\n"
+             (gdocs--render-comments-section (gdocs-test--sample-threads)))
+     (org-mode)
+     ,@body))
+
+(defun gdocs-test--add-reply (thread-id text)
+  "Add a new reply entry with TEXT at the end of thread THREAD-ID."
+  (goto-char (point-min))
+  (search-forward (concat ":GDOC_COMMENT: " thread-id "\n"))
+  (org-end-of-subtree t t)
+  (insert "\n*** Reply\n" text "\n"))
+
+(ert-deftest gdocs-test-comment-intents-come-from-entries ()
+  "New reply entries and changed DONE states are the only comment changes."
+  (gdocs-test--with-comments-buffer
+    (let ((clean (gdocs--current-body-hash)))
+      (should (equal (gdocs--local-comment-intents) '(nil . 0)))
+      (should (equal clean (secure-hash 'sha256 (gdocs--buffer-body-as-plain))))
+      (gdocs-test--add-reply "doco.open" "First line\nsecond line")
+      (goto-char (point-max))
+      (insert "\n*** Thanks!\n")
+      (goto-char (point-min))
+      (re-search-forward "^\\*\\* DONE ")
+      (replace-match "** " t t)
+      (goto-char (point-max))
+      (insert "\n** A new thread\n")
+      (let ((found (gdocs--local-comment-intents)))
+        (should (= (cdr found) 1))
+        (should (equal (mapcar (lambda (intent)
+                                 (list (plist-get intent :id) (plist-get intent :resolve)
+                                       (mapcar (lambda (reply) (plist-get reply :text))
+                                               (plist-get intent :replies))))
+                               (car found))
+                       '(("doco.open" nil ("First line\nsecond line"))
+                         ("doco.done" nil ("Thanks!"))))))
+      (should-not (equal clean (gdocs--current-body-hash)))
+      (should (equal (gdocs--buffer-body-as-plain) "Body\n")))))
+
+(ert-deftest gdocs-test-comment-posts-follow-the-docs-editor ()
+  "A reply to a resolved thread reopens it; a wanted state is set after."
+  (let ((plan (gdocs--comment-posts
+               (list (list :id "doco.done" :resolve t :marker 'thread-done
+                           :replies (list (list :marker 'reply :text "Done now")))
+                     (list :id "doco.open" :resolve nil :marker 'thread-open
+                           :replies (list (list :marker 'reply2 :text "Ok")))
+                     (list :id "doco.open" :resolve t :marker 'thread-open)
+                     (list :id "doco.done" :resolve t :marker 'thread-done)
+                     (list :id "doco.gone" :resolve t :marker 'gone))
+               (gdocs-test--sample-threads))))
+    (should (equal (car plan)
+                   '((:thread "doco.done" :text "Done now" :action 1 :resolved nil
+                              :marker reply)
+                     (:thread "doco.done" :action 0 :resolved t
+                              :baseline (:marker thread-done :resolved t))
+                     (:thread "doco.open" :text "Ok" :action nil :resolved nil
+                              :marker reply2
+                              :baseline (:marker thread-open :resolved nil))
+                     (:thread "doco.open" :action 0 :resolved t
+                              :baseline (:marker thread-open :resolved t))
+                     (:thread "doco.done"
+                              :baseline (:marker thread-done :resolved t)))))
+    (should (equal (cdr plan) '("comment thread doco.gone is gone")))))
+
+(ert-deftest gdocs-test-comment-request-is-shaped-like-the-client ()
+  "A post resends the thread with numbers for booleans and one new record."
+  (let* ((thread (car (gdocs-test--sample-threads)))
+         (author '(:name "Val" :photo "//p" :ouid "7" :email "v@x"))
+         (record (gdocs--docos-new-record author "a <b>\n&c" nil "key" 5))
+         (resolve (gdocs--docos-new-record author nil 0 "k2" 6))
+         (bundle (gdocs--docos-request-bundle (plist-get thread :bundle) record nil))
+         (root (aref bundle 1))
+         (replies (aref root 7)))
+    (should (equal record
+                   (vector nil nil ["text/html" "a &lt;b&gt;<br>&amp;c"]
+                           ["text/plain" "a <b>\n&c"]
+                           ["Val" nil "//p" "7" 1 nil 0 "v@x" nil nil nil nil 1]
+                           5 5 nil nil nil "key" 1)))
+    (should (equal resolve
+                   (vector nil nil nil nil
+                           ["Val" nil "//p" "7" 1 nil 0 "v@x" nil nil nil nil 1]
+                           6 nil nil nil 0 "k2" 1)))
+    (should (length= bundle 9))
+    (should (= (aref bundle 8) 1))
+    (should (= (aref bundle 5) 0))
+    ;; JSON booleans become numbers, as the client sends them.
+    (should (equal (aref (aref root 4) 4) 1))
+    (should (equal (aref (aref root 4) 6) 0))
+    (should (= (aref root 11) 0))
+    (should-not (aref root 14))
+    (should (length= replies 2))
+    (should (= (aref (aref replies 0) 11) 0))
+    (should (eq (aref replies 1) record))))
+
+(defun gdocs-test--docos-server (posts)
+  "Return a fake `gdocs--curl-async' that answers comment POSTS like Google.
+Each posted thread is pushed to POSTS and returned with ids for its new
+records and its resolved state."
+  (let ((count 0))
+    (lambda (_url _method _headers form callback)
+      (let* ((payload (gdocs--docos-json
+                       (decode-coding-string (url-unhex-string (substring form 2))
+                                             'utf-8)))
+             (bundle (aref (aref payload 0) 0))
+             (record (aref bundle 1)))
+        (push bundle (car posts))
+        (seq-doseq (reply (aref record 7))
+          (unless (aref reply 0)
+            (aset reply 0 (format "doco.new%d" (cl-incf count)))
+            (aset reply 11 nil)))
+        (funcall callback
+                 (gdocs-test--docos-response
+                  (list (vconcat (seq-subseq bundle 0 5)
+                                 (vector (eql (aref bundle 5) 1) nil (aref bundle 7))))
+                  (+ 1700000000002 count))
+                 200 nil)))))
+
+(defmacro gdocs-test--with-docos-stubs (posts &rest body)
+  "Run BODY with comment endpoints answered locally, recording into POSTS."
+  (declare (indent 1))
+  `(cl-letf* ((revision 3)
+              ((symbol-function 'gdocs--fetch-edit-page-async)
+               (lambda (_doc-id callback)
+                 (let ((current revision))
+                   (cl-incf revision 2)
+                   (funcall callback
+                            (list :token "t" :ouid "42" :revision current
+                                  :author '(:name "Val" :photo "//p" :ouid "42" :email "v@x"))
+                            "html" nil))))
+              ((symbol-function 'gdocs--remote-org-view) (lambda (&rest _) "same"))
+              ((symbol-function 'gdocs--docos-sync-raw-async)
+               (lambda (_doc-id _state callback)
+                 (funcall callback (gdocs-test--docos-sample) nil)))
+              ((symbol-function 'gdocs--docos-base-qs) (lambda (&rest _) "q"))
+              ((symbol-function 'gdocs--docos-headers) (lambda (&rest _) nil))
+              ((symbol-function 'gdocs--curl-async) (gdocs-test--docos-server ,posts)))
+     ,@body))
+
+
+(ert-deftest gdocs-test-comment-push-sends-and-records-each-change ()
+  "A reply on a resolved thread reopens it, then resolves it again."
+  (gdocs-test--with-comments-buffer
+    (gdocs-test--add-reply "doco.done" "Still done")
+    (let ((posts (list nil))
+          (result :pending))
+      (gdocs-test--with-docos-stubs posts
+        (gdocs--push-comments-async
+         "d" (current-buffer) (car (gdocs--local-comment-intents))
+         (lambda (err before after) (setq result (list err before after)))))
+      ;; The page is fetched again after the posts, at a later revision.
+      (should (equal result '(nil 3 5)))
+      (let ((sent (reverse (car posts))))
+        (should (length= sent 2))
+        (let* ((first (car (last (append (aref (aref (nth 0 sent) 1) 7) nil))))
+               (second (car (last (append (aref (aref (nth 1 sent) 1) 7) nil)))))
+          (should (equal (aref first 3) ["text/plain" "Still done"]))
+          (should (equal (aref first 9) 1))
+          (should (= (aref (nth 0 sent) 5) 0))
+          (should (null (aref second 3)))
+          (should (equal (aref second 9) 0))
+          (should (= (aref (nth 1 sent) 5) 1))))
+      (should (string-search "*** Reply\n:PROPERTIES:\n:GDOC_COMMENT: doco.new1\n:END:\nStill done"
+                             (buffer-string)))
+      (should (string-search ":GDOC_COMMENT: doco.done\n:GDOC_RESOLVED: t\n" (buffer-string)))
+      (should (equal (gdocs--local-comment-intents) '(nil . 0))))))
+
+(ert-deftest gdocs-test-comment-push-reopens-and-refuses-unconfirmed-posts ()
+  "Reopening sends a bare reopen record; a post Google does not show fails."
+  (gdocs-test--with-comments-buffer
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* DONE ")
+    (replace-match "** " t t)
+    (let ((posts (list nil)) (result :pending))
+      (gdocs-test--with-docos-stubs posts
+        (gdocs--push-comments-async
+         "d" (current-buffer) (car (gdocs--local-comment-intents))
+         (lambda (err &rest _) (setq result err))))
+      (should (null result))
+      (should (length= (car posts) 1))
+      (should-not (string-search "GDOC_RESOLVED" (buffer-string))))
+    (gdocs-test--add-reply "doco.open" "Lost")
+    (let ((result :pending))
+      (gdocs-test--with-docos-stubs (list nil)
+        (cl-letf (((symbol-function 'gdocs--curl-async)
+                   (lambda (_url _method _headers _form callback)
+                     (funcall callback (gdocs-test--docos-sample) 200 nil))))
+          (gdocs--push-comments-async
+           "d" (current-buffer) (car (gdocs--local-comment-intents))
+           (lambda (err &rest _) (setq result err)))))
+      (should (string-match-p "does not show the new record" result))
+      (should (length= (car (gdocs--local-comment-intents)) 1)))))
+
+(ert-deftest gdocs-test-push-sends-comments-before-the-body ()
+  "A push with comment changes sends them, then pushes the body."
+  (gdocs-test--with-comments-buffer
+    (gdocs-test--add-reply "doco.open" "Hello")
+    (let ((calls nil))
+      (cl-letf (((symbol-function 'gdocs--push-comments-async)
+                 (lambda (_doc-id _buf intents callback)
+                   (push (list :comments (length intents)) calls)
+                   (funcall callback nil 3 5)))
+                ((symbol-function 'gdocs--push-remotely-async-1)
+                 (lambda (_doc-id _buf rev body owner)
+                   (push (list :body rev body) calls)
+                   (gdocs--sync-release owner))))
+        (gdocs-push-remotely))
+      ;; The posts raised the revision from 3 to 5 without changing the
+      ;; text, so the body push starts from 5.
+      (should (equal (nreverse calls) '((:comments 1) (:body "5" "Body\n"))))
+      (should (equal (org-entry-get (point-min) "GDOC_REVISION") "5")))))
+
+(ert-deftest gdocs-test-comment-posts-keep-a-changed-revision ()
+  "A revision whose text changed during the posts is not adopted."
+  (gdocs-test--with-comments-buffer
+    (gdocs-test--add-reply "doco.open" "Hi")
+    (let ((result nil))
+      (gdocs-test--with-docos-stubs (list nil)
+        (cl-letf (((symbol-function 'gdocs--remote-org-view)
+                   (let ((n 0)) (lambda (&rest _) (cl-incf n)))))
+          (gdocs--push-comments-async
+           "d" (current-buffer) (car (gdocs--local-comment-intents))
+           (lambda (&rest args) (setq result args)))))
+      (should (equal result '(nil 3 nil))))))
+
+(ert-deftest gdocs-test-edit-page-shows-the-comment-author ()
+  "The signed-in user's author record is read from the edit page."
+  (should (equal (gdocs--edit-page-author
+                  "x,[\"Val \\\"V\\\" L\",null,\"//lh3/a\\u003ds50\",\"42\",1,null,0,\"v@x.com\",0,1],1"
+                  "42")
+                 '(:name "Val \"V\" L" :photo "//lh3/a=s50" :ouid "42" :email "v@x.com")))
+  (should-not (gdocs--edit-page-author "[\"A\",null,\"//p\",\"43\",1,null,0,\"a@b\"]" "42")))
 
 (defun gdocs-test--table-state ()
   "Return a state whose tab holds a one-row table and no final newline."
@@ -3982,18 +4303,22 @@ re-emits the last paragraph so its paragraph style is written again."
                    '(("kix.synthetic-final-letter" 6 . 7))))))
 
 (ert-deftest gdocs-test-comment-response-parsing-and-reply-numbering ()
-  "Thread roots and replies are numbered in server order."
+  "Threads keep server order; only threads are numbered for references."
   (let* ((fixture (gdocs-test--fixture "comments"))
-         (comments (gdocs--parse-docos-sync-response
-                    (gdocs-test--comments-json fixture))))
-    (should (= (length comments) 3))
-    (should (= (car (nth 0 comments)) 1))
-    (should (equal (plist-get (cdr (nth 0 comments)) :text)
-                   "Root   comment"))
-    (should (= (car (nth 1 comments)) 2))
-    (should (equal (plist-get (cdr (nth 1 comments)) :anchor)
-                   "kix.synthetic-final-letter"))
-    (should (= (car (nth 2 comments)) 3))))
+         (threads (plist-get (gdocs--parse-docos-threads
+                              (gdocs-test--comments-json fixture))
+                             :threads)))
+    (should (equal (mapcar (lambda (thread) (plist-get thread :id)) threads)
+                   '("thread.synthetic.one" "thread.synthetic.two")))
+    (should (equal (mapcar (lambda (reply) (plist-get reply :text))
+                           (plist-get (car threads) :replies))
+                   '("A reply")))
+    (should (equal (gdocs--thread-comments threads)
+                   (mapcar (lambda (thread)
+                             (list (if (equal (plist-get thread :id) "thread.synthetic.one") 1 2)
+                                   :text (plist-get thread :text)
+                                   :anchor (plist-get thread :anchor)))
+                           (plist-get fixture :threads))))))
 
 (ert-deftest gdocs-test-comment-inline-anchor-at-final-letter ()
   "A final-letter anchor lands outside the closing emphasis marker."
@@ -4331,12 +4656,13 @@ re-emits the last paragraph so its paragraph style is written again."
 (ert-deftest gdocs-test-comment-whitespace-normalization-and-section ()
   "NBSP and horizontal whitespace normalize in the local comments subtree."
   (let* ((fixture (gdocs-test--fixture "comments"))
-         (comments (gdocs--parse-docos-sync-response
-                    (gdocs-test--comments-json fixture)))
-         (section (gdocs--render-comments-section comments)))
+         (threads (plist-get (gdocs--parse-docos-threads
+                              (gdocs-test--comments-json fixture))
+                             :threads))
+         (section (gdocs--render-comments-section threads)))
     (should (string-match-p "\\[fn:gdocs-comment-1\\] Root comment" section))
-    (should (string-match-p "\\[fn:gdocs-comment-2\\] A reply" section))
-    (should (string-match-p "\\[fn:gdocs-comment-3\\] Second comment" section))
+    (should (string-match-p ":END:\nA reply\n" section))
+    (should (string-match-p "\\[fn:gdocs-comment-2\\] Second comment" section))
     (should (equal (gdocs--normalize-comment-text "  a  \t b  ") "a b"))))
 
 (ert-deftest gdocs-test-comment-footnote-namespace-collision-is-visible ()
@@ -4422,9 +4748,13 @@ re-emits the last paragraph so its paragraph style is written again."
 
 (ert-deftest gdocs-test-append-comments-section-single-blank ()
   "Exactly one blank line separates the body from the Comments heading."
-  (let ((comments '((1 :text "Root" :anchor "kix.comment"))))
-    (should (equal (gdocs--append-comments-section "Body text" comments)
-                   "Body text\n\n* Comments\n:PROPERTIES:\n:GDOC_LOCAL: t\n:END:\n\n[fn:gdocs-comment-1] Root\n"))
+  (let ((threads (list (list :id "doco.a" :anchor "kix.comment" :author "Ann"
+                             :text "Root"))))
+    (should (equal (gdocs--append-comments-section "Body text" threads)
+                   (concat "Body text\n\n* Comments\n:PROPERTIES:\n:GDOC_LOCAL: t\n"
+                           ":LOGGING: nil\n:END:\n"
+                           "\n** Ann: Root\n:PROPERTIES:\n:GDOC_COMMENT: doco.a\n:END:\n"
+                           "[fn:gdocs-comment-1] Root\n")))
     (should (equal (gdocs--append-comments-section "Body text" nil)
                    "Body text"))))
 
@@ -4702,13 +5032,15 @@ re-emits the last paragraph so its paragraph style is written again."
 
 (ert-deftest gdocs-test-pull-render-push-preserves-user-footnotes ()
   "A pulled comment projection does not consume ordinary Org footnotes."
-  (let* ((comments '((1 :text "Root" :anchor "kix.comment")
-                     (2 :text "Reply" :anchor "kix.comment")))
+  (let* ((threads (list (list :id "doco.a" :anchor "kix.comment" :author "Ann"
+                              :text "Root"
+                              :replies (list (list :id "doco.b" :author "Bob"
+                                                   :text "Reply")))))
          (body "Text[fn:1] and named[fn:user-note]\n\n[fn:1] Numeric\n[fn:user-note] Named\n")
          (with-ref (gdocs--inline-comment-refs
                     body "Text and named\n"
-                    '(("kix.comment" 1 . 4)) comments))
-         (pulled (gdocs--append-comments-section with-ref comments)))
+                    '(("kix.comment" 1 . 4)) (gdocs--thread-comments threads)))
+         (pulled (gdocs--append-comments-section with-ref threads)))
     (with-temp-buffer
       (insert ":PROPERTIES:\n:GDOC_ID: synthetic-id\n:GDOC_TITLE: Title\n:END:\nOld\n")
       (org-mode)
@@ -4716,8 +5048,8 @@ re-emits the last paragraph so its paragraph style is written again."
                                      "Title" pulled)
       (should (string-match-p "Text\\[fn:gdocs-comment-1\\]\\[fn:1\\]"
                               (buffer-string)))
-      (should (string-match-p "\\[fn:gdocs-comment-2\\] Reply"
-                              (buffer-string)))
+      (should (string-search ":GDOC_COMMENT: doco.b\n:END:\nReply\n"
+                             (buffer-string)))
       (should (equal (gdocs--buffer-body-as-plain) body)))))
 
 (ert-deftest gdocs-test-pull-replaces-legacy-numeric-comment-refs ()
