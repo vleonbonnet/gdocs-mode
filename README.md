@@ -28,8 +28,11 @@ date chips. The semantic value behind the link is what push matching compares, s
 a reformatted description that parses to the same calendar date still matches. Rendered  
 tables pad their cells so every row shares the same display widths, and emphasis markers  
 are placed so Org actually parses the result (boundary whitespace moves  
-outside the markers; emphasis that Org could not parse is dropped rather than  
-emitted as literal markup).  
+outside the markers and links). Pull parses its own Org text back. A paragraph  
+whose text does not read back exactly is rendered again without emphasis. If  
+it still does not read back, for example plain text that starts with `- `, its  
+markup characters are protected by invisible characters (U+2060 before, U+200C  
+after) that push removes.  
 Comments are pulled into an editable local-only, ephemeral projection. Comments  
 with unambiguous anchors get reserved `[fn:gdocs-comment-N]` references, and all  
 fetched comments are listed in a local `* Comments` subtree. You may edit that  
@@ -152,14 +155,7 @@ as an explicit remote placeholder such as:
 #+gdocs_inline_object: image kix.example 468x102 content-id=s-blob-v1-IMAGE-example
 ```
 
-The placeholder is metadata, not prose and not an Org image link. Its entity
-ID, object kind, content ID, and dimensions form its stable identity. Do not
-edit, remove, move, or recreate it and then push: a full-replacement push is
-refused rather than silently deleting the remote image. A safe incremental edit
-may proceed only when the remote image is matched to its unchanged local
-placeholder and the edit range is proven not to touch it. Image creation,
-deletion, movement, duplication, metadata changes, and ambiguous
-entity-to-placeholder associations remain refused.
+The placeholder is metadata, not prose and not an Org image link. Its entity ID, object kind, content ID, and dimensions form its stable identity. Do not edit, remove, move, or recreate it and then push: a full-replacement push is refused rather than silently deleting the remote image. A safe incremental edit may proceed only when the remote image is matched to its unchanged local placeholder and the edit range is proven not to touch it. In a single-tab document, image creation, deletion, movement, duplication, metadata changes, and ambiguous entity-to-placeholder associations remain refused. A push to a multi-tab document can delete and copy images, see [Usage](#usage).
 
 Date and person smart chips follow the same policy with `date`/`person` object  
 kinds. They render as Org chip links such as  
@@ -167,8 +163,9 @@ kinds. They render as Org chip links such as
 `[[gdocs-chip:person:kix.example][Jane Doe]]`; Org hides the target and shows  
 only the description. The chip's semantic value (calendar date or contact name)  
 is the editable-identity field: an unchanged chip is preserved by incremental  
-edits that do not touch it, while creating, deleting, moving, or editing a chip  
-is refused before any `/save`.
+edits that do not touch it. In a single-tab document, creating, deleting,  
+moving, or editing a chip is refused before any `/save`. A push to a multi-tab  
+document can create, change and delete chips, see [Usage](#usage).
 
 ## Requirements
 
@@ -316,18 +313,31 @@ active.
 
 For a document with multiple tabs, pull puts every tab in the same Org buffer. Each tab is a heading with a `GDOC_TAB` property; nested tabs become nested headings, and headings within a tab are shifted below its heading. The document name appears once as the file's `#+title:`. A tab emoji appears both in its heading and in `GDOC_TAB_ICON`. The document's original tab may have an icon and may sit anywhere in the tab order. An empty tab pulls as an empty heading. Opening a URL with `?tab=…` moves to that tab after pull. Single-tab documents keep their existing unwrapped layout.
 
-Push to a multi-tab document saves one changed tab per push. Changes inside existing paragraphs, including headings and list items, are written in place: only the changed characters are deleted, inserted or restyled. Colors, fonts, comments, bookmarks, chips, and paragraph and list formatting stay on the text they belong to. Google gives inserted text the style of the character before it, so new text that should look different copies the full style of the nearest text with the same link and code formatting. A plain, heading or code paragraph can also be added or removed whole. A new paragraph is inserted at the start of the paragraph after it, which keeps that paragraph's formatting.
+Push to a multi-tab document saves one changed tab per push. Changes inside existing paragraphs, including headings, list items and table cells, are written in place: only the changed characters are deleted, inserted or restyled. Colors, fonts, comments, bookmarks, chips, and paragraph and list formatting stay on the text they belong to. Google gives inserted text the style of the character before it, so new text that should look different copies the full style of the nearest text with the same link and code formatting.
+
+Paragraphs of any kind can be added or removed whole, at any place in the tab, including after its last paragraph:
+
+- A new paragraph is inserted at the start of the paragraph after it, which keeps that paragraph's formatting. It gets the default paragraph style, and a heading gets its level.
+- A new list item joins the Google list that its Org list continues, with the indentation of that list's items. An Org list that continues no Google list becomes a new Google list.
+- A table whose rows or columns change is replaced whole. Cell text edits stay in place.
+- Removing the last paragraphs of a tab leaves no empty paragraph at its end.
+
+Chips and images can be added, changed and deleted:
+
+- A date chip is written `[[gdocs-chip:date:new][2026-11-20 Fri]]`. Changing the date of a chip that shows a time keeps that time.
+- A person chip needs an email. Write `[[gdocs-chip:person:jane@example.com][Jane Doe]]`, or use the name of a person chip already in the document.
+- A new image must reuse an image already in the document: copy its `#+gdocs_inline_object:` line. Uploading an image is not supported.
+- A deleted chip or image is deleted from the document, not only from the text.
+
+After a push that adds chips or images, the buffer is pulled again so that it shows their new identifiers. Deleting all of the text a comment is anchored to is allowed, but Google keeps the comment without an anchor, and the push logs a warning.
 
 The push refuses these changes before any `/save`:
 
 - edits in more than one tab
-- adding or removing list items, tables, images or chips
-- changing or deleting a chip or image
-- deleting all of the text a comment is anchored to
-- adding a paragraph after the tab's last paragraph
 - renaming, moving, adding or deleting tabs, or content outside the tab headings
+- changing a paragraph whose Org view does not read back exactly as its Google text, which the refusal names
 
-After each save the document is fetched again. The push is accepted only when exactly one revision was added and the other tabs are unchanged. The edited tab must also decode to the predicted text and Org-visible styles, and keep every entity and comment anchor. A save that commits but does not read back as planned is reported, and you should pull. A throttled save that left the document untouched is planned again from the fresh state and retried, up to five attempts. `gdocs-publish-file` still refuses multi-tab documents.
+After each save the document is fetched again. The push is accepted only when exactly one revision was added and the other tabs are unchanged. The edited tab must also decode to the predicted text and Org-visible styles. It must anchor exactly the expected entities and comments: the old ones less those the push deleted, plus those it created. A save that commits but does not read back as planned is reported, and you should pull. A throttled save that left the document untouched is planned again from the fresh state and retried, up to five attempts. `gdocs-publish-file` still refuses multi-tab documents.
 
 ### Source-file publication (one-way Org → Google Docs)
 
@@ -430,6 +440,6 @@ used for reads but do not support `/save`; there is no hardened credential story
 yet.
 - **Format fidelity is best-effort.** Headings, paragraphs, inline emphasis, lists, tables, and code blocks round-trip.
 - **Disclosed fallbacks, not silent loss.** Blocks the remote model cannot represent (quote/verse/center/example/special blocks, footnote definitions, horizontal rules, fixed-width lines) keep their text as ordinary content with a disclosed fallback instead of disappearing. Inline leaves (timestamps, entities, LaTeX fragments, footnote references, macros) are literalized in prose. Source-block language, checkbox structure inside lists, and rich Google-only formatting have no faithful round trip.
-- **Inline images are pull-only placeholders.** Downloading, uploading, moving, replacing, and deleting them through push are unsupported except for safe incremental text edits that prove the image was left untouched.
+- **Inline images are placeholders.** Image bytes are never downloaded or uploaded. In a multi-tab document, push can delete an image or copy one already in the document. In a single-tab document, push only keeps images untouched.
 - **Comments** are pulled as an editable local-only footnote and `* Comments` projection, stripped before push, and regenerated from remote comments on the next pull; local edits are never sent to Google. Suggestions and column layouts remain out of scope.
 - **Rate limiting.** Google's `/save` endpoint rejects malformed or excessively bursty requests; the mode persists a session SID to look like a single stable client.  The endpoint reads that SID as a signed 64-bit integer and permanently refuses one with the top bit set (HTTP 550 / err 13), so the mode only generates SIDs below 2^63 and replaces an out-of-range SID it finds in `gdocs-session-file`.

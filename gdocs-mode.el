@@ -267,6 +267,13 @@ down.")
                (upcase (symbol-name level))
                (apply #'format format-string args)))))
 
+(defun gdocs--org-scratch-mode ()
+  "Turn on Org mode in a buffer that is only parsed, without mode hooks.
+User hooks such as `org-indent-mode' do work after every edit, which
+makes parsing large documents slow and has no use in a scratch buffer."
+  (let ((org-inhibit-startup t))
+    (delay-mode-hooks (org-mode))))
+
 
 ;;; HTTP layer
 
@@ -471,7 +478,7 @@ that supplied TEXT[i].  Link descriptions and bare link text are visible;
 link targets hidden behind descriptions, Org delimiters, heading and list
 prefixes, drawers, and title keyword prefixes are not."
   (with-temp-buffer
-    (org-mode)
+    (gdocs--org-scratch-mode)
     (insert org-body)
     (let* ((size (buffer-size))
            (visible (make-vector size t))
@@ -683,7 +690,7 @@ but wrong)."
                              (> (plist-get a :plain-end)
                                 (plist-get b :plain-end)))))
     (with-temp-buffer
-      (org-mode)
+      (gdocs--org-scratch-mode)
       (insert org-body)
       (let* ((visible+map (gdocs--org-visible-and-map org-body))
              (visible-text (car visible+map))
@@ -889,6 +896,112 @@ and 2 the optional emoji icon."
              when (/= x y) do (throw 'order (< x y)))
     (< (length a) (length b))))
 
+(defun gdocs--astral-p (char)
+  "Return non-nil when CHAR takes two UTF-16 code units."
+  (> char #xFFFF))
+
+(defun gdocs--has-astral-p (string)
+  "Return non-nil when STRING holds a character outside the BMP."
+  (and (stringp string) (seq-some #'gdocs--astral-p string)))
+
+(defun gdocs--utf16-char-map (body)
+  "Return a vector mapping each UTF-16 position of BODY to its character.
+Google counts OT positions in UTF-16 code units, one-based, so a
+character outside the Basic Multilingual Plane, such as an emoji, takes
+two.  Element U is the one-based character position holding UTF-16
+position U; both halves of a pair map to their character."
+  (let* ((size (length body))
+         (map (make-vector (+ size (cl-count-if #'gdocs--astral-p body) 2) 0))
+         (unit 1))
+    (dotimes (index size)
+      (aset map unit (1+ index))
+      (when (gdocs--astral-p (aref body index))
+        (cl-incf unit)
+        (aset map unit (1+ index)))
+      (cl-incf unit))
+    (aset map unit (1+ size))
+    map))
+
+(defun gdocs--op-map-positions (op function)
+  "Return OP with its position fields mapped through FUNCTION."
+  (if (cl-some (lambda (key) (integerp (alist-get key op))) '(si ei spi ibi))
+      (mapcar (lambda (entry)
+                (if (and (memq (car-safe entry) '(si ei spi ibi)) (integerp (cdr entry)))
+                    (cons (car entry) (funcall function (cdr entry)))
+                  entry))
+              op)
+    op))
+
+(defun gdocs--ops-to-char-positions (ops body)
+  "Return OPS with their UTF-16 positions in BODY as character positions.
+The rest of the package counts positions in characters.  OPS are
+unchanged when BODY holds no character outside the BMP."
+  (if (not (gdocs--has-astral-p body))
+      ops
+    (let* ((map (gdocs--utf16-char-map body))
+           (last (1- (length map))))
+      (mapcar (lambda (op)
+                (gdocs--op-map-positions
+                 op (lambda (position)
+                      (cond ((<= position 0) position)
+                            ((<= position last) (aref map position))
+                            (t (+ (aref map last) (- position last)))))))
+              ops))))
+
+(defun gdocs--commands-to-utf16 (commands body)
+  "Return save COMMANDS with their character positions as UTF-16 positions.
+COMMANDS apply in order to BODY, the text they were planned against, so
+each command's positions are converted against the text as the commands
+before it left it."
+  (if (not (or (gdocs--has-astral-p body)
+               (cl-some (lambda (command) (gdocs--has-astral-p (alist-get 's command)))
+                        commands)))
+      commands
+    (let ((current body)
+          (prefix nil))
+      (cl-flet* ((recount ()
+                   (setq prefix (make-vector (1+ (length current)) 0))
+                   (dotimes (index (length current))
+                     (aset prefix (1+ index)
+                           (+ (aref prefix index)
+                              (if (gdocs--astral-p (aref current index)) 1 0)))))
+                 (unit (position)
+                   (let ((before (min (max 0 (1- position)) (length current))))
+                     (+ position (aref prefix before))))
+                 (clip (position) (min (max 0 (1- position)) (length current))))
+        (recount)
+        (mapcar
+         (lambda (command)
+           (let ((converted
+                  (mapcar (lambda (entry)
+                            (pcase (car-safe entry)
+                              ((or 'si 'ibi 'spi)
+                               (if (integerp (cdr entry))
+                                   (cons (car entry) (unit (cdr entry)))
+                                 entry))
+                              ('ei
+                               (if (integerp (cdr entry))
+                                   (let ((end (cdr entry)))
+                                     (cons 'ei (+ (unit end)
+                                                  (if (and (<= 1 end (length current))
+                                                           (gdocs--astral-p (aref current (1- end))))
+                                                      1 0))))
+                                 entry))
+                              (_ entry)))
+                          command)))
+             (pcase (alist-get 'ty command)
+               ("is" (let ((at (clip (alist-get 'ibi command))))
+                       (setq current (concat (substring current 0 at)
+                                             (alist-get 's command)
+                                             (substring current at)))
+                       (recount)))
+               ("ds" (setq current (concat (substring current 0 (clip (alist-get 'si command)))
+                                           (substring current (min (alist-get 'ei command)
+                                                                   (length current)))))
+                     (recount)))
+             converted))
+         commands)))))
+
 (defun gdocs--root-tab (tabs)
   "Return the document's original tab, `t.0', among TABS."
   (seq-find (lambda (tab) (equal (plist-get tab :id) "t.0")) tabs))
@@ -1003,7 +1116,10 @@ which is not necessarily the first once tabs are reordered."
       (dolist (tab tabs)
         (setf (plist-get tab :ops) (nreverse (plist-get tab :ops)))
         (setf (plist-get tab :ot-body)
-              (gdocs--tab-op-body (plist-get tab :ops))))
+              (gdocs--tab-op-body (plist-get tab :ops)))
+        (setf (plist-get tab :ops)
+              (gdocs--ops-to-char-positions (plist-get tab :ops)
+                                            (plist-get tab :ot-body))))
       tabs)))
 
 (defun gdocs--state-for-tab (state tab-id)
@@ -1029,7 +1145,7 @@ which is not necessarily the first once tabs are reordered."
 Tab and content headings may have the same Org level, so boundaries are
 identified by GDOC_TAB properties, never by heading depth alone."
   (with-temp-buffer
-    (org-mode)
+    (gdocs--org-scratch-mode)
     (insert body)
     (let (headings result)
       (org-element-map (org-element-parse-buffer) 'headline
@@ -1072,7 +1188,6 @@ identified by GDOC_TAB properties, never by heading depth alone."
                                  (plist-get entry :body-start)
                                  (if next (plist-get next :start) (point-max)))))
                       (with-temp-buffer
-                        (org-mode)
                         (insert (string-trim-right text) "\n")
                         (goto-char (point-min))
                         (while (re-search-forward "^\\(\\*+\\) " nil t)
@@ -1107,7 +1222,8 @@ see `gdocs--tab-change-plan' for how its changes are written."
             (local (cdr part)))
         (unless (gdocs--org-bodies-equivalent-p local remote)
           (push (list :tab-id (car part)
-                      :state (gdocs--state-for-tab state (car part))
+                      :state (plist-put (gdocs--state-for-tab state (car part))
+                                        :doc-entities (gdocs--doc-entities state))
                       :local local :remote remote)
                 changes))))
     (when (length> changes 1)
@@ -1152,13 +1268,16 @@ see `gdocs--tab-change-plan' for how its changes are written."
   "Classify AFTER relative to BEFORE for a one-tab save of TAB-ID.
 Return `:untouched' when the document is identical to BEFORE.  When
 exactly one revision was added and only TAB-ID changed, return
-`:committed' if the tab matches EXPECTED and every entity and comment
-anchored in it is still there, `:mismatch' otherwise.  EXPECTED is the
-pushed Org body, or the prediction of an in-place plan, see
-`gdocs--surgical-prediction'.  Anything else is
-a `:conflict'."
-  (let ((pre-rev (plist-get before :revision))
-        (post-rev (and after (plist-get after :revision))))
+`:committed' if the tab matches EXPECTED and anchors the expected
+entities and comments, `:mismatch' otherwise.  EXPECTED is the pushed
+Org body, which must keep every anchored id, or an in-place plan, whose
+`:expect' prediction, see `gdocs--surgical-prediction', and
+`:expect-ids' are checked.  Anything else is a `:conflict'."
+  (let* ((pre-rev (plist-get before :revision))
+         (post-rev (and after (plist-get after :revision)))
+         (plan (and (consp expected) (keywordp (car expected)) expected))
+         (expected-ids (if plan (plist-get plan :expect-ids)
+                         (gdocs--tab-anchored-ids before tab-id))))
     (cond
      ((null after) :conflict)
      ((and (gdocs--push-revisions-equal-p post-rev pre-rev)
@@ -1176,13 +1295,29 @@ a `:conflict'."
                                    nil nil #'equal)
                         ""))
                  (condition-case nil
-                     (gdocs--tab-prediction-matches-p expected after tab-id doc-id)
+                     (gdocs--tab-prediction-matches-p
+                      (if plan (plist-get plan :expect) expected) after tab-id doc-id)
                    (error nil)))
-               (equal (gdocs--tab-anchored-ids before tab-id)
-                      (gdocs--tab-anchored-ids after tab-id)))
+               (equal expected-ids (gdocs--tab-anchored-ids after tab-id)))
           :committed
         :mismatch))
      (t :conflict))))
+
+(defun gdocs--report-tab-removals (doc-id state plan)
+  "Log what in-place PLAN removed from DOC-ID, whose state was STATE.
+A comment whose text was all deleted stays in the document without an
+anchor, so it is reported as a warning."
+  (let* ((entities (plist-get (gdocs--doc-entities state) :by-id))
+         (removed (plist-get plan :removed-ids))
+         (comments (seq-remove (lambda (id) (gethash id entities)) removed))
+         (objects (seq-filter (lambda (id) (gethash id entities)) removed)))
+    (when comments
+      (gdocs-log 'warn "Push %s: %d comment(s) lost all of their text and are no longer anchored"
+                 doc-id (length comments)))
+    (when objects
+      (gdocs-log 'info "Push %s: removed %s" doc-id
+                 (mapconcat (lambda (id) (alist-get 'et (gethash id entities)))
+                            objects ", ")))))
 
 (defvar gdocs--rate-limit-retry-delay)
 
@@ -1230,8 +1365,8 @@ OWNER is the sync mutex token and is released exactly once."
          (send (current change n)
            (let* ((plan (plist-get change :plan))
                   (tab-id (plist-get change :tab-id))
-                  (expected (or (plist-get plan :expect)
-                                (plist-get plan :post-body))))
+                  (expected (if (plist-get plan :expect) plan
+                              (plist-get plan :post-body))))
              (gdocs--save-request-async
               doc-id (plist-get change :state) (plist-get plan :commands)
               (lambda (response err)
@@ -1258,7 +1393,17 @@ OWNER is the sync mutex token and is released exactly once."
                                (with-current-buffer buf
                                  (gdocs--finalize-push-props
                                   (plist-get fresh :revision) local-body))
-                               (finish nil)))
+                               (gdocs--report-tab-removals doc-id current plan)
+                               (finish nil)
+                               ;; Created chips and images have new ids that the
+                               ;; buffer's markers do not show yet.
+                               (when (plist-get plan :created-ids)
+                                 (run-at-time
+                                  0 nil
+                                  (lambda ()
+                                    (when (buffer-live-p buf)
+                                      (with-current-buffer buf
+                                        (gdocs-pull-locally doc-id))))))))
                             ((and (eq outcome :untouched) transient
                                   (< n gdocs--tab-save-max-attempts))
                              (gdocs-log 'info "/save throttled for tab %s (attempt %d); retrying"
@@ -1527,9 +1672,10 @@ supported.  See `gdocs--capability-text-style-key-policy'.")
     (b_gt . :normalized) (b_il . :normalized))
   "Classification table for list-level entity fields.
 
-The encoder emits, for levels 0 through 8, `b_gt' 9 for bullets or 13 for
-numbers, `b_gs' cycling through ●/○/■ for bullets or the empty string for
-numbers, `b_gf' as %N or %N., `b_ifl' as 18+36N, `b_il' as 36+36N,
+The encoder emits, for levels 0 through 8, `b_gt' 9 for bullets or the
+cycle 10, 13, 15 for numbers, `b_gs' cycling through ●/○/■ for bullets
+or the empty string for numbers, `b_gf' as %N or %N., `b_ifl' as
+18+36N, `b_il' as 36+36N,
 `b_a' as 0, `b_sn' as 1, and the block returned by
 `gdocs--ts-block-canonical' as `b_ts'.  Observed semantic values outside
 those exact canonical forms cannot be reproduced by full replacement.")
@@ -1772,17 +1918,18 @@ can be made."
 
 (defun gdocs--capability-merge (&rest report-lists)
   "Return REPORT-LISTS concatenated without duplicate reports."
-  (let (out keys)
+  (let ((keys (make-hash-table :test #'equal))
+        out)
     (dolist (reports report-lists)
       (dolist (report reports)
         (setq report (gdocs--capability-normalize report))
         (let ((key (mapcar (lambda (field) (plist-get report field))
                            '(:kind :entity-id :entity-type :feature-type
                                    :ot-start :ot-end :source))))
-          (unless (member key keys)
-            (setq keys (append keys (list key)))
-            (setq out (append out (list report)))))))
-    out))
+          (unless (gethash key keys)
+            (puthash key t keys)
+            (push report out)))))
+    (nreverse out)))
 
 (defun gdocs--capability-summary (reports)
   "Return a sanitized count summary for REPORTS.
@@ -2118,9 +2265,11 @@ value so malformed values remain available to capability validation."
                (id (alist-get 'ls_id sm))
                (nest (gdocs--effective-list-nesting-level sm))
                (text-style (alist-get 'ls_ts sm 'unset)))
-          (when (stringp id)
-            (push (cons si (list :list-id id :nest nest
-                                 :text-style text-style)) out)))))
+          ;; A binding without a list id clears the paragraph's list.
+          (push (cons si (and (stringp id)
+                              (list :list-id id :nest nest
+                                    :text-style text-style)))
+                out))))
     out))
 
 (defun gdocs--decode-table-attrs (ops)
@@ -2823,6 +2972,12 @@ not required to establish the semantic value."
        (gdocs--capability-list-text-style-features
         (alist-get 'ls_ts sm 'unset) "ls_ts")))))
 
+(defun gdocs--numbered-glyph-type (level)
+  "Return the glyph type of a numbered list at LEVEL, as Google writes it.
+Levels cycle through decimal (10), lower-case letters (13) and lower-case
+roman numerals (15)."
+  (aref [10 13 15] (mod level 3)))
+
 (defun gdocs--capability-list-level-features (level level-body)
   "Return every noncanonical semantic feature in LEVEL-BODY at LEVEL."
   (if (not (and (integerp level) (<= 0 level) (<= level 8)
@@ -2841,7 +2996,7 @@ not required to establish the semantic value."
                (known (assq key gdocs--capability-list-level-key-policy))
                (canonical
                 (pcase key
-                  ('b_gt (memq value '(9 13)))
+                  ('b_gt (eql value (if numbered (gdocs--numbered-glyph-type level) 9)))
                   ('b_gs (equal value (if numbered ""
                                         (aref bullet-glyphs level))))
                   ('b_gf (equal value (format "%%%d%s" level
@@ -3339,6 +3494,10 @@ report. Inline image reports are produced by
                 (dolist (report (gdocs--scan-paragraph-style-values
                                  op sm para-attrs))
                   (push report reports)))
+               ((and (equal style "list") (listp sm) (null (alist-get 'ls_id sm)))
+                ;; A binding without a list id, null or dropped, takes the
+                ;; paragraph out of its list.
+                nil)
                ((equal style "list")
                 (dolist (key (gdocs--capability-unknown-style-keys
                               sm '(ls_id ls_nest ls_ts)))
@@ -3902,6 +4061,17 @@ Uses `org-emphasis-regexp-components' so user customization applies."
        (concat "\\`[" (nth 1 org-emphasis-regexp-components) "]")
        (char-to-string char))))
 
+(defun gdocs--emphasis-core-ok-p (core)
+  "Non-nil when Org parses emphasis around CORE.
+CORE must be non-empty, hold no line break, and neither start nor end
+with a border character, such as the zero-width space that escapes a
+bracket in a link description.  Uses `org-emphasis-regexp-components'."
+  (let ((border (concat "[" (nth 2 org-emphasis-regexp-components) "]")))
+    (and (not (string-empty-p core))
+         (not (string-match-p "[\n\r]" core))
+         (not (string-match-p (concat "\\`" border) core))
+         (not (string-match-p (concat border "\\'") core)))))
+
 (defun gdocs--wrap-emphasis-inner (inner key)
   "Wrap the styled text INNER in KEY's Org marker when that parses.
 
@@ -3914,10 +4084,9 @@ classes — typically a style that starts or ends mid-word."
   (pcase-let* ((`(,leading ,core ,trailing)
                 (gdocs--split-inline-space inner))
                (mk (cdr (assq key gdocs--org-style-markers))))
-    (cond
-     ((or (string-empty-p core) (string-match-p "[\n\r]" core))
-      inner)
-     (t (concat leading mk core mk trailing)))))
+    (if (gdocs--emphasis-core-ok-p core)
+        (concat leading mk core mk trailing)
+      inner)))
 
 (defun gdocs--emphasis-boundaries-ok-p (previous-char next-char)
   "Non-nil when Org emphasis parses between PREVIOUS-CHAR and NEXT-CHAR.
@@ -4022,23 +4191,60 @@ for callers rendering one run directly."
                                   (if (string-empty-p clean) link clean)))
         clean))))
 
+(defun gdocs--trim-runs (runs)
+  "Return (LEADING TRIMMED TRAILING) for the text of RUNS.
+LEADING and TRAILING are the whitespace at the edges of the runs' text,
+and TRIMMED the runs without it.  TRIMMED is nil when the runs hold only
+whitespace."
+  (cl-flet ((trim (runs pattern edge)
+              ;; Strip PATTERN from the first of RUNS, dropping runs it empties.
+              (let ((runs (mapcar #'copy-sequence runs)) (stripped "") (done nil))
+                (while (and runs (not done))
+                  (let ((text (plist-get (car runs) :text)))
+                    (if (or (plist-get (car runs) :inline-object)
+                            (not (stringp text))
+                            (not (string-match pattern text)))
+                        (setq done t)
+                      (setq stripped (if (eq edge :start)
+                                         (concat stripped (match-string 0 text))
+                                       (concat (match-string 0 text) stripped)))
+                      (if (length= text (- (match-end 0) (match-beginning 0)))
+                          (setq runs (cdr runs))
+                        (setf (plist-get (car runs) :text)
+                              (if (eq edge :start)
+                                  (substring text (match-end 0))
+                                (substring text 0 (match-beginning 0))))
+                        (setq done t)))))
+                (cons stripped runs))))
+    (let* ((front (trim runs "\\`[ \t]+" :start))
+           (back (trim (reverse (cdr front)) "[ \t]+\\'" :end)))
+      (list (car front) (nreverse (cdr back)) (car back)))))
+
 (defun gdocs--render-link-group (runs link)
   "Render contiguous RUNS sharing LINK as one logical Org link.
 
 Rendering the description as a run group preserves style changes inside a
-link without repeating the link target for every style run."
-  (let* ((description (let ((gdocs--render-link-description t)
-                            (gdocs--render-edge-chars nil))
-                        (gdocs--render-runs-styled runs nil)))
-         (plain (gdocs-dm-runs-text runs))
-         (bare (and (not (cl-some (lambda (run)
-                                    (plist-get run :styles))
-                                  runs))
-                    (string= plain link))))
-    (if bare
-        (org-link-make-string link)
-      (org-link-make-string link
-                            (if (string-empty-p description) link description)))))
+link without repeating the link target for every style run.  Whitespace
+at the edges of the link text is written outside the link, because Org
+trims it from a description."
+  (pcase-let* ((`(,leading ,trimmed ,trailing) (gdocs--trim-runs runs))
+               (runs (or trimmed runs))
+               (description (let ((gdocs--render-link-description t)
+                                  (gdocs--render-edge-chars nil))
+                              (gdocs--render-runs-styled runs nil)))
+               (plain (gdocs-dm-runs-text runs))
+               (bare (and (not (cl-some (lambda (run)
+                                          (plist-get run :styles))
+                                        runs))
+                          (string= plain link))))
+    (if (null trimmed)
+        (setq leading "" trailing ""))
+    (concat leading
+            (if bare
+                (org-link-make-string link)
+              (org-link-make-string link
+                                    (if (string-empty-p description) link description)))
+            trailing)))
 
 (defun gdocs--common-run-style (runs)
   "Return a style key spanning both linked and unlinked RUNS, if any.
@@ -4291,8 +4497,7 @@ whitespace and boundary policy."
                                  (if (length> leading 0) ?\s previous-char))
                                 (effective-next
                                  (if (length> trailing 0) ?\s next-char)))
-                     (list (and (not (string-empty-p core))
-                                (not (string-match-p "[\n\r]" core))
+                     (list (and (gdocs--emphasis-core-ok-p core)
                                 (gdocs--emphasis-boundaries-ok-p
                                  effective-previous effective-next)
                                 (concat leading marker core marker trailing))
@@ -4328,8 +4533,10 @@ whitespace and boundary policy."
       out)))
 
 (defun gdocs--render-heading-stars (level)
-  "Return N stars for heading LEVEL (1..5). Levels >5 are clamped to 5."
-  (make-string (min 5 (max 1 level)) ?*))
+  "Return N stars for heading LEVEL, at least one.
+A tab's headings are shifted below the tab's own heading, so LEVEL may be
+deeper than any Google Docs heading level."
+  (make-string (max 1 level) ?*))
 
 (defun gdocs--render-list-bullet (glyph nest &optional ordinal indent)
   "Return the leading bullet text for a list item.
@@ -4468,7 +4675,128 @@ repeat count instead of being repeated once per occurrence."
                 (nreverse order)))
              "; ")))))
 
+(defun gdocs--post-blank-text (el count)
+  "Return the COUNT whitespace characters Org attached after element EL.
+They are read from the buffer, so a tab stays a tab."
+  (let ((end (org-element-property :end el)))
+    (if (and (integerp end) (<= (point-min) (- end count)) (<= end (point-max)))
+        (buffer-substring-no-properties (- end count) end)
+      (make-string count ?\s))))
+
+(defconst gdocs--org-literal-sentinel (string #x2060)
+  "Invisible word joiner placed before a character of a literal paragraph.
+Org markup cannot open after it, see `gdocs--literal-runs'.  A word
+joiner in the text itself is doubled.")
+
+(defconst gdocs--org-literal-closer (string #x200c)
+  "Invisible zero-width non-joiner placed after a protected character.
+Org markup cannot close before it.  One in the text itself is doubled.")
+
+(defconst gdocs--org-literal-chars (string-to-list "*/_=~+-[]<>$#:|^\\{}@")
+  "Characters that a literal paragraph keeps from being read as Org markup.")
+
+(defun gdocs--literal-runs (runs)
+  "Return RUNS with their text protected from Org markup.
+A word joiner goes before the first character, and each character of
+`gdocs--org-literal-chars' gets a word joiner before it and a
+zero-width non-joiner after it, so Org markup can neither open nor close
+on it.  Either invisible character in the text itself is doubled.
+Linked runs and objects are left alone."
+  (let ((first t))
+    (mapcar
+     (lambda (run)
+       (if (or (plist-get run :link) (plist-get run :inline-object)
+               (not (stringp (plist-get run :text))))
+           (progn (setq first nil) run)
+         (let ((text (mapconcat
+                      (lambda (char)
+                        (cond ((= char #x2060) (concat gdocs--org-literal-sentinel
+                                                       gdocs--org-literal-sentinel))
+                              ((= char #x200c) (concat gdocs--org-literal-closer
+                                                       gdocs--org-literal-closer))
+                              ((memq char gdocs--org-literal-chars)
+                               (concat gdocs--org-literal-sentinel (string char)
+                                       gdocs--org-literal-closer))
+                              (t (string char))))
+                      (plist-get run :text) "")))
+           (when (and first (length> text 0)
+                      (not (string-prefix-p gdocs--org-literal-sentinel text)))
+             (setq text (concat gdocs--org-literal-sentinel text)))
+           (setq first nil)
+           (plist-put (copy-sequence run) :text text))))
+     runs)))
+
+(defun gdocs--org-paragraphs-for-check (doc)
+  "Return DOC's paragraphs as compared after an Org round trip."
+  (gdocs--normalize-paragraphs-for-ot
+   (seq-remove (lambda (paragraph) (eq (plist-get paragraph :kind) :unsupported))
+               (gdocs--split-paragraph-lines (gdocs-dm-paragraphs doc)))))
+
+(defun gdocs--org-unreadable-paragraphs (doc org)
+  "Return the indices of DOC's paragraphs whose text ORG does not read back.
+ORG is DOC rendered.  Return nil when ORG has other paragraphs than DOC."
+  (let* ((paragraphs (gdocs-dm-paragraphs doc))
+         (expected (gdocs--normalize-paragraphs-for-ot paragraphs))
+         (back (gdocs--org-paragraphs-for-check (gdocs-dm-from-org org)))
+         (indices (gdocs--raw-indices-for-norm paragraphs expected)))
+    (and (length= expected (length back))
+         (cl-loop for a in expected for b in back for k from 0
+                  unless (or (eq (plist-get a :kind) :table)
+                             (gdocs--cells-shown-offset (gdocs--paragraph-cells a)
+                                                        (gdocs--paragraph-cells b)))
+                  collect (nth k indices)))))
+
+(defun gdocs--map-paragraph-runs (doc indices function)
+  "Return DOC with FUNCTION applied to the runs of paragraphs at INDICES.
+Source code paragraphs are left alone: a source block is read raw."
+  (plist-put (copy-sequence doc) :paragraphs
+             (cl-loop for paragraph in (gdocs-dm-paragraphs doc)
+                      for index from 0
+                      collect (if (and (memq index indices)
+                                       (not (eq (plist-get paragraph :kind) :code)))
+                                  (plist-put (copy-sequence paragraph) :runs
+                                             (funcall function (plist-get paragraph :runs)))
+                                paragraph))))
+
 (defun gdocs-dm-to-org (doc)
+  "Render a doc-model DOC to Org, so that its text reads back exactly.
+The rendering of `gdocs--dm-to-org-1' is parsed back.  A paragraph whose
+text does not come back exactly is rendered again without emphasis,
+which fixes emphasis around text holding its own marker, such as code
+containing `='.  A paragraph still not read back exactly, such as plain
+text starting with `- ', is rendered literally, see
+`gdocs--literal-runs'.  The Org view then shows the right text."
+  (let ((org (gdocs--dm-to-org-1 doc)))
+    (condition-case nil
+        (let ((bad (gdocs--org-unreadable-paragraphs doc org)))
+          (when bad
+            (let* ((plain (gdocs--map-paragraph-runs
+                           doc bad
+                           (lambda (runs)
+                             (mapcar (lambda (run)
+                                       (if (plist-get run :styles)
+                                           (plist-put (copy-sequence run) :styles nil)
+                                         run))
+                                     runs))))
+                   (plain-org (gdocs--dm-to-org-1 plain))
+                   (still (gdocs--org-unreadable-paragraphs plain plain-org)))
+              (setq org plain-org)
+              ;; Emphasis may span a line break, so protecting one
+              ;; paragraph can change how its neighbors read: repeat.
+              (let ((literal plain) (pending still) (protected nil) (rounds 0))
+                (while (and pending (< rounds 4))
+                  (setq literal (gdocs--map-paragraph-runs
+                                 literal pending #'gdocs--literal-runs)
+                        org (gdocs--dm-to-org-1 literal)
+                        protected (append pending protected)
+                        pending (seq-difference
+                                 (gdocs--org-unreadable-paragraphs literal org)
+                                 protected)
+                        rounds (1+ rounds)))))))
+      (error nil))
+    org))
+
+(defun gdocs--dm-to-org-1 (doc)
   "Render a doc-model DOC to a canonical org-mode string.
 
 Code blocks: contiguous :kind=:code paragraphs are wrapped in a single
@@ -4716,6 +5044,13 @@ a different document-model value."
     (while (< i n)
       (let ((char (aref text i)))
         (cond
+         ;; Literal paragraphs protect markup with a word joiner and a
+         ;; zero-width non-joiner and double real ones, see
+         ;; `gdocs--literal-runs'.
+         ((memq char '(#x2060 #x200c))
+          (if (and (< (1+ i) n) (= (aref text (1+ i)) char))
+              (progn (push char out) (setq i (+ i 2)))
+            (cl-incf i)))
          ((and link-description
                (= char #x200b))
           (cl-incf i))
@@ -4870,7 +5205,7 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
               (if (and (integerp post-blank) (> post-blank 0))
                   (append runs
                           (list (gdocs-dm-make-run
-                                 (make-string post-blank ?\s)
+                                 (gdocs--post-blank-text el post-blank)
                                  inherited-styles inherited-link)))
                 runs)))
            ((gdocs--org-element-escaped-p el)
@@ -4886,6 +5221,13 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                    (run (gdocs-dm-make-run
                          (or text "") inherited-styles inherited-link)))
               (list (plist-put run :inline-object-malformed t)))))))
+       ((and (eq type 'link) inherited-link
+             (not (gdocs--chip-object-from-link el props)))
+        ;; A description cannot hold a link: Org only sees one in text
+        ;; that looks like a URL, so it is text of the outer link.
+        (let ((text (gdocs--org-element-visible-text el inherited-link table-cell)))
+          (when text
+            (list (gdocs-dm-make-run text inherited-styles inherited-link)))))
        ((eq type 'link)
         (let ((chip (gdocs--chip-object-from-link el props)))
           (if chip
@@ -4897,7 +5239,7 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                 (if (and (integerp post-blank) (> post-blank 0))
                     (append runs
                             (list (gdocs-dm-make-run
-                                   (make-string post-blank ?\s)
+                                   (gdocs--post-blank-text el post-blank)
                                    inherited-styles inherited-link)))
                   runs))
             (let* ((path (plist-get props :path))
@@ -4924,7 +5266,7 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
               (if (and (integerp post-blank) (> post-blank 0))
                   (append runs
                           (list (gdocs-dm-make-run
-                                 (make-string post-blank ?\s)
+                                 (gdocs--post-blank-text el post-blank)
                                  inherited-styles inherited-link)))
                 runs)))))
        ((eq type 'plain-text)
@@ -4954,7 +5296,7 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                    (integerp post-blank) (> post-blank 0))
               (append runs
                       (list (gdocs-dm-make-run
-                             (make-string post-blank ?\s)
+                             (gdocs--post-blank-text el post-blank)
                              inherited-styles inherited-link)))
             runs)))
        ((eq type 'latex-fragment)
@@ -4977,7 +5319,7 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                    (integerp post-blank) (> post-blank 0))
               (append runs
                       (list (gdocs-dm-make-run
-                             (make-string post-blank ?\s)
+                             (gdocs--post-blank-text el post-blank)
                              inherited-styles inherited-link)))
             runs)))
        (style
@@ -4987,11 +5329,16 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
                          (stringp (plist-get props :value)))
                     ;; Inline code/verbatim contents come as a single
                     ;; string in :value.
+                    ;; The renderer escapes link description text before it
+                    ;; wraps code, and Org does not unescape code.
                     (list (gdocs-dm-make-run
-                           (if table-cell
-                               (gdocs--unescape-org-table-markup
-                                (plist-get props :value))
-                             (plist-get props :value))
+                           (cond (table-cell
+                                  (gdocs--unescape-org-table-markup
+                                   (plist-get props :value)))
+                                 (inherited-link
+                                  (gdocs--unescape-org-inline
+                                   (plist-get props :value) t nil))
+                                 (t (plist-get props :value)))
                            styles inherited-link))
                   (cl-mapcan
                    (lambda (c)
@@ -5007,9 +5354,14 @@ VISIBLE-FALLBACK preserves unsupported source as plain text."
           (if (and (integerp post-blank) (> post-blank 0))
               (append runs
                       (list (gdocs-dm-make-run
-                             (make-string post-blank ?\s)
+                             (gdocs--post-blank-text el post-blank)
                              inherited-styles inherited-link)))
             runs)))
+       ((memq type '(subscript superscript))
+        ;; Google Docs text has no Org subscripts: `a_b' is literal text.
+        (let ((text (gdocs--org-element-visible-text el inherited-link table-cell)))
+          (when text
+            (list (gdocs-dm-make-run text inherited-styles inherited-link)))))
        ;; Org anchors never appear in exported text, but a title or table
        ;; cell visible-fallback keeps the literal source.
        ((and (memq type '(target radio-target)) (not visible-fallback)) nil)
@@ -5084,7 +5436,7 @@ visible content."
           (with-temp-buffer
             (let ((org-inhibit-startup t))
               (insert sentinel text "\n"))
-            (org-mode)
+            (gdocs--org-scratch-mode)
             (let* ((tree (org-element-parse-buffer))
                    (section
                     (seq-find
@@ -5315,9 +5667,18 @@ empty run list rather than disappearing from its row."
 Each run carries the `:code' style so the OT emitter sends the matching
 monospace font (Roboto Mono) and a pull decodes the paragraph back into a
 `:code' paragraph.  The source language is not represented by the remote
-model; a pull always renders `text' as the language."
+model; a pull always renders `text' as the language.  A line keeps its
+own indentation, less the block's own indentation."
   (let* ((val (or (plist-get (cadr sb) :value) ""))
-         (lines (split-string val "\n"))
+         (begin (plist-get (cadr sb) :begin))
+         (indent (if (integerp begin)
+                     (save-excursion (goto-char begin) (current-indentation))
+                   0))
+         (lines (mapcar (lambda (line)
+                          (if (string-prefix-p (make-string indent ?\s) line)
+                              (substring line indent)
+                            line))
+                        (split-string val "\n")))
          ;; org-element appends a trailing \n; drop the trailing empty line.
          (lines (if (and lines (string-empty-p (car (last lines))))
                     (butlast lines)
@@ -5641,14 +6002,17 @@ intentionally lossy.  Inverse of `gdocs-dm-to-org' (lossy for unsupported
 syntax)."
   (with-temp-buffer
     (let ((org-inhibit-startup t)) (insert org-text))
-    (org-mode)
+    (gdocs--org-scratch-mode)
     (goto-char (point-min))
     ;; Skip a leading property drawer (won't round-trip through the model).
     (when (looking-at org-property-drawer-re)
       (let ((inhibit-read-only t))
         (delete-region (match-beginning 0) (match-end 0))
         (when (looking-at "\n") (delete-char 1))))
-    (let* ((tree (org-element-parse-buffer))
+    (let* ((tree (let ((org-src-preserve-indentation t))
+                   ;; Keep a source line's own indentation; the block's
+                   ;; indentation is removed in `gdocs--src-block-paragraphs'.
+                   (org-element-parse-buffer)))
            (with-spans
             (cl-mapcan
              (lambda (el) (gdocs--walk-org-element el t))
@@ -5913,25 +6277,26 @@ Each per-level alist mirrors the live shape: `b_gf' glyph format,
 canonical `b_ts' text-style block, `b_ifl'/`b_il' indents stepped by
 36pt per level (18pt first-line offset), `b_a'=0, and `b_sn'=1. For
 level N, bullets emit `b_gt'=9, `b_gs' cycling ●/○/■, and `b_gf'=%N;
-numbers emit `b_gt'=13, an empty `b_gs', and `b_gf'=%N.  `b_ifl' is
+numbers emit the `b_gt' of `gdocs--numbered-glyph-type', an empty
+`b_gs', and `b_gf'=%N.  `b_ifl' is
 18+36N and `b_il' is 36+36N. For LISTS, each entry is \(LIST-ID . GLYPH),
 where GLYPH is :bullet or :number.
 
 Bullet glyphs cycle ●/○/■ across levels; numbered uses no glyph string
-\(b_gt=13 already tells the renderer to compute the number)."
+\(the glyph type tells the renderer to compute the number)."
   (let ((bullet-glyphs ["●" "○" "■" "●" "○" "■" "●" "○" "■"]))
     (mapcar
      (lambda (entry)
        (let* ((id (car entry))
               (glyph (cdr entry))
               (numbered (eq glyph :number))
-              (gt (if numbered 13 9))
               (ts (gdocs--ts-block-canonical))
               (levels
                (cl-loop
                 for n from 0 to 8
                 collect
-                (let* ((b-il (float (* 36 (1+ n))))
+                (let* ((gt (if numbered (gdocs--numbered-glyph-type n) 9))
+                       (b-il (float (* 36 (1+ n))))
                        (b-ifl (float (+ 18 (* 36 n))))
                        (gs (if numbered "" (aref bullet-glyphs n)))
                        (b-gf (format "%%%d%s" n (if numbered "." ""))))
@@ -6448,7 +6813,8 @@ or removed use `gdocs--tab-paragraph-plan'."
                                         body ops))
          (local-doc (gdocs-dm-from-org local))
          (plan (or (gdocs--tab-surgical-plan
-                    remote-doc (gdocs-dm-from-org remote) local-doc ops body)
+                    remote-doc (gdocs-dm-from-org remote) local-doc ops body
+                    (plist-get state :doc-entities))
                    (gdocs--tab-paragraph-plan remote-doc local-doc body))))
     (when (eq (plist-get plan :kind) :noop)
       (user-error "gdocs: the tab differs only in Org layout; nothing to save"))
@@ -6488,23 +6854,52 @@ paragraph.  A table is one span from its opening to its closing marker."
           (setq index (1+ newline)))))
     (nreverse spans)))
 
+(defconst gdocs--structural-cell '(:structural)
+  "The object of a cell holding a table marker rather than text.")
+
+(defun gdocs--runs-cells (runs)
+  "Return the cells of RUNS as a list, see `gdocs--paragraph-cells'."
+  (mapcan
+   (lambda (run)
+     (if-let* ((object (plist-get run :inline-object)))
+         (list (list (gdocs--inline-marker-ot-char object) nil nil
+                     (gdocs--inline-object-identity object)))
+       (let ((styles (gdocs--style-key-set run))
+             (link (plist-get run :link)))
+         (mapcar (lambda (char) (list char styles link nil))
+                 (plist-get run :text)))))
+   runs))
+
+(defun gdocs--table-cells (paragraph)
+  "Return the cells of table PARAGRAPH, markers included, as a list.
+The sequence is the table's OT text: an opening marker, then for each
+row a row marker and, for each cell, a cell marker, the cell's text and
+a newline, then a closing marker.  Markers are structural cells."
+  (let ((cells (list (list gdocs--ot-table-open nil nil gdocs--structural-cell))))
+    (dolist (row (plist-get paragraph :rows))
+      (push (list gdocs--ot-row-end nil nil gdocs--structural-cell) cells)
+      (dolist (cell row)
+        (push (list gdocs--ot-cell-end nil nil gdocs--structural-cell) cells)
+        (dolist (text-cell (gdocs--runs-cells (gdocs--table-cell-runs cell)))
+          (push text-cell cells))
+        (push (list ?\n nil nil gdocs--structural-cell) cells)))
+    (push (list gdocs--ot-table-close nil nil gdocs--structural-cell) cells)
+    (nreverse cells)))
+
 (defun gdocs--paragraph-cells (paragraph)
   "Return PARAGRAPH's characters as a vector of cells, or nil.
 A cell is (CHAR STYLES LINK OBJECT).  An inline object is one cell whose
-CHAR is its OT placeholder and OBJECT its stable identity.  Tables and
-standalone objects have no cells: their text is never edited in place."
-  (unless (memq (plist-get paragraph :kind) '(:table :inline-object))
-    (vconcat
-     (mapcan
-      (lambda (run)
-        (if-let* ((object (plist-get run :inline-object)))
-            (list (list (gdocs--inline-marker-ot-char object) nil nil
-                        (gdocs--inline-object-identity object)))
-          (let ((styles (gdocs--style-key-set run))
-                (link (plist-get run :link)))
-            (mapcar (lambda (char) (list char styles link nil))
-                    (plist-get run :text)))))
-      (plist-get paragraph :runs)))))
+CHAR is its OT placeholder and OBJECT its stable identity.  A table's
+cells include its markers, see `gdocs--table-cells'.  Return nil when a
+standalone object has no usable identity."
+  (pcase (plist-get paragraph :kind)
+    (:table (vconcat (gdocs--table-cells paragraph)))
+    (:inline-object
+     (let ((object (gdocs--paragraph-inline-object-for-equality paragraph)))
+       (unless (eq object :invalid-inline-object)
+         (vector (list (gdocs--inline-marker-ot-char object) nil nil
+                       (gdocs--inline-object-identity object))))))
+    (_ (vconcat (gdocs--runs-cells (plist-get paragraph :runs))))))
 
 (defun gdocs--cell-text-equal-p (a b)
   "Return non-nil when cells A and B hold the same character or object."
@@ -6643,13 +7038,18 @@ copy its look."
     (vconcat
      (cl-mapcar
       (lambda (paragraph span)
-        (let ((cells (gdocs--paragraph-cells paragraph))
-              (start (car span)))
+        (let* ((cells (gdocs--paragraph-cells paragraph))
+               (start (car span))
+               ;; A table's span ends on its closing marker, which is one of
+               ;; its cells; a paragraph's span ends on its newline.
+               (end (if (eq (plist-get paragraph :kind) :table)
+                        (cdr span)
+                      (1- (cdr span)))))
           (list :start start
                 :cells (and cells
-                            (= (+ start (length cells)) (cdr span))
+                            (= (+ start (length cells) -1) end)
                             (string= (concat (mapcar #'car cells))
-                                     (substring body (1- start) (1- (cdr span))))
+                                     (substring body (1- start) end))
                             cells)
                 :class (if (plist-get paragraph :tab-kind)
                            (list (plist-get paragraph :tab-kind))
@@ -6746,13 +7146,7 @@ sets it explicitly.  The paragraph's own newline is the last resort."
 STYLES are the Org-visible styles the text must have.  Inserted text
 first takes INHERITED, the style of the character before it, so a key
 INHERITED sets and SOURCE does not is reset to inherit."
-  (let ((sm (copy-alist source)))
-    (dolist (entry inherited)
-      (let* ((base (string-remove-suffix "_i" (symbol-name (car entry))))
-             (flag (intern (concat base "_i"))))
-        (unless (or (assq (intern base) sm) (assq flag sm))
-          (push (cons flag t) sm))))
-    (gdocs--sm-with-styles sm styles)))
+  (gdocs--sm-with-styles (gdocs--copied-sm inherited source) styles))
 
 (defun gdocs--link-sm (link)
   "Return the link style modifier setting LINK, or removing links when nil."
@@ -6764,20 +7158,27 @@ INHERITED sets and SOURCE does not is reset to inherit."
     (and (stringp url) url)))
 
 (defun gdocs--cell-runs (cells)
-  "Split CELLS into runs of equal attributes: (OFFSET LENGTH ATTRIBUTES)."
+  "Split CELLS into runs: (OFFSET LENGTH ATTRIBUTES STRUCTURAL).
+A run has equal attributes and is all table markers or all text."
   (let (runs)
     (dotimes (offset (length cells))
-      (let ((attributes (gdocs--cell-attributes (aref cells offset))))
-        (if (and runs (equal (nth 2 (car runs)) attributes))
+      (let* ((cell (aref cells offset))
+             (attributes (gdocs--cell-attributes cell))
+             (structural (eq (nth 3 cell) gdocs--structural-cell)))
+        (if (and runs (equal (nth 2 (car runs)) attributes)
+                 (eq (nth 3 (car runs)) structural))
             (cl-incf (nth 1 (car runs)))
-          (push (list offset 1 attributes) runs))))
+          (push (list offset 1 attributes structural) runs))))
     (nreverse runs)))
 
-(defun gdocs--surgical-replace-commands (edit table text-styles link-styles)
-  "Return the commands of replacement EDIT, using TABLE and style vectors.
+(defun gdocs--surgical-replace-commands (edit context)
+  "Return the commands of replacement EDIT, using CONTEXT.
 EDIT is a plist with `:index', `:offset', `:delete' and `:insert'.
-TEXT-STYLES and LINK-STYLES come from `gdocs--ot-style-vector'."
-  (let* ((index (plist-get edit :index))
+CONTEXT is the plist `gdocs--tab-surgical-commands' builds."
+  (let* ((table (plist-get context :table))
+         (text-styles (plist-get context :text))
+         (link-styles (plist-get context :link))
+         (index (plist-get edit :index))
          (entry (aref table index))
          (cells (plist-get entry :cells))
          (offset (plist-get edit :offset))
@@ -6796,6 +7197,8 @@ TEXT-STYLES and LINK-STYLES come from `gdocs--ot-style-vector'."
       (push `((ty . "is") (ibi . ,position)
               (s . ,(concat (mapcar #'car inserted))))
             commands)
+      (dolist (command (gdocs--entity-commands inserted position))
+        (push command commands))
       (dolist (run (gdocs--cell-runs inserted))
         (let* ((attributes (nth 2 run))
                (from (+ position (nth 0 run)))
@@ -6869,20 +7272,12 @@ character's style stays."
     (nreverse commands)))
 
 (defun gdocs--tab-paragraphs-aligned-p (decoded shown)
-  "Return non-nil when DECODED and SHOWN paragraphs hold the same text.
+  "Return non-nil when DECODED and SHOWN paragraphs correspond one to one.
 DECODED come from the tab's operations and SHOWN from its Org view, both
-normalized.  Tables and standalone objects only need the same kind."
-  (and (length= decoded (length shown))
-       (cl-every
-        (lambda (a b)
-          (and (equal (gdocs--paragraph-class a) (gdocs--paragraph-class b))
-               (let ((x (gdocs--paragraph-cells a))
-                     (y (gdocs--paragraph-cells b)))
-                 (if (or (null x) (null y))
-                     (and (null x) (null y))
-                   (and (length= x (length y))
-                        (cl-every #'gdocs--cell-text-equal-p x y))))))
-        decoded shown)))
+normalized.  A paragraph whose Org view does not read back exactly is
+still aligned, but its text can only be kept or removed, never edited,
+see `gdocs--tab-surgical-edits'."
+  (length= decoded (length shown)))
 
 (defun gdocs--split-paragraph-lines (paragraphs)
   "Return PARAGRAPHS with each plain paragraph split at its newlines.
@@ -6913,18 +7308,25 @@ holds newlines; the OT body ends a paragraph at each of them."
                  (nreverse lines)))))
    paragraphs))
 
-(defun gdocs--tab-surgical-plan (remote-doc shown-doc local-doc ops body)
+(defun gdocs--tab-surgical-plan (remote-doc shown-doc local-doc ops body
+                                            &optional entities)
   "Plan in-place edits that turn tab SHOWN-DOC into LOCAL-DOC.
 SHOWN-DOC is the tab as its Org view reads, REMOTE-DOC the same tab
 decoded from OPS and OT BODY, which locates characters and their full
-styles.  Return nil when the Org view does not match the decoded
-paragraphs.  See `gdocs--tab-surgical-edits' for what the plan does."
+styles.  ENTITIES is the document's entity table, see
+`gdocs--doc-entities'.  Return nil when the Org view and the decoded tab
+do not have the same paragraphs.  See `gdocs--tab-surgical-edits' for
+what the plan does."
   (let* ((raw (gdocs-dm-paragraphs (gdocs--tab-model remote-doc)))
          (decoded (gdocs--normalize-paragraphs-for-ot raw))
-         (shown (gdocs--normalize-paragraphs-for-ot
-                 (gdocs--split-paragraph-lines (gdocs-dm-paragraphs shown-doc))))
-         (new (gdocs--normalize-paragraphs-for-ot
-               (gdocs--split-paragraph-lines (gdocs-dm-paragraphs local-doc)))))
+         (content (lambda (doc)
+                    ;; Notices of unsupported content are not paragraphs.
+                    (gdocs--normalize-paragraphs-for-ot
+                     (seq-remove (lambda (paragraph)
+                                   (eq (plist-get paragraph :kind) :unsupported))
+                                 (gdocs--split-paragraph-lines (gdocs-dm-paragraphs doc))))))
+         (shown (funcall content shown-doc))
+         (new (funcall content local-doc)))
     (when (gdocs--tab-paragraphs-aligned-p decoded shown)
       (let* ((prefix (gdocs--paragraphs-common-prefix shown new))
              (suffix (gdocs--paragraphs-common-suffix (nthcdr prefix shown)
@@ -6934,7 +7336,8 @@ paragraphs.  See `gdocs--tab-surgical-edits' for what the plan does."
         (if (and (zerop old-count) (zerop new-count))
             (list :kind :noop :commands nil :ranges nil)
           (gdocs--tab-surgical-edits
-           raw decoded shown new prefix old-count new-count ops body))))))
+           raw decoded shown new prefix old-count new-count ops body
+           entities))))))
 
 (defun gdocs--paragraphs-similar-p (a b)
   "Return non-nil when paragraphs A and B look like one paragraph edited.
@@ -6992,189 +7395,358 @@ The pairs are in ascending order."
       (setq previous-i (1+ (car anchor)) previous-j (1+ (cdr anchor))))
     (nreverse pairs)))
 
-(defun gdocs--paragraph-movable-p (paragraph)
-  "Return non-nil when PARAGRAPH may be added or removed whole.
-Only plain, heading and code paragraphs without remote objects qualify."
-  (and (memq (car (gdocs--paragraph-class paragraph)) '(:para :heading :code))
-       (let ((cells (gdocs--paragraph-cells paragraph)))
-         (and cells (not (cl-some (lambda (cell) (nth 3 cell)) cells))))))
-
-(defun gdocs--paragraph-text-edits (index before after)
+(defun gdocs--paragraph-text-edits (index before after entities &optional lead)
   "Return the in-place edits that turn paragraph BEFORE into AFTER.
-INDEX is the paragraph's position among the decoded tab paragraphs."
+INDEX is the paragraph's position among the decoded tab paragraphs and
+ENTITIES the document's entity table.  BEFORE's text starts LEAD cells
+into the decoded paragraph, see `gdocs--cells-shown-offset'.  Return
+`:restructure' when the edit changes a table's rows or cells: such a
+table is replaced whole."
   (let* ((before-cells (gdocs--paragraph-cells before))
          (after-cells (gdocs--paragraph-cells after))
          (hunks (gdocs--cells-diff before-cells after-cells))
+         (structural (lambda (cells)
+                       (cl-some (lambda (cell) (eq (nth 3 cell) gdocs--structural-cell))
+                                cells)))
          (edits nil))
-    (dolist (hunk hunks)
-      (let ((removed (seq-subseq before-cells (nth 0 hunk) (nth 1 hunk)))
-            (added (seq-subseq after-cells (nth 2 hunk) (nth 3 hunk))))
-        (when (cl-some (lambda (cell) (nth 3 cell)) (vconcat removed added))
-          (user-error "gdocs: Push refused: the edit creates, removes or changes a remote chip or image"))
-        (push (list :index index :offset (nth 0 hunk)
-                    :delete (length removed) :insert added)
-              edits)))
-    (dolist (span (gdocs--cells-restyles before-cells after-cells hunks))
-      (when (nth 3 (aref before-cells (nth 0 span)))
-        (user-error "gdocs: Push refused: the edit restyles a remote chip or image"))
-      (push (list :index index :offset (nth 0 span) :length (nth 1 span)
-                  :from (nth 2 span) :to (nth 3 span))
-            edits))
-    edits))
+    (catch 'restructure
+      (dolist (hunk hunks)
+        (let ((removed (seq-subseq before-cells (nth 0 hunk) (nth 1 hunk)))
+              (added (seq-subseq after-cells (nth 2 hunk) (nth 3 hunk))))
+          (when (or (funcall structural removed) (funcall structural added))
+            (throw 'restructure :restructure))
+          (push (list :index index :offset (+ (or lead 0) (nth 0 hunk))
+                      :delete (length removed)
+                      :insert (vconcat (gdocs--created-cells (append added nil) entities)))
+                edits)))
+      (dolist (span (gdocs--cells-restyles before-cells after-cells hunks))
+        (push (list :index index :offset (+ (or lead 0) (nth 0 span)) :length (nth 1 span)
+                    :from (nth 2 span) :to (nth 3 span))
+              edits))
+      edits)))
 
-(defun gdocs--tab-surgical-edits (raw decoded shown new prefix old-count new-count ops body)
+(defun gdocs--tab-surgical-edits (raw decoded shown new prefix old-count new-count ops body
+                                      &optional entities)
   "Plan the edits that turn OLD-COUNT shown paragraphs into NEW-COUNT ones.
 Both start at PREFIX.  RAW are the decoded tab paragraphs and DECODED
 their normalized form, aligned with SHOWN, the normalized Org view; NEW
 are the local paragraphs.  OPS and BODY are the tab's operations and OT
-body.
+body, and ENTITIES the document's entity table, see `gdocs--doc-entities'.
 
 A paragraph that was edited is changed in place, character by
-character.  A plain, heading or code paragraph can be removed or added
-whole: it is deleted with its newline, or inserted with a newline at the
-start of the paragraph that follows it, which keeps that paragraph's
-formatting.  List items, tables and objects are never added or removed."
-  (let* ((table (gdocs--tab-paragraph-table raw body))
+character; a remote object it gains is created and one it loses is
+deleted.  A paragraph of any kind can be removed or added whole: it is
+deleted with its newline, or inserted with a newline at the start of the
+paragraph that follows it, which keeps that paragraph's formatting.  A
+table whose rows or cells change is replaced whole."
+  (let* ((entities (or entities (gdocs--doc-entities (list :ot-ops ops))))
+         (table (gdocs--tab-paragraph-table raw body))
          (raw-indices (gdocs--raw-indices-for-norm raw decoded))
          (raw-at (lambda (k) (if (length> shown k) (nth k raw-indices) (length raw))))
          (old (vconcat (seq-subseq shown prefix (+ prefix old-count))))
          (fresh (vconcat (seq-subseq new prefix (+ prefix new-count))))
+         (pairs (gdocs--paragraph-pairs old fresh))
+         (suffix (- (length shown) prefix old-count))
+         (list-map (gdocs--tab-list-map
+                    decoded new prefix suffix
+                    (mapcar (lambda (pair) (cons (+ prefix (car pair)) (+ prefix (cdr pair))))
+                            pairs)))
          (i 0) (j 0) edits)
-    (dolist (pair (append (gdocs--paragraph-pairs old fresh)
-                          (list (cons old-count new-count))))
-      (when (< i (car pair))
-        (let ((from (funcall raw-at (+ prefix i)))
-              (to (funcall raw-at (+ prefix (car pair)))))
-          (cl-loop for k from i below (car pair)
-                   unless (gdocs--paragraph-movable-p (aref old k))
-                   do (user-error "gdocs: Push refused: removing list items, tables, images or chips in a tab is not supported"))
-          (cl-loop for k from from below to
-                   unless (plist-get (aref table k) :cells)
-                   do (user-error "gdocs: a removed paragraph could not be located in the remote tab"))
-          (push (list :index from :remove to) edits)))
-      (when (< j (cdr pair))
-        (let ((before (funcall raw-at (+ prefix (car pair))))
-              (added (cl-loop for k from j below (cdr pair) collect (aref fresh k))))
-          (unless (cl-every #'gdocs--paragraph-movable-p added)
-            (user-error "gdocs: Push refused: adding list items, tables, images or chips in a tab is not supported"))
-          (unless (length> raw before)
-            (user-error "gdocs: Push refused: a paragraph cannot be added after the tab's last paragraph"))
-          (push (list :index before :add added) edits)))
-      (when (< (car pair) old-count)
+    (cl-flet ((add-paragraphs (before paragraphs)
+                (when paragraphs
+                  (let ((items (mapcar
+                                (lambda (paragraph)
+                                  (list :paragraph paragraph
+                                        :cells (gdocs--created-cells
+                                                (append (or (gdocs--paragraph-cells paragraph)
+                                                            (user-error "gdocs: Push refused: an added paragraph has an invalid object marker"))
+                                                        nil)
+                                                entities)))
+                                paragraphs))
+                        (same (seq-find (lambda (edit)
+                                          (and (plist-member edit :add)
+                                               (eql (plist-get edit :index) before)))
+                                        edits)))
+                    (if same
+                        (setf (plist-get same :add) (append (plist-get same :add) items))
+                      (push (list :index before :add items) edits)))))
+              (remove-paragraphs (from to)
+                (when (< from to)
+                  (cl-loop for k from from below to
+                           unless (plist-get (aref table k) :cells)
+                           do (user-error "gdocs: a removed paragraph could not be located in the remote tab"))
+                  (push (list :index from :remove to) edits))))
+      (dolist (pair (append pairs (list (cons old-count new-count))))
         (let* ((k (+ prefix (car pair)))
-               (index (funcall raw-at k)))
-          (unless (and (eq (nth index raw) (nth k decoded))
-                       (plist-get (aref table index) :cells))
-            (user-error "gdocs: a changed paragraph could not be located in the remote tab"))
-          (setq edits (append (gdocs--paragraph-text-edits
-                               index (nth k shown) (aref fresh (cdr pair)))
-                              edits))))
-      (setq i (1+ (car pair)) j (1+ (cdr pair))))
-    (plist-put (gdocs--tab-surgical-commands edits table ops body)
-               :expect (gdocs--surgical-prediction raw table edits))))
+               (anchor (funcall raw-at k))
+               (added (cl-loop for x from j below (cdr pair) collect (aref fresh x))))
+          (remove-paragraphs (funcall raw-at (+ prefix i)) anchor)
+          (when (< (car pair) old-count)
+            (let* ((before (nth k shown))
+                   (after (aref fresh (cdr pair)))
+                   (entry (aref table anchor))
+                   (located (and (eq (nth anchor raw) (nth k decoded))
+                                 (plist-get entry :cells)
+                                 (if (length= (plist-get entry :cells) 0)
+                                     (and (length= (gdocs--paragraph-cells before) 0) 0)
+                                   (gdocs--cells-shown-offset
+                                    (plist-get entry :cells)
+                                    (gdocs--paragraph-cells before)))))
+                   (paragraph-edits (and located
+                                         (gdocs--paragraph-text-edits
+                                          anchor before after entities located))))
+              (cond
+               ((and located (not (eq paragraph-edits :restructure)))
+                (setq edits (append paragraph-edits edits)))
+               ((gdocs--paragraph-equal-p before after))
+               ((or located (eq (plist-get before :kind) :table))
+                ;; Replace the paragraph whole: remove it, and add the new
+                ;; one in front of the paragraph after it.
+                (remove-paragraphs anchor (funcall raw-at (1+ k)))
+                (setq added (append added (list after))
+                      anchor (funcall raw-at (1+ k))))
+               (t (user-error "gdocs: Push refused: the paragraph %S does not read back exactly from its Org view, so it can only be changed in Google Docs"
+                              (truncate-string-to-width
+                               (gdocs-dm-runs-text (plist-get before :runs)) 60 nil nil t))))))
+          (add-paragraphs anchor added))
+        (setq i (1+ (car pair)) j (1+ (cdr pair)))))
+    (let ((plan (gdocs--tab-surgical-commands edits table ops body raw list-map entities)))
+      (plist-put plan :expect (gdocs--surgical-prediction raw table edits)))))
 
 (defun gdocs--style-source-for-class (table index class attributes)
   "Return the OT position of the character text with ATTRIBUTES copies.
-The text is in a new paragraph of CLASS added before paragraph INDEX of
+The text is in a new paragraph of CLASS added near paragraph INDEX of
 TABLE; paragraphs of CLASS nearest to it are searched first."
-  (let ((entry (aref table index))
+  (let ((index (min index (1- (length table))))
         (predicate #'gdocs--attributes-similar-p))
-    (or (and (equal class (plist-get entry :class))
-             (gdocs--style-source-in
-              table index
-              (number-sequence 0 (1- (length (plist-get entry :cells))))
-              attributes predicate))
+    (or (let ((entry (aref table index)))
+          (and (equal class (plist-get entry :class))
+               (gdocs--style-source-in
+                table index
+                (number-sequence 0 (1- (length (plist-get entry :cells))))
+                attributes predicate)))
         (gdocs--style-source-nearby table index attributes predicate class)
         (gdocs--style-source-nearby table index attributes predicate nil))))
 
-(defun gdocs--class-newline (table index class)
+(defun gdocs--class-newline (table index class &optional test)
   "Return the OT position of the newline nearest INDEX in TABLE ending CLASS.
-Return nil when no located paragraph has CLASS."
-  (cl-loop for distance from 0 below (length table)
+When TEST is non-nil, it is called with a paragraph's entry and index
+and must return non-nil for that paragraph.
+Return nil when no located paragraph qualifies."
+  (cl-loop for distance from 0 below (max 1 (length table))
            thereis
            (cl-loop for other in (if (zerop distance) (list index)
                                    (list (- index distance) (+ index distance)))
                     for entry = (and (< -1 other (length table)) (aref table other))
                     when (and entry (plist-get entry :cells)
-                              (equal class (plist-get entry :class)))
+                              (equal class (plist-get entry :class))
+                              (or (null test) (funcall test entry other)))
                     return (+ (plist-get entry :start)
                               (length (plist-get entry :cells))))))
 
-(defun gdocs--surgical-add-commands (edit table text-styles link-styles)
-  "Return the commands of EDIT, which adds paragraphs, using TABLE.
-TEXT-STYLES and LINK-STYLES come from `gdocs--ot-style-vector'.  The
-paragraphs go at the start of paragraph `:index', and their text copies
-the look of the nearest paragraphs of the same structure."
-  (let* ((index (plist-get edit :index))
-         (position (plist-get (aref table index) :start))
-         (size (length text-styles))
-         (style-at (lambda (at) (and at (<= 1 at size) (aref text-styles (1- at)))))
-         (inherited (funcall style-at (1- position)))
-         (inherited-link (and (> position 1)
-                              (gdocs--sm-link-url (aref link-styles (- position 2)))))
-         (text (mapconcat (lambda (paragraph)
-                            (concat (concat (mapcar #'car (gdocs--paragraph-cells paragraph)))
-                                    "\n"))
-                          (plist-get edit :add) ""))
+(defun gdocs--surgical-add-commands (edit context)
+  "Return the commands of EDIT, which adds paragraphs, using CONTEXT.
+The paragraphs go at the start of paragraph `:index', or after the last
+paragraph when `:index' is past it.  Their text copies the look of the
+nearest paragraphs of the same structure.  List items join or start a
+list and take its indentation; other paragraphs get the default
+paragraph style, which a heading completes with its level.
+
+Google ends a tab with a newline outside its text.  When the text ends
+with a newline, the last added paragraph takes that final newline.  When
+it does not, the last paragraph's newline is inserted, and the old final
+newline, with the last paragraph's style, moves to the added text: the
+two styles are swapped back.  An EDIT with `:replace-end' adds
+paragraphs in place of the tab's last paragraphs, which another edit
+deletes first: the last added paragraph takes the final newline too."
+  (let* ((table (plist-get context :table))
+         (body (plist-get context :body))
+         (size (length body))
+         (index (plist-get edit :index))
+         (replace-end (plist-get edit :replace-end))
+         (append-mode (or replace-end (>= index (length table))))
+         (reference (min index (1- (length table))))
+         (unterminated (and append-mode (not replace-end)
+                            (> size 0) (/= (aref body (1- size)) ?\n)))
+         (position (if (and append-mode (not replace-end))
+                       (1+ size)
+                     (plist-get (aref table index) :start)))
+         (items (plist-get edit :add))
+         (prefix (if unterminated "\n" ""))
+         (text (concat prefix
+                       (mapconcat (lambda (item) (concat (mapcar #'car (plist-get item :cells))))
+                                  items "\n")
+                       (if append-mode "" "\n")))
+         (inherited (gdocs--style-at context :text (1- position)))
+         (inherited-link (gdocs--sm-link-url (gdocs--style-at context :link (1- position))))
+         (final (1+ size))
          (commands (list `((ty . "is") (ibi . ,position) (s . ,text))))
-         (at position))
-    (dolist (paragraph (plist-get edit :add))
-      (let* ((cells (gdocs--paragraph-cells paragraph))
-             (class (gdocs--paragraph-class paragraph))
-             (newline (+ at (length cells))))
-        (dolist (run (gdocs--cell-runs cells))
-          (let* ((attributes (nth 2 run))
-                 (from (+ at (nth 0 run)))
-                 (to (+ from (nth 1 run) -1)))
-            (push `((ty . "as") (st . "text") (si . ,from) (ei . ,to)
-                    (sm . ,(gdocs--copied-text-sm
-                            inherited
-                            (funcall style-at (gdocs--style-source-for-class
-                                               table index class attributes))
-                            (car attributes))))
-                  commands)
-            (unless (equal (cdr attributes) inherited-link)
-              (push `((ty . "as") (st . "link") (si . ,from) (ei . ,to)
-                      (sm . ,(gdocs--link-sm (cdr attributes))))
-                    commands))))
-        (push `((ty . "as") (st . "text") (si . ,newline) (ei . ,newline)
-                (sm . ,(gdocs--copied-text-sm
-                        inherited
-                        (funcall style-at (gdocs--class-newline table index class))
-                        nil)))
-              commands)
-        (when inherited-link
-          (push `((ty . "as") (st . "link") (si . ,newline) (ei . ,newline)
-                  (sm . ,(gdocs--link-sm nil)))
-                commands))
-        (when (eq (car class) :heading)
-          (push `((ty . "as") (st . "paragraph") (si . ,newline) (ei . ,newline)
-                  (sm (ps_hd . ,(cadr class)) (ps_hd_i . :json-false)))
-                commands))
-        (setq at (1+ newline))))
-    (nreverse commands)))
+         (at (+ position (length prefix))))
+    (when unterminated
+      ;; The inserted newline now ends the old last paragraph.
+      (when (gdocs--style-at context :paragraph final)
+        (push `((ty . "as") (st . "paragraph") (si . ,position) (ei . ,position)
+                (sm . ,(gdocs--style-at context :paragraph final)))
+              commands))
+      (when (gdocs--style-at context :list final)
+        (push `((ty . "as") (st . "list") (si . ,position) (ei . ,position)
+                (sm . ,(gdocs--style-at context :list final)))
+              commands))
+      (when (gdocs--style-at context :text final)
+        (push `((ty . "as") (st . "text") (si . ,position) (ei . ,position)
+                (sm . ,(gdocs--copied-sm nil (gdocs--style-at context :text final))))
+              commands)))
+    (cl-loop
+     for (item . rest) on items
+     do (let* ((paragraph (plist-get item :paragraph))
+               (cells (plist-get item :cells))
+               (class (gdocs--paragraph-class paragraph))
+               (newline (+ at (length cells)))
+               (reused (and append-mode (null rest)))
+               (current-paragraph (and reused (gdocs--style-at context :paragraph final)))
+               (current-list (and reused (gdocs--style-at context :list final)))
+               (paragraph-sm nil))
+          (dolist (command (gdocs--entity-commands cells at))
+            (push command commands))
+          (when (eq (car class) :table)
+            (push (gdocs--table-op paragraph at) commands))
+          (dolist (run (gdocs--cell-runs (vconcat cells)))
+            (let ((attributes (nth 2 run))
+                  (from (+ at (nth 0 run))))
+              (unless (nth 3 run)
+                (let ((to (+ from (nth 1 run) -1)))
+                  (push `((ty . "as") (st . "text") (si . ,from) (ei . ,to)
+                          (sm . ,(gdocs--copied-text-sm
+                                  inherited
+                                  (gdocs--style-at
+                                   context :text
+                                   (gdocs--style-source-for-class table reference class attributes))
+                                  (car attributes))))
+                        commands)
+                  (unless (equal (cdr attributes) inherited-link)
+                    (push `((ty . "as") (st . "link") (si . ,from) (ei . ,to)
+                            (sm . ,(gdocs--link-sm (cdr attributes))))
+                          commands))))))
+          (push `((ty . "as") (st . "text") (si . ,newline) (ei . ,newline)
+                  (sm . ,(gdocs--copied-text-sm
+                          (if reused (gdocs--style-at context :text final) inherited)
+                          (gdocs--style-at context :text
+                                           (gdocs--class-newline table reference class))
+                          nil)))
+                commands)
+          (when (and inherited-link (not reused))
+            (push `((ty . "as") (st . "link") (si . ,newline) (ei . ,newline)
+                    (sm . ,(gdocs--link-sm nil)))
+                  commands))
+          (if (eq (car class) :list)
+              (dolist (command (gdocs--added-list-binding context paragraph reference newline))
+                (if (eq (car command) :paragraph)
+                    (setq paragraph-sm (cdr command))
+                  (push command commands)))
+            (when current-list
+              (push `((ty . "as") (st . "list") (si . ,newline) (ei . ,newline) (sm (ls_id)))
+                    commands)))
+          (when (eq (car class) :heading)
+            (setf (alist-get 'ps_hd paragraph-sm) (cadr class)
+                  (alist-get 'ps_hd_i paragraph-sm) :json-false))
+          (when (or paragraph-sm current-paragraph)
+            (push `((ty . "as") (st . "paragraph") (si . ,newline) (ei . ,newline)
+                    (sm . ,(gdocs--copied-sm current-paragraph paragraph-sm)))
+                  commands))
+          (setq at (1+ newline))))
+    ;; Entity and list definitions come before the text that uses them.
+    (let ((ordered (nreverse commands)))
+      (append (seq-filter (lambda (command) (equal (alist-get 'et command) "list")) ordered)
+              (seq-remove (lambda (command) (equal (alist-get 'et command) "list")) ordered)))))
 
 (defun gdocs--surgical-edit-position (edit table)
-  "Return the OT position where EDIT starts, located through TABLE."
-  (+ (plist-get (aref table (plist-get edit :index)) :start)
-     (or (plist-get edit :offset) 0)))
+  "Return the OT position where EDIT starts, located through TABLE.
+An addition after the last paragraph starts one past the tab's text."
+  (if (>= (plist-get edit :index) (length table))
+      most-positive-fixnum
+    (+ (plist-get (aref table (plist-get edit :index)) :start)
+       (or (plist-get edit :offset) 0))))
 
 (defun gdocs--surgical-edit-rank (edit)
   "Return the order of EDIT among edits at one position, lowest first.
-The characters at a position are restyled or replaced before paragraphs
-are added in front of them."
+The characters at a position are restyled or replaced, and paragraphs
+removed from it, before paragraphs are added in front of it."
   (cond ((plist-member edit :length) 0)
         ((plist-member edit :offset) 1)
-        ((plist-member edit :add) 2)
+        ((plist-member edit :remove) 2)
         (t 3)))
 
-(defun gdocs--tab-surgical-commands (edits table ops body)
+(defconst gdocs--attached-entity-types
+  '("person" "date" "inline" "bookmark" "placeholder" "dropdown" "first-party-link")
+  "Entity types that exist only attached to a position in the text.")
+
+(defun gdocs--entity-deletions (ops from to)
+  "Return `de' operations for the entities OPS attach between FROM and TO.
+Google deletes an entity before the text holding its placeholder."
+  (let ((types (make-hash-table :test #'equal)))
+    (dolist (op ops)
+      (when (equal (alist-get 'ty op) "ae")
+        (puthash (alist-get 'id op) (alist-get 'et op) types)))
+    (cl-loop for op in ops
+             when (and (equal (alist-get 'ty op) "te")
+                       (integerp (alist-get 'spi op))
+                       (<= from (alist-get 'spi op) to)
+                       (member (gethash (alist-get 'id op) types)
+                               gdocs--attached-entity-types))
+             collect `((ty . "de") (id . ,(alist-get 'id op))
+                       (et . ,(gethash (alist-get 'id op) types))))))
+
+(defun gdocs--orphan-entities (ops)
+  "Return the ids of entities OPS define but never attach to the text.
+They are left behind when a placeholder is deleted without its entity."
+  (let ((attached (make-hash-table :test #'equal)))
+    (dolist (op ops)
+      (when (equal (alist-get 'ty op) "te")
+        (puthash (alist-get 'id op) t attached)))
+    (cl-loop for op in ops
+             when (and (equal (alist-get 'ty op) "ae")
+                       (member (alist-get 'et op) gdocs--attached-entity-types)
+                       (not (gethash (alist-get 'id op) attached)))
+             collect (cons (alist-get 'id op) (alist-get 'et op)))))
+
+(defun gdocs--tab-surgical-commands (edits table ops body &optional raw list-map entities)
   "Return the in-place plan for EDITS located through TABLE.
-OPS and BODY are the tab's operations and OT body.  Edits run from the
-end of the tab backwards, so each position is unaffected by the
-commands before it."
-  (let* ((text-styles (gdocs--ot-style-vector ops (length body) "text"))
-         (link-styles (gdocs--ot-style-vector ops (length body) "link"))
+OPS and BODY are the tab's operations and OT body, RAW its decoded
+paragraphs, LIST-MAP from `gdocs--tab-list-map' and ENTITIES from
+`gdocs--doc-entities'.  Edits run from the end of the tab backwards, so
+each position is unaffected by the commands before it.  The plan's
+`:expect-ids' are the entity and comment ids the tab must hold after the
+save.  Entities left without an attachment are deleted, see
+`gdocs--orphan-entities'; their ids are the plan's `:cleanup-ids'."
+  (let* ((size (1+ (length body)))
+         (context (list :table table :body body :raw raw
+                        :list-map (or list-map (make-hash-table :test #'equal))
+                        :new-lists (make-hash-table :test #'equal)
+                        :entities (or entities (gdocs--doc-entities (list :ot-ops ops)))
+                        :text (gdocs--ot-style-vector ops size "text")
+                        :link (gdocs--ot-style-vector ops size "link")
+                        :paragraph (gdocs--ot-style-vector ops size "paragraph")
+                        :list (gdocs--ot-style-vector ops size "list")))
+         (through-end (seq-find (lambda (edit)
+                                  (and (plist-member edit :remove)
+                                       (>= (plist-get edit :remove) (length table))))
+                                edits))
+         (replacing (and through-end
+                         (seq-find (lambda (edit)
+                                     (and (plist-member edit :add)
+                                          (>= (plist-get edit :index) (length table))))
+                                   edits)))
+         ;; Paragraphs added after removed last paragraphs go where they were,
+         ;; once they are gone, and take the tab's final newline.
+         (edits (mapcar (lambda (edit)
+                          (cond ((eq edit replacing)
+                                 (plist-put (plist-put (copy-sequence edit) :index
+                                                       (plist-get through-end :index))
+                                            :replace-end t))
+                                ((and replacing (eq edit through-end))
+                                 (plist-put (copy-sequence edit) :keep-final t))
+                                (t edit)))
+                        edits))
          (ordered (sort edits
                         :lessp
                         (lambda (a b)
@@ -7185,13 +7757,14 @@ commands before it."
                                      (< (gdocs--surgical-edit-rank a)
                                         (gdocs--surgical-edit-rank b))))))))
          (commands nil)
-         (ranges nil))
+         (ranges nil)
+         (created nil))
     (dolist (edit ordered)
-      (let ((start (gdocs--surgical-edit-position edit table)))
+      (let ((start (min (gdocs--surgical-edit-position edit table) size)))
         (cond
          ((plist-member edit :length)
           (setq commands (append commands (gdocs--surgical-restyle-commands
-                                           edit table text-styles)))
+                                           edit table (plist-get context :text))))
           (push (list :ot-start start :ot-end (+ start (plist-get edit :length) -1)
                       :delete-count 0 :restyle t)
                 ranges))
@@ -7199,28 +7772,56 @@ commands before it."
           (let ((deleted (plist-get edit :delete)))
             (when (length< body start)
               (user-error "gdocs: Push refused: text cannot be added after the tab's final newline"))
-            (setq commands (append commands (gdocs--surgical-replace-commands
-                                             edit table text-styles link-styles)))
+            (setq commands (append commands
+                                   (and (> deleted 0)
+                                        (gdocs--entity-deletions ops start (+ start deleted -1)))
+                                   (gdocs--surgical-replace-commands edit context)))
+            (setq created (append (gdocs--entity-commands (plist-get edit :insert) start)
+                                  created))
             (push (list :ot-start start
                         :ot-end (if (> deleted 0) (+ start deleted -1) start)
                         :insert-at start :delete-count deleted)
                   ranges)))
          ((plist-member edit :add)
-          (setq commands (append commands (gdocs--surgical-add-commands
-                                           edit table text-styles link-styles)))
+          (let ((added (gdocs--surgical-add-commands edit context)))
+            (setq commands (append commands added))
+            (setq created (append (seq-filter (lambda (command)
+                                                (and (equal (alist-get 'ty command) "ae")
+                                                     (not (equal (alist-get 'et command) "list"))))
+                                              added)
+                                  created)))
           (push (list :ot-start start :ot-end start :insert-at start :delete-count 0)
                 ranges))
          (t
-          (let ((end (if (length> table (plist-get edit :remove))
-                         (1- (plist-get (aref table (plist-get edit :remove)) :start))
-                       (length body))))
+          (let* ((removal (gdocs--surgical-remove-commands edit context))
+                 (deletion (car removal)))
             (setq commands (append commands
-                                   (list `((ty . "ds") (si . ,start) (ei . ,end)))))
-            (push (list :ot-start start :ot-end end :insert-at start
-                        :delete-count (- end start -1))
+                                   (gdocs--entity-deletions ops (alist-get 'si deletion)
+                                                            (alist-get 'ei deletion))
+                                   removal))
+            (push (list :ot-start (alist-get 'si deletion) :ot-end (alist-get 'ei deletion)
+                        :insert-at (alist-get 'si deletion)
+                        :delete-count (- (alist-get 'ei deletion) (alist-get 'si deletion) -1))
                   ranges))))))
-    (list :kind :incremental :surgical t :commands commands
-          :ranges (nreverse ranges))))
+    (let* ((ranges (nreverse ranges))
+           (removed (gdocs--surgical-removed-ids ops ranges))
+           (created-ids (seq-keep (lambda (command)
+                                    (and (equal (alist-get 'ty command) "ae")
+                                         (alist-get 'id command)))
+                                  created))
+           (before (gdocs--anchored-ids ops))
+           (orphans (gdocs--orphan-entities ops)))
+      (list :kind :incremental :surgical t
+            :commands (append (mapcar (lambda (orphan)
+                                        `((ty . "de") (id . ,(car orphan)) (et . ,(cdr orphan))))
+                                      orphans)
+                              commands)
+            :cleanup-ids (mapcar #'car orphans)
+            :ranges ranges
+            :removed-ids removed :created-ids created-ids
+            :expect-ids (sort (delete-dups (append (seq-difference before removed)
+                                                   created-ids))
+                              :lessp #'string<)))))
 
 (defun gdocs--prediction-class (paragraph)
   "Return PARAGRAPH's class for verification; code is a kind of plain text.
@@ -7250,34 +7851,41 @@ the Org view did not show are kept."
 (defun gdocs--surgical-prediction (raw table edits)
   "Return the tab paragraphs expected after in-place EDITS.
 RAW are the decoded tab paragraphs and TABLE locates them.  Each element
-is a plist with `:class' and `:cells', a list, or with `:paragraph'
-when the paragraph has no cells.  `gdocs--tab-prediction-matches-p'
-compares a fresh state with it."
+is a plist with `:class' and `:cells', a list.  An added table is
+followed by the empty paragraph its newline makes, unless it ends the
+tab.  `gdocs--tab-prediction-matches-p' compares a fresh state with it."
   (let ((by-index (make-hash-table))
         (added (make-hash-table))
         (removed nil)
         (out nil))
     (dolist (edit edits)
       (cond ((plist-member edit :add)
-             (puthash (plist-get edit :index) (plist-get edit :add) added))
+             (puthash (plist-get edit :index)
+                      (append (gethash (plist-get edit :index) added)
+                              (plist-get edit :add))
+                      added))
             ((plist-member edit :remove)
              (push (cons (plist-get edit :index) (plist-get edit :remove)) removed))
             (t (push edit (gethash (plist-get edit :index) by-index)))))
-    (cl-loop
-     for paragraph in raw
-     for index from 0
-     do (dolist (new (gethash index added))
-          (push (list :class (gdocs--prediction-class new)
-                      :cells (mapcar #'copy-sequence (gdocs--paragraph-cells new)))
-                out))
-     unless (cl-some (lambda (range) (and (<= (car range) index) (< index (cdr range))))
-                     removed)
-     do (push
-         (if (null (gdocs--paragraph-cells paragraph))
-             (list :paragraph paragraph)
-           (let ((cells (mapcar #'copy-sequence
-                                (or (plist-get (aref table index) :cells)
-                                    (gdocs--paragraph-cells paragraph)))))
+    (cl-flet ((emit-added (index)
+                (cl-loop for (item . rest) on (gethash index added)
+                         for paragraph = (plist-get item :paragraph)
+                         do (push (list :class (gdocs--prediction-class paragraph)
+                                        :cells (gdocs--prediction-cells (plist-get item :cells)))
+                                  out)
+                         when (and (eq (plist-get paragraph :kind) :table)
+                                   (or rest (length> raw index)))
+                         do (push (list :class '(:para) :cells nil) out))))
+      (cl-loop
+       for paragraph in raw
+       for index from 0
+       do (emit-added index)
+       unless (cl-some (lambda (range) (and (<= (car range) index) (< index (cdr range))))
+                       removed)
+       do (push
+           (let ((cells (gdocs--prediction-cells
+                         (or (plist-get (aref table index) :cells)
+                             (gdocs--paragraph-cells paragraph)))))
              (dolist (edit (sort (gethash index by-index)
                                  :lessp
                                  (lambda (a b)
@@ -7295,11 +7903,12 @@ compares a fresh state with it."
                                    (setf (nth 1 cell) (car attributes)
                                          (nth 2 cell) (cdr attributes))))
                    (setq cells (append (seq-take cells offset)
-                                       (append (plist-get edit :insert) nil)
+                                       (gdocs--prediction-cells (plist-get edit :insert))
                                        (nthcdr (+ offset (plist-get edit :delete))
                                                cells))))))
-             (list :class (gdocs--prediction-class paragraph) :cells cells)))
-         out))
+             (list :class (gdocs--prediction-class paragraph) :cells cells))
+           out))
+      (emit-added (length raw)))
     (nreverse out)))
 
 (defun gdocs--tab-prediction-matches-p (prediction state tab-id doc-id)
@@ -7315,45 +7924,391 @@ match paragraph by paragraph."
     (and (length= raw (length prediction))
          (cl-every
           (lambda (paragraph expected)
-            (let ((cells (gdocs--paragraph-cells paragraph)))
-              (if (plist-member expected :paragraph)
-                  (and (null cells)
-                       (gdocs--paragraph-equal-p paragraph
-                                                 (plist-get expected :paragraph)))
-                (and cells
-                     (equal (plist-get expected :class)
-                            (gdocs--prediction-class paragraph))
-                     (equal (plist-get expected :cells) (append cells nil))))))
+            (and (equal (plist-get expected :class)
+                        (gdocs--prediction-class paragraph))
+                 (equal (plist-get expected :cells)
+                        (gdocs--prediction-cells (gdocs--paragraph-cells paragraph)))))
           raw prediction))))
 
 (defun gdocs--surgical-report-touched-p (report ranges)
   "Return non-nil when in-place edit RANGES harm what REPORT describes.
-In-place edits change characters inside paragraphs and never a newline.
-Styles, paragraph and list formatting stay on the characters they cover.
-A comment is lost only when all of its text is deleted, and a chip,
-image or bookmark when its own position is deleted or restyled.  Any
+Styles and paragraph and list formatting stay on the characters they
+cover.  Chips, images, bookmarks and comments go with the text the edit
+deletes, which the plan reports and verifies, see `:removed-ids'.  Any
 other report is touched by an edit of its range."
-  (let ((covered (gdocs--capability-report-range report)))
-    (and covered
-         (pcase (plist-get report :kind)
-           ((or :unsupported-style :unsupported-paragraph :unsupported-entity
-                :document-settings :annotation-state)
-            nil)
-           (:comment-anchor
-            (cl-loop for position from (car covered) to (cdr covered)
-                     always (cl-some (lambda (range)
-                                       (and (> (plist-get range :delete-count) 0)
-                                            (<= (plist-get range :ot-start) position
-                                                (plist-get range :ot-end))))
-                                     ranges)))
-           ((or :inline-image :remote-chip :unknown-entity)
-            (cl-some (lambda (range)
-                       (and (or (> (plist-get range :delete-count) 0)
-                                (plist-get range :restyle))
-                            (<= (plist-get range :ot-start) (cdr covered))
-                            (<= (car covered) (plist-get range :ot-end))))
-                     ranges))
-           (_ (gdocs--capability-range-touched-p report ranges))))))
+  (and (gdocs--capability-report-range report)
+       (not (memq (plist-get report :kind)
+                  '(:unsupported-style :unsupported-paragraph :unsupported-entity
+                                       :document-settings :annotation-state :comment-anchor
+                                       :inline-image :remote-chip :unknown-entity)))
+       (gdocs--capability-range-touched-p report ranges)))
+
+(defun gdocs--cells-text-equal-p (x y)
+  "Return non-nil when cell vectors X and Y hold the same text and objects."
+  (and x y (length= x (length y)) (cl-every #'gdocs--cell-text-equal-p x y)))
+
+(defun gdocs--cells-shown-offset (decoded shown)
+  "Return where SHOWN cells start in DECODED cells, or nil.
+SHOWN is the Org view of the DECODED paragraph.  Org drops spaces and
+tabs at the edges of a heading or line, or turns a tab into a space, so
+DECODED may hold more of them than SHOWN at either edge; the text
+between the edges must match exactly."
+  (when (and decoded shown)
+    (let* ((blank (lambda (cell) (and (memq (car cell) '(?\s ?\t)) (null (nth 3 cell)))))
+           (count-edge (lambda (cells from-end)
+                         (let ((n 0) (size (length cells)))
+                           (while (and (< n size)
+                                       (funcall blank (aref cells (if from-end (- size n 1) n))))
+                             (cl-incf n))
+                           n)))
+           (decoded-lead (funcall count-edge decoded nil))
+           (shown-lead (funcall count-edge shown nil))
+           (decoded-trail (if (length= decoded decoded-lead) 0
+                            (funcall count-edge decoded t)))
+           (shown-trail (if (length= shown shown-lead) 0
+                          (funcall count-edge shown t))))
+      (cond
+       ((gdocs--cells-text-equal-p decoded shown) 0)
+       ;; Org may also turn an edge tab into a space: only the text
+       ;; between the edges must match.
+       ((and (>= decoded-lead shown-lead)
+             (>= decoded-trail shown-trail)
+             (gdocs--cells-text-equal-p
+              (seq-subseq decoded decoded-lead (- (length decoded) decoded-trail))
+              (seq-subseq shown shown-lead (- (length shown) shown-trail))))
+        (- decoded-lead shown-lead))))))
+
+(defun gdocs--new-entity-id (taken)
+  "Return a fresh `kix.' entity id that is not a key of hash table TAKEN."
+  (let (id)
+    (while (or (null id) (gethash id taken))
+      (setq id (concat "kix." (apply #'string
+                                     (cl-loop repeat 12
+                                              collect (aref "abcdefghijklmnopqrstuvwxyz0123456789"
+                                                            (random 36)))))))
+    (puthash id t taken)
+    id))
+
+(defun gdocs--date-chip-epm (ymd previous)
+  "Return the entity properties of a date chip on YMD, (YEAR MONTH DAY).
+A date-only chip stores noon UTC of its day.  When PREVIOUS, the
+properties of the chip it replaces, include a time of day, the time is
+kept and only the day changes."
+  (let* ((noon (float-time (encode-time (list 0 0 12 (nth 2 ymd) (nth 1 ymd) (nth 0 ymd)
+                                              nil nil 0))))
+         (label (format "%s %d, %d"
+                        (aref ["Jan" "Feb" "Mar" "Apr" "May" "Jun"
+                               "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"]
+                              (1- (nth 1 ymd)))
+                        (nth 2 ymd) (nth 0 ymd)))
+         (old (alist-get 'dat_df previous))
+         (old-seconds (alist-get 'tv_s (alist-get 'tv (alist-get 'dfie_ts old))))
+         (timed (and old (numberp old-seconds)
+                     (not (eql (alist-get 'dfie_tpt old) 0)))))
+    (if timed
+        (let* ((old-day (decode-time old-seconds 0))
+               (old-noon (float-time
+                          (encode-time (list 0 0 12 (decoded-time-day old-day)
+                                             (decoded-time-month old-day)
+                                             (decoded-time-year old-day)
+                                             nil nil 0))))
+               (seconds (+ old-seconds (- noon old-noon)))
+               (old-label (alist-get 'dfie_dt old))
+               (copy (copy-tree old)))
+          (setf (alist-get 'tv_s (alist-get 'tv (alist-get 'dfie_ts copy))) seconds)
+          (setf (alist-get 'dfie_dt copy)
+                (if (and (stringp old-label)
+                         (string-match "\\`[A-Z][a-z][a-z] [0-9]+, [0-9]+" old-label))
+                    (replace-match label t t old-label)
+                  label))
+          `((dat_df . ,copy)))
+      `((dat_df (dfie_pt . 3) (dfie_ts (tv (tv_s . ,noon) (tv_n . 0)))
+                (dfie_dt . ,label) (fres_usd . "") (dfie_l . "en") (dfie_tzi . "")
+                (fres_frt . 1)
+                (dfie_p (tres_tv . "MMM d, y") (fres_usd . "") (fres_frt . 0))
+                (dfie_tpt . 0))))))
+
+(defun gdocs--entity-creation (identity entities)
+  "Return (IDENTITY . AE) for a new entity that recreates object IDENTITY.
+IDENTITY is a stable object identity from `gdocs--inline-object-identity';
+the returned identity carries the fresh id that AE, an `ae' operation,
+defines.  ENTITIES is the document's entity table, see
+`gdocs--doc-entities'.  A person chip needs an email: the Org link target
+gives it, or another person chip in the document with the same name.  An
+image must reuse an image already uploaded to the document."
+  (let* ((kind (plist-get identity :object-kind))
+         (local-id (plist-get identity :entity-id))
+         (previous (gethash local-id (plist-get entities :by-id)))
+         (id (gdocs--new-entity-id (plist-get entities :taken)))
+         (epm
+          (pcase kind
+            (:chip-person
+             (let* ((name (plist-get identity :chip-value))
+                    (email (cond ((and (stringp local-id) (string-search "@" local-id))
+                                  local-id)
+                                 (t (gethash name (plist-get entities :emails))))))
+               (unless email
+                 (user-error "gdocs: Push refused: the new person chip %S needs an email; write [[gdocs-chip:person:EMAIL][%s]]"
+                             name name))
+               `((per_n . ,name) (per_e . ,email))))
+            (:chip-date
+             (let ((value (plist-get identity :chip-value)))
+               (unless (and (stringp value)
+                            (string-match "\\`\\([0-9]+\\)-\\([0-9]+\\)-\\([0-9]+\\)\\'" value))
+                 (user-error "gdocs: Push refused: a date chip has no usable date"))
+               (gdocs--date-chip-epm
+                (list (string-to-number (match-string 1 value))
+                      (string-to-number (match-string 2 value))
+                      (string-to-number (match-string 3 value)))
+                (and previous (equal (alist-get 'et previous) "date")
+                     (alist-get 'epm previous)))))
+            (:image
+             (let ((source (gethash (plist-get identity :content-id)
+                                    (plist-get entities :images))))
+               (unless source
+                 (user-error "gdocs: Push refused: a new image must reuse one already in the document; uploading images is not supported"))
+               (let ((copy (copy-tree (alist-get 'epm source))))
+                 (setf (alist-get 'i_wth (alist-get 'ee_eo copy))
+                       (float (plist-get identity :width)))
+                 (setf (alist-get 'i_ht (alist-get 'ee_eo copy))
+                       (float (plist-get identity :height)))
+                 copy)))
+            (_ (user-error "gdocs: Push refused: this kind of remote object cannot be created")))))
+    (cons (plist-put (copy-sequence identity) :entity-id id)
+          `((ty . "ae")
+            (et . ,(pcase kind (:chip-person "person") (:chip-date "date") (_ "inline")))
+            (id . ,id) (epm . ,epm)))))
+
+(defun gdocs--doc-entities (state)
+  "Return the entity table of the whole document in STATE.
+It is a plist of hash tables: `:by-id' maps an entity id to its `ae'
+operation, `:emails' a person chip's name to its email, `:images' an
+uploaded image's content id to its `ae' operation, and `:taken' holds
+every id in use."
+  (let ((by-id (make-hash-table :test #'equal))
+        (emails (make-hash-table :test #'equal))
+        (images (make-hash-table :test #'equal))
+        (taken (make-hash-table :test #'equal)))
+    (dolist (tab (or (plist-get state :tabs) (list state)))
+      (dolist (op (or (plist-get tab :ops) (plist-get tab :ot-ops)))
+        (when (and (equal (alist-get 'ty op) "ae") (stringp (alist-get 'id op)))
+          (let ((epm (alist-get 'epm op)))
+            (puthash (alist-get 'id op) op by-id)
+            (puthash (alist-get 'id op) t taken)
+            (pcase (alist-get 'et op)
+              ("person" (when (and (stringp (alist-get 'per_n epm))
+                                   (stringp (alist-get 'per_e epm)))
+                          (puthash (alist-get 'per_n epm) (alist-get 'per_e epm) emails)))
+              ("inline" (let ((content (alist-get 'i_cid (alist-get 'ee_eo epm))))
+                          (when (stringp content) (puthash content op images)))))))))
+    (list :by-id by-id :emails emails :images images :taken taken)))
+
+(defun gdocs--created-cells (cells entities)
+  "Return CELLS with each object cell turned into a new entity.
+The cell's object becomes the new identity and its fifth element the
+`ae' operation that defines it, see `gdocs--entity-creation'.  ENTITIES
+is the document's entity table."
+  (mapcar (lambda (cell)
+            (if (and (nth 3 cell) (not (eq (nth 3 cell) gdocs--structural-cell)))
+                (let ((created (gdocs--entity-creation (nth 3 cell) entities)))
+                  (list (nth 0 cell) (nth 1 cell) (nth 2 cell) (car created) (cdr created)))
+              cell))
+          cells))
+
+(defun gdocs--tab-list-map (decoded new prefix suffix pairs-in-mid)
+  "Return a hash table from local Org list ids to remote list ids.
+DECODED and NEW are aligned at their PREFIX and SUFFIX paragraphs and at
+PAIRS-IN-MID, pairs of absolute indices.  A local list that continues a
+remote list keeps the remote list's id."
+  (let ((map (make-hash-table :test #'equal)))
+    (cl-flet ((link (old fresh)
+                (when (and (eq (plist-get old :kind) :list)
+                           (eq (plist-get fresh :kind) :list)
+                           (plist-get fresh :list-id))
+                  (puthash (plist-get fresh :list-id) (plist-get old :list-id) map))))
+      (dotimes (k prefix) (link (nth k decoded) (nth k new)))
+      (dotimes (k suffix)
+        (link (nth (- (length decoded) k 1) decoded) (nth (- (length new) k 1) new)))
+      (dolist (pair pairs-in-mid) (link (nth (car pair) decoded) (nth (cdr pair) new))))
+    map))
+
+(defun gdocs--copied-sm (current source)
+  "Return style SOURCE for a character whose style is now CURRENT.
+Every key CURRENT sets that SOURCE does not is reset to inherit, so the
+character ends up styled exactly like SOURCE."
+  (let ((sm (copy-alist source)))
+    (dolist (entry current)
+      (let* ((base (string-remove-suffix "_i" (symbol-name (car entry))))
+             (flag (intern (concat base "_i"))))
+        (unless (or (assq (intern base) sm) (assq flag sm))
+          (push (cons flag t) sm))))
+    sm))
+
+(defun gdocs--entity-commands (cells position)
+  "Return the `ae' and `te' operations of the entities CELLS create.
+CELLS start at OT POSITION; a created cell holds its `ae' operation as
+fifth element, see `gdocs--created-cells'."
+  (let ((commands nil))
+    (cl-loop for cell in (append cells nil)
+             for at from position
+             when (nth 4 cell)
+             do (push (nth 4 cell) commands)
+             (push `((ty . "te") (id . ,(plist-get (nth 3 cell) :entity-id)) (spi . ,at))
+                   commands))
+    (nreverse commands)))
+
+(defun gdocs--style-at (context type position)
+  "Return the style modifiers of TYPE at OT POSITION in CONTEXT, or nil.
+POSITION may be the tab's final newline, one past its text."
+  (let ((styles (plist-get context type)))
+    (and position (<= 1 position (length styles)) (aref styles (1- position)))))
+
+(defun gdocs--added-list-binding (context paragraph index newline)
+  "Return the list commands for list item PARAGRAPH added near INDEX.
+NEWLINE is the item's newline position.  The item joins the remote list
+its Org list continues, see `gdocs--tab-list-map', copying an item of
+that list at its level; otherwise it starts a new list, defined once."
+  (let* ((org-id (plist-get paragraph :list-id))
+         (nest (or (plist-get paragraph :nest) 0))
+         (remote (gethash org-id (plist-get context :list-map)))
+         (raw (plist-get context :raw))
+         (table (plist-get context :table))
+         (item (lambda (id level)
+                 (gdocs--class-newline
+                  table index (list :list level (plist-get paragraph :glyph))
+                  (lambda (_entry other)
+                    (equal (plist-get (nth other raw) :list-id) id)))))
+         (commands nil))
+    (if remote
+        (let* ((same (funcall item remote nest))
+               (any (or same
+                        (cl-loop for level from 0 to 8
+                                 thereis (funcall item remote level))))
+               (list-sm (copy-alist (gdocs--style-at context :list any)))
+               (paragraph-sm
+                (if same
+                    (gdocs--style-at context :paragraph same)
+                  (let* ((definition (gethash remote (plist-get (plist-get context :entities) :by-id)))
+                         (level (alist-get (intern (format "nl_%d" nest))
+                                           (alist-get 'le_nb (alist-get 'epm definition)))))
+                    `((ps_il . ,(or (alist-get 'b_il level) (+ 36.0 (* 36 nest))))
+                      (ps_il_i . :json-false)
+                      (ps_ifl . ,(or (alist-get 'b_ifl level) (+ 18.0 (* 36 nest))))
+                      (ps_ifl_i . :json-false))))))
+          (setf (alist-get 'ls_id list-sm) remote
+                (alist-get 'ls_nest list-sm) nest)
+          (push `((ty . "as") (st . "list") (si . ,newline) (ei . ,newline) (sm . ,list-sm))
+                commands)
+          (push (cons :paragraph paragraph-sm) commands))
+      (let ((id (or (gethash org-id (plist-get context :new-lists))
+                    (let ((fresh (gdocs--new-entity-id
+                                  (plist-get (plist-get context :entities) :taken))))
+                      (puthash org-id fresh (plist-get context :new-lists))
+                      (dolist (definition (gdocs--emit-list-defs
+                                           (list (cons fresh (plist-get paragraph :glyph)))))
+                        (push definition commands))
+                      fresh))))
+        (push (gdocs--emit-list-style-op id nest newline) commands)
+        (push (cons :paragraph `((ps_il . ,(+ 36.0 (* 36 nest))) (ps_il_i . :json-false)
+                                 (ps_ifl . ,(+ 18.0 (* 36 nest))) (ps_ifl_i . :json-false)))
+              commands)))
+    (nreverse commands)))
+
+(defun gdocs--table-op (paragraph position)
+  "Return the `tbl' operation of table PARAGRAPH opening at POSITION."
+  (let ((columns (or (plist-get paragraph :cols)
+                     (apply #'max 1 (mapcar #'length (plist-get paragraph :rows))))))
+    `((ty . "as") (st . "tbl") (si . ,position) (ei . ,position)
+      (sm . ((tbls_cols . ((cv . ((op . "set")
+                                  (opValue . ,(gdocs--emit-table-col-attrs columns))))))
+             (tbls_tblid . ,(gdocs--gen-table-id)))))))
+
+(defun gdocs--surgical-remove-commands (edit context)
+  "Return the commands of EDIT, which removes whole paragraphs.
+CONTEXT is the plist `gdocs--tab-surgical-commands' builds.
+
+Google ends a tab with a newline outside its text, which holds the style
+of the last paragraph when the text has no final newline.  Removing the
+last paragraphs of such a tab then deletes the newline before them too,
+and the final newline takes the style of the paragraph that is now last,
+so no empty paragraph is left at the end.  When no paragraph ending with
+a newline stays, the final newline's style is reset instead.  An EDIT
+with `:keep-final' leaves the final newline to the paragraphs another
+edit adds in place of the removed ones, see
+`gdocs--surgical-add-commands'."
+  (let* ((table (plist-get context :table))
+         (body (plist-get context :body))
+         (size (length body))
+         (start (plist-get (aref table (plist-get edit :index)) :start))
+         (through-end (>= (plist-get edit :remove) (length table)))
+         (end (if through-end size
+                (1- (plist-get (aref table (plist-get edit :remove)) :start))))
+         (final (1+ size))
+         (unterminated (and through-end (> size 0) (/= (aref body (1- size)) ?\n)
+                            (not (plist-get edit :keep-final))))
+         (merge (and unterminated (> start 1) (= (aref body (- start 2)) ?\n)))
+         (from (if merge (1- start) start))
+         (commands (list `((ty . "ds") (si . ,from) (ei . ,end)))))
+    (when unterminated
+      (let* ((source (and merge (1- start)))
+             (paragraph (gdocs--style-at context :paragraph final))
+             (list-sm (gdocs--style-at context :list final))
+             (text (gdocs--style-at context :text final))
+             (source-paragraph (and source (gdocs--style-at context :paragraph source)))
+             (source-list (and source (gdocs--style-at context :list source)))
+             (source-text (and source (gdocs--style-at context :text source))))
+        (when (or paragraph source-paragraph)
+          (push `((ty . "as") (st . "paragraph") (si . ,from) (ei . ,from)
+                  (sm . ,(gdocs--copied-sm paragraph source-paragraph)))
+                commands))
+        (cond ((alist-get 'ls_id source-list)
+               (push `((ty . "as") (st . "list") (si . ,from) (ei . ,from)
+                       (sm . ,source-list))
+                     commands))
+              ((alist-get 'ls_id list-sm)
+               (push `((ty . "as") (st . "list") (si . ,from) (ei . ,from) (sm (ls_id)))
+                     commands)))
+        (when (and merge (or text source-text))
+          (push `((ty . "as") (st . "text") (si . ,from) (ei . ,from)
+                  (sm . ,(gdocs--copied-sm text source-text)))
+                commands))))
+    (nreverse commands)))
+
+(defun gdocs--surgical-removed-ids (ops ranges)
+  "Return the ids anchored in OPS that deletion RANGES remove.
+An entity is removed with its position, a comment when all of its text
+is deleted."
+  (let ((deleted (lambda (position)
+                   (cl-some (lambda (range)
+                              (and (> (plist-get range :delete-count) 0)
+                                   (<= (plist-get range :ot-start) position
+                                       (plist-get range :ot-end))))
+                            ranges)))
+        removed)
+    (dolist (op ops)
+      (when (and (equal (alist-get 'ty op) "te") (stringp (alist-get 'id op))
+                 (integerp (alist-get 'spi op))
+                 (funcall deleted (alist-get 'spi op)))
+        (push (alist-get 'id op) removed)))
+    (dolist (anchor (gdocs--decode-doco-anchors ops))
+      (when (cl-loop for position from (cadr anchor) to (cddr anchor)
+                     always (funcall deleted position))
+        (push (car anchor) removed)))
+    (delete-dups removed)))
+
+(defun gdocs--prediction-cells (cells)
+  "Return CELLS as a list of decoded cells, without creation data."
+  (mapcar (lambda (cell) (seq-take cell 4)) (append cells nil)))
+
+(defun gdocs--anchored-ids (ops)
+  "Return the sorted ids of entities and comments anchored in OPS."
+  (sort (delete-dups
+         (append (cl-loop for op in ops
+                          when (and (equal (alist-get 'ty op) "te")
+                                    (stringp (alist-get 'id op)))
+                          collect (alist-get 'id op))
+                 (mapcar #'car (gdocs--decode-doco-anchors ops))))
+        :lessp #'string<))
 
 (defun gdocs--tab-paragraph-plan (remote-doc local-doc body)
   "Plan a paragraph-level save from tab REMOTE-DOC to LOCAL-DOC.
@@ -7377,16 +8332,10 @@ refused."
 
 (defun gdocs--tab-anchored-ids (state tab-id)
   "Return the sorted ids of entities and comments anchored in TAB-ID of STATE."
-  (let ((ops (plist-get (seq-find (lambda (tab) (equal (plist-get tab :id) tab-id))
-                                  (plist-get state :tabs))
-                        :ops)))
-    (sort (delete-dups
-           (append (cl-loop for op in ops
-                            when (and (equal (alist-get 'ty op) "te")
-                                      (stringp (alist-get 'id op)))
-                            collect (alist-get 'id op))
-                   (mapcar #'car (gdocs--decode-doco-anchors ops))))
-          :lessp #'string<)))
+  (gdocs--anchored-ids
+   (plist-get (seq-find (lambda (tab) (equal (plist-get tab :id) tab-id))
+                        (plist-get state :tabs))
+              :ops)))
 
 (defun gdocs--format-creation-date (creation-time-ms)
   "Format CREATION-TIME-MS (epoch ms, integer or nil) as an org
@@ -7395,28 +8344,68 @@ nil/zero/garbage input."
   (when (and (integerp creation-time-ms) (> creation-time-ms 0))
     (format-time-string "[%Y-%m-%d %a]" (/ creation-time-ms 1000))))
 
+(defvar gdocs--tab-model-cache (make-hash-table :test #'eq :weakness 'key)
+  "Decoded tab models, keyed by the operation list they were decoded from.
+A pull renders every tab more than once, for the body and again for
+comment placement; decoding is the costly part.")
+
+(defun gdocs--tab-dm (tab revision doc-id)
+  "Return the doc-model of TAB at REVISION of DOC-ID, decoded once.
+The model is shared: copy it before changing it."
+  (let* ((ops (plist-get tab :ops))
+         (key (list revision doc-id (plist-get tab :title) (plist-get tab :ot-body)))
+         (cached (and ops (gethash ops gdocs--tab-model-cache))))
+    (if (and cached (equal (car cached) key))
+        (cdr cached)
+      (let ((model (gdocs-dm-from-ops revision doc-id (plist-get tab :title)
+                                      (plist-get tab :ot-body) ops)))
+        (when ops
+          (puthash ops (cons key model) gdocs--tab-model-cache))
+        model))))
+
+(defvar gdocs--tab-content-cache (make-hash-table :test #'equal)
+  "Rendered tab contents, keyed by a hash of what they are rendered from.
+Rendering checks that the Org text reads back, which costs a parse; a
+pull and the pushes after it render the same unchanged tabs again.")
+
+(defun gdocs--tab-content (tab revision doc-id depth)
+  "Return (CONTENT . REPORTS) for TAB of DOC-ID at REVISION.
+CONTENT is the tab's Org text with its headings DEPTH levels deeper and
+its Title and Subtitle paragraphs as plain text, and REPORTS its
+capability reports.  The result is cached by the tab's operations."
+  (let* ((key (secure-hash
+               'sha1 (let ((print-length nil) (print-level nil))
+                       (prin1-to-string (list (plist-get tab :ops) (plist-get tab :ot-body)
+                                              (plist-get tab :title) depth)))))
+         (cached (gethash key gdocs--tab-content-cache)))
+    (or cached
+        (let* ((model (copy-sequence (gdocs--tab-dm tab revision doc-id)))
+               (model
+                (plist-put
+                 model :paragraphs
+                 (mapcar
+                  (lambda (para)
+                    (let ((para (copy-sequence para)))
+                      (pcase (plist-get para :kind)
+                        (:heading
+                         (plist-put para :level
+                                    (+ depth (plist-get para :level))))
+                        ((or :title :subtitle) (plist-put para :kind :para))
+                        (_ para))))
+                  (gdocs-dm-paragraphs model))))
+               (result (cons (gdocs-dm-to-org model) (gdocs-dm-unsupported model))))
+          (when (> (hash-table-count gdocs--tab-content-cache) 1000)
+            (clrhash gdocs--tab-content-cache))
+          (puthash key result gdocs--tab-content-cache)
+          result))))
+
 (defun gdocs--render-tab-tree (tabs revision doc-id &optional comments)
   "Render TABS as Org content and return (CONTENT . CAPABILITY-REPORTS)."
   (let (parts reports)
     (dolist (tab tabs)
       (let* ((depth (length (plist-get tab :path)))
-             (model (gdocs-dm-from-ops
-                     revision doc-id (plist-get tab :title)
-                     (plist-get tab :ot-body) (plist-get tab :ops)))
-             (model
-              (plist-put
-               model :paragraphs
-               (mapcar
-                (lambda (para)
-                  (let ((para (copy-sequence para)))
-                    (pcase (plist-get para :kind)
-                      (:heading
-                       (plist-put para :level
-                                  (+ depth (plist-get para :level))))
-                      ((or :title :subtitle) (plist-put para :kind :para))
-                      (_ para))))
-                (gdocs-dm-paragraphs model))))
-             (content (gdocs-dm-to-org model))
+             (rendered (gdocs--tab-content tab revision doc-id depth))
+             (content (car rendered))
              (anchors (gdocs--decode-doco-anchors (plist-get tab :ops)))
              (tab-comments (seq-filter
                             (lambda (comment)
@@ -7427,7 +8416,7 @@ nil/zero/garbage input."
                            content (plist-get tab :ot-body) anchors tab-comments)
                         content))
              (icon (plist-get tab :icon)))
-        (setq reports (nconc reports (gdocs-dm-unsupported model)))
+        (setq reports (append reports (cdr rendered)))
         (push (concat (make-string depth ?*) " "
                       (if icon (concat icon " ") "")
                       (plist-get tab :title) "\n"
@@ -7802,7 +8791,8 @@ Unrecognized tab structures signal rather than returning a partial body."
                           (gdocs--tab-op-body single-ops))))
         (when (plist-get mc :revision)
           (setq revision (plist-get mc :revision)))
-        (let* ((ops (if tabs (plist-get (gdocs--root-tab tabs) :ops) single-ops))
+        (let* ((ops (if tabs (plist-get (gdocs--root-tab tabs) :ops)
+                      (gdocs--ops-to-char-positions single-ops (or ot-body ""))))
                (analysis (gdocs--decode-capability-analysis
                           ops (or ot-body ""))))
           (list :title title :token token :ouid ouid :revision revision
@@ -7977,53 +8967,60 @@ modelChunk we need for the op stream. Comments live in the cookie-auth
           (err (finish nil err))
           (t
            (condition-case setup-sig
-               (gdocs--fetch-docdetails-async
-                doc-id state
-                (lambda (details details-err)
-                  (when details-err
-                    (gdocs-log 'debug "docdetails fetch failed for %s: %s"
-                               doc-id details-err))
-                  (condition-case sig
-                      (let* ((creation-time-ms
-                              (and (listp details)
-                                   (alist-get 'CREATION_TIME details)))
-                             (built (gdocs--ot-decode-pipeline
-                                     doc-id edit-html state creation-time-ms))
-                             (title (car built))
-                             (body (cdr built))
-                             (tabs (plist-get state :tabs))
-                             (anchor-map (gdocs--decode-doco-anchors
-                                          (plist-get state :ot-ops)))
-                             (ot-body (plist-get state :ot-body)))
-                        (gdocs--docos-sync-raw-async
-                         doc-id state
-                         (lambda (raw _docos-err)
-                           (condition-case sig2
-                               (let* ((comments
-                                       (and raw
-                                            (gdocs--parse-docos-sync-response raw)))
-                                      (_namespace-available
-                                       (and comments
-                                            (gdocs--assert-comment-footnote-namespace-available
-                                             body)))
-                                      (body-with-refs
-                                       (if tabs
-                                           (gdocs--tabbed-comment-refs
-                                            body tabs comments)
-                                         (if (and comments ot-body)
-                                             (gdocs--inline-comment-refs
-                                              body ot-body anchor-map comments)
-                                           body)))
-                                      (final
-                                       (gdocs--append-comments-section
-                                        body-with-refs comments)))
-                                 (gdocs--apply-pull-into-buffer
-                                  doc-id buf title final snapshot
-                                  (plist-get state :revision))
-                                 (finish final nil))
-                             (error
-                              (finish nil (error-message-string sig2)))))))
-                    (error (finish nil (error-message-string sig))))))
+               ;; Document details and comments both need only STATE, so
+               ;; they are fetched in parallel.
+               (let ((details nil) (raw nil) (pending 2))
+                 (cl-flet
+                     ((build ()
+                        (unless done
+                          (condition-case sig
+                              (let* ((creation-time-ms
+                                      (and (listp details)
+                                           (alist-get 'CREATION_TIME details)))
+                                     (built (gdocs--ot-decode-pipeline
+                                             doc-id edit-html state creation-time-ms))
+                                     (title (car built))
+                                     (body (cdr built))
+                                     (tabs (plist-get state :tabs))
+                                     (anchor-map (gdocs--decode-doco-anchors
+                                                  (plist-get state :ot-ops)))
+                                     (ot-body (plist-get state :ot-body))
+                                     (comments
+                                      (and raw
+                                           (gdocs--parse-docos-sync-response raw)))
+                                     (_namespace-available
+                                      (and comments
+                                           (gdocs--assert-comment-footnote-namespace-available
+                                            body)))
+                                     (body-with-refs
+                                      (if tabs
+                                          (gdocs--tabbed-comment-refs
+                                           body tabs comments)
+                                        (if (and comments ot-body)
+                                            (gdocs--inline-comment-refs
+                                             body ot-body anchor-map comments)
+                                          body)))
+                                     (final
+                                      (gdocs--append-comments-section
+                                       body-with-refs comments)))
+                                (gdocs--apply-pull-into-buffer
+                                 doc-id buf title final snapshot
+                                 (plist-get state :revision))
+                                (finish final nil))
+                            (error (finish nil (error-message-string sig)))))))
+                   (gdocs--fetch-docdetails-async
+                    doc-id state
+                    (lambda (value details-err)
+                      (when details-err
+                        (gdocs-log 'debug "docdetails fetch failed for %s: %s"
+                                   doc-id details-err))
+                      (setq details value)
+                      (when (zerop (cl-decf pending)) (build))))
+                   (gdocs--docos-sync-raw-async
+                    doc-id state
+                    (lambda (value _docos-err)
+                      (setq raw value)
+                      (when (zerop (cl-decf pending)) (build))))))
              (error (finish nil (error-message-string setup-sig)))))))))))
 
 (defface gdocs-pull-flash
@@ -8776,7 +9773,7 @@ body is never rewritten."
   (with-temp-buffer
     (let ((org-inhibit-startup t))
       (insert (or text "")))
-    (org-mode)
+    (gdocs--org-scratch-mode)
     (let ((tree (org-element-parse-buffer))
           replacements)
       (org-element-map tree '(keyword export-snippet link)
@@ -8859,17 +9856,30 @@ stale buffer-local capability metadata cannot bypass policy."
           (append
            (plist-get local :inline-marker-errors)
            (gdocs--remote-inline-object-validation-errors
-            (plist-get remote :unsupported))
-           (gdocs--capability-object-matching-errors
-            local-objects remote-objects
-            (eq (plist-get plan :inline-object-scope) :partial))))
+            (cl-remove-if (lambda (report)
+                            (member (plist-get report :entity-id)
+                                    (plist-get plan :cleanup-ids)))
+                          (plist-get remote :unsupported)))
+           ;; An in-place plan creates and deletes objects itself, and its
+           ;; save is verified against the objects it planned.
+           (unless (plist-get plan :surgical)
+             (gdocs--capability-object-matching-errors
+              local-objects remote-objects
+              (eq (plist-get plan :inline-object-scope) :partial)))))
          (local-reports (plist-get local :unsupported))
-         (reports (gdocs--capability-merge
-                   (plist-get remote :unsupported)
-                   (cl-remove-if
-                    (lambda (report)
-                      (eq (plist-get report :source) :local-object))
-                    local-reports)))
+         (reports (cl-remove-if
+                   (lambda (report)
+                     (or (member (plist-get report :entity-id)
+                                 (plist-get plan :cleanup-ids))
+                         ;; An in-place plan never writes notice lines.
+                         (and (plist-get plan :surgical)
+                              (eq (plist-get report :kind) :local-unsupported))))
+                   (gdocs--capability-merge
+                    (plist-get remote :unsupported)
+                    (cl-remove-if
+                     (lambda (report)
+                       (eq (plist-get report :source) :local-object))
+                     local-reports))))
          ;; Reports whose policy allows push regardless of context (document
          ;; settings outside the replaced body) never block any plan kind,
          ;; including the conservative no-op path.
@@ -8911,6 +9921,18 @@ stale buffer-local capability metadata cannot bypass policy."
              destructive :full-replace))))
        ((eq kind :incremental)
         (let* ((ranges (plist-get plan :ranges))
+               ;; An in-place plan never rewrites styles or paragraph and
+               ;; list attributes, so they are kept even where the scanner
+               ;; cannot place them.
+               (blocking (if (plist-get plan :surgical)
+                             (cl-remove-if
+                              (lambda (report)
+                                (memq (plist-get report :kind)
+                                      '(:unsupported-style :unsupported-paragraph
+                                        :unsupported-entity :document-settings
+                                        :annotation-state)))
+                              blocking)
+                           blocking))
                (hard (cl-remove-if-not
                       (lambda (report)
                         (or (plist-get report :refuse-push)
@@ -9340,6 +10362,8 @@ of OT ops (alists). Returns parsed JSON response (XSSI-stripped)."
                               (or (plist-get state :tab-id) gdocs-docs-tab))))
          (url (format "https://docs.google.com/document/u/0/d/%s/save?%s"
                       doc-id qs))
+         (commands (gdocs--commands-to-utf16
+                    commands (or (plist-get state :ot-body) "")))
          (commands (if (plist-get state :tab-id)
                        (mapcar (lambda (op)
                                  `((ty . "nm")
@@ -9808,6 +10832,8 @@ On curl error, ERR is a string."
                               (or (plist-get state :tab-id) gdocs-docs-tab))))
          (url (format "https://docs.google.com/document/u/0/d/%s/save?%s"
                       doc-id qs))
+         (commands (gdocs--commands-to-utf16
+                    commands (or (plist-get state :ot-body) "")))
          (commands (if (plist-get state :tab-id)
                        (mapcar (lambda (op)
                                  `((ty . "nm")

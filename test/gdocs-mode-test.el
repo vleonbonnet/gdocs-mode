@@ -826,13 +826,33 @@ commented item and a link; `t.kid', a child of the original tab, is empty."
   (list :revision 7 :token "token" :ouid "ouid"
         :tabs (gdocs--tabs-from-ops (gdocs-test--work-tab-ops))))
 
-(defun gdocs-test--work-plan (from to)
-  "Plan the push that replaces FROM with TO in the rendered work tab."
-  (let* ((state (gdocs-test--work-state))
-         (body (car (gdocs--render-tab-tree (plist-get state :tabs) 7 "d")))
+(defun gdocs-test--state-plan (state from to)
+  "Plan the push that replaces FROM with TO in the rendered tabs of STATE."
+  (let* ((body (car (gdocs--render-tab-tree (plist-get state :tabs) 7 "d")))
          (edited (string-replace from to body)))
     (should-not (equal edited body))
     (plist-get (gdocs--tab-push-plan "d" state edited) :plan)))
+
+(defun gdocs-test--work-plan (from to)
+  "Plan the push that replaces FROM with TO in the rendered work tab."
+  (gdocs-test--state-plan (gdocs-test--work-state) from to))
+
+(defun gdocs-test--one-tab-state (body &optional ops)
+  "Return an edit state whose tab `t.work' holds BODY styled by OPS."
+  (list :revision 7 :token "token" :ouid "ouid"
+        :tabs (gdocs--tabs-from-ops
+               (append (list '((ty . "mkch") (d (1 "Root")))
+                             '((ty . "ac") (d "t.work" (1 "Work") (0)))
+                             '((ty . "is") (s . "Root body\n")))
+                       (mapcar (lambda (op) `((ty . "nm") (nmr "ksm" "t.work") (nmc . ,op)))
+                               (cons (gdocs-test--insert-op body) ops))))))
+
+(defun gdocs-test--commands-of (plan &optional type style)
+  "Return PLAN's commands of TYPE, and of STYLE when it is non-nil."
+  (seq-filter (lambda (command)
+                (and (or (null type) (equal (alist-get 'ty command) type))
+                     (or (null style) (equal (alist-get 'st command) style))))
+              (plist-get plan :commands)))
 
 (ert-deftest gdocs-test-tabs-original-tab-takes-free-position ()
   "The `mkch' tab may carry an icon and sit after reordered tabs."
@@ -876,11 +896,15 @@ commented item and a link; `t.kid', a child of the original tab, is empty."
                  '(((ty . "as") (st . "text") (si . 38) (ei . 41)
                     (sm (ts_bd . t) (ts_bd_i . :json-false)))))))
 
-(ert-deftest gdocs-test-tab-in-place-refuses-losing-a-comment ()
-  "Replacing all the text a comment is anchored to is refused."
-  (should-error (gdocs-test--work-plan "- Item two" "- Zzz")
-                :type 'user-error)
-  (should (gdocs-test--work-plan "- Item two" "- Item")))
+(ert-deftest gdocs-test-tab-in-place-deletes-a-comment-text ()
+  "Deleting all of a comment's text is planned and expected to remove it."
+  (let ((all (gdocs-test--work-plan "- Item two" "- Zzz"))
+        (part (gdocs-test--work-plan "- Item two" "- Item")))
+    (should (equal (car (plist-get all :commands)) '((ty . "ds") (si . 38) (ei . 45))))
+    (should (equal (plist-get all :removed-ids) '("kix.comment")))
+    (should-not (plist-get all :expect-ids))
+    (should-not (plist-get part :removed-ids))
+    (should (equal (plist-get part :expect-ids) '("kix.comment")))))
 
 (ert-deftest gdocs-test-tab-adds-and-removes-whole-paragraphs ()
   "Paragraphs are added at the start of the next one and removed whole."
@@ -891,9 +915,203 @@ commented item and a link; `t.kid', a child of the original tab, is empty."
     (should (cl-every (lambda (command) (equal (alist-get 'st command) "text"))
                       (cdr added))))
   (should (equal (plist-get (gdocs-test--work-plan "\nTail" "") :commands)
-                 '(((ty . "ds") (si . 60) (ei . 64)))))
-  (should-error (gdocs-test--work-plan "- Item two" "- Item two\n- Item three")
-                :type 'user-error))
+                 '(((ty . "ds") (si . 60) (ei . 64))))))
+
+(ert-deftest gdocs-test-tab-new-list-item-joins-its-list ()
+  "An item added to an Org list is bound to the remote list it continues."
+  (let ((plan (gdocs-test--work-plan "- Item two" "- Item two\n- Item three")))
+    (should (equal (car (plist-get plan :commands))
+                   '((ty . "is") (ibi . 47) (s . "Item three\n"))))
+    (should (equal (alist-get 'sm (car (gdocs-test--commands-of plan "as" "list")))
+                   '((ls_nest . 0) (ls_id . "kix.list"))))
+    (should-not (gdocs-test--commands-of plan "ae"))))
+
+(ert-deftest gdocs-test-tab-new-numbered-list-defines-its-levels ()
+  "A new numbered list is defined once, with Google's glyph per level."
+  (let* ((plan (gdocs-test--state-plan (gdocs-test--one-tab-state "Plain\nTail\n")
+                                       "Tail\n" "Tail\n1. one\n   1. sub\n"))
+         (definitions (gdocs-test--commands-of plan "ae"))
+         (levels (alist-get 'le_nb (alist-get 'epm (car definitions))))
+         (bindings (gdocs-test--commands-of plan "as" "list")))
+    (should (length= definitions 1))
+    (should (equal (mapcar (lambda (n)
+                             (alist-get 'b_gt (alist-get (intern (format "nl_%d" n)) levels)))
+                           '(0 1 2 3))
+                   '(10 13 15 10)))
+    (should (equal (mapcar (lambda (command) (alist-get 'ls_nest (alist-get 'sm command)))
+                           bindings)
+                   '(0 1)))
+    (should (equal (alist-get 'ls_id (alist-get 'sm (car bindings)))
+                   (alist-get 'id (car definitions))))))
+
+(ert-deftest gdocs-test-tab-appends-after-the-last-paragraph ()
+  "A paragraph added at the end of a tab takes the tab's final newline."
+  (should (equal (car (plist-get (gdocs-test--work-plan "\nTail" "\nTail\nAfter tail")
+                                 :commands))
+                 '((ty . "is") (ibi . 65) (s . "After tail"))))
+  (let ((plan (gdocs-test--state-plan (gdocs-test--one-tab-state "Intro\nTail")
+                                      "\nTail\n" "\nTail\nMore\n")))
+    (should (equal (car (plist-get plan :commands))
+                   '((ty . "is") (ibi . 11) (s . "\nMore"))))
+    (should (cl-every (lambda (command) (alist-get 'sm command))
+                      (gdocs-test--commands-of plan "as")))))
+
+(defun gdocs-test--two-item-state ()
+  "Return a state whose tab ends with a two-item list and no final newline."
+  (gdocs-test--one-tab-state
+   "Intro\nOne\nTwo"
+   (list (gdocs-test--list-definition-op '(:id "kix.list" :glyph :bullet))
+         '((ty . "as") (st . "list") (si . 10) (ei . 10) (sm (ls_id . "kix.list") (ls_nest . 0)))
+         '((ty . "as") (st . "list") (si . 14) (ei . 14) (sm (ls_id . "kix.list") (ls_nest . 0)))
+         '((ty . "as") (st . "paragraph") (si . 10) (ei . 14)
+           (sm (ps_il . 36.0) (ps_il_i . :json-false))))))
+
+(ert-deftest gdocs-test-tab-removes-the-last-paragraphs ()
+  "Removing a tab's last paragraphs leaves no empty paragraph at its end."
+  (let ((state (gdocs-test--two-item-state)))
+    (should (equal (plist-get (gdocs-test--state-plan state "- Two\n" "") :commands)
+                   '(((ty . "ds") (si . 10) (ei . 13))
+                     ((ty . "as") (st . "paragraph") (si . 10) (ei . 10)
+                      (sm (ps_il_i . :json-false) (ps_il . 36.0)))
+                     ((ty . "as") (st . "list") (si . 10) (ei . 10)
+                      (sm (ls_nest . 0) (ls_id . "kix.list"))))))
+    (should (equal (plist-get (gdocs-test--state-plan state "- One\n- Two\n" "") :commands)
+                   '(((ty . "ds") (si . 6) (ei . 13))
+                     ((ty . "as") (st . "paragraph") (si . 6) (ei . 6) (sm (ps_il_i . t)))
+                     ((ty . "as") (st . "list") (si . 6) (ei . 6) (sm (ls_id))))))
+    (let ((plan (gdocs-test--state-plan state "- One\n- Two\n" "\nDone\n")))
+      (should (equal (seq-take (plist-get plan :commands) 2)
+                     '(((ty . "ds") (si . 7) (ei . 13))
+                       ((ty . "is") (ibi . 7) (s . "\nDone")))))
+      (should (member '((ty . "as") (st . "list") (si . 12) (ei . 12) (sm (ls_id)))
+                      (plist-get plan :commands))))))
+
+(defun gdocs-test--chip-state ()
+  "Return a state whose tab holds person chip `kix.p' and an orphan entity."
+  (gdocs-test--one-tab-state
+   (concat "Lead: " (string gdocs--ot-chip-codepoint) " here\nTail\n")
+   '(((ty . "ae") (et . "person") (id . "kix.p")
+      (epm (per_n . "Jane Doe") (per_e . "jane@example.com")))
+     ((ty . "te") (id . "kix.p") (spi . 7))
+     ((ty . "ae") (et . "person") (id . "kix.orphan")
+      (epm (per_n . "Gone") (per_e . "gone@example.com"))))))
+
+(ert-deftest gdocs-test-tab-deletes-a-chip-with-its-entity ()
+  "A deleted chip's entity is deleted before its placeholder."
+  (let ((plan (gdocs-test--state-plan (gdocs-test--chip-state)
+                                      "[[gdocs-chip:person:kix.p][Jane Doe]] " "")))
+    (should (equal (plist-get plan :commands)
+                   '(((ty . "de") (id . "kix.orphan") (et . "person"))
+                     ((ty . "de") (id . "kix.p") (et . "person"))
+                     ((ty . "ds") (si . 7) (ei . 8)))))
+    (should (equal (plist-get plan :removed-ids) '("kix.p")))
+    (should (equal (plist-get plan :cleanup-ids) '("kix.orphan")))))
+
+(ert-deftest gdocs-test-tab-creates-chips ()
+  "New chips get a fresh entity attached to their placeholder."
+  (let ((state (gdocs-test--chip-state)))
+    (cl-flet ((created (to)
+                (let* ((plan (gdocs-test--state-plan state "Tail" (concat "Tail " to)))
+                       (entity (car (gdocs-test--commands-of plan "ae")))
+                       (attach (car (gdocs-test--commands-of plan "te"))))
+                  (should (equal (alist-get 's (car (gdocs-test--commands-of plan "is")))
+                                 (concat " " (string gdocs--ot-chip-codepoint))))
+                  (should (equal (alist-get 'id attach) (alist-get 'id entity)))
+                  (should (equal (alist-get 'spi attach) 19))
+                  (should (equal (plist-get plan :created-ids) (list (alist-get 'id entity))))
+                  (should (member (alist-get 'id entity) (plist-get plan :expect-ids)))
+                  (alist-get 'epm entity))))
+      (should (equal (created "[[gdocs-chip:person:bob@example.com][Bob]]")
+                     '((per_n . "Bob") (per_e . "bob@example.com"))))
+      (should (equal (created "[[gdocs-chip:person:new][Jane Doe]]")
+                     '((per_n . "Jane Doe") (per_e . "jane@example.com"))))
+      (let ((date (alist-get 'dat_df (created "[[gdocs-chip:date:new][2026-11-20 Fri]]"))))
+        (should (= (alist-get 'tv_s (alist-get 'tv (alist-get 'dfie_ts date))) 1795176000.0))
+        (should (equal (alist-get 'dfie_dt date) "Nov 20, 2026")))
+      (should-error (gdocs-test--state-plan
+                     state "Tail" "Tail [[gdocs-chip:person:new][Nobody]]")
+                    :type 'user-error))))
+
+(ert-deftest gdocs-test-date-chip-change-keeps-its-time ()
+  "Changing a timed date chip's day keeps its time of day."
+  (let* ((previous '((dat_df (dfie_ts (tv (tv_s . 1794850440.0) (tv_n . 0)))
+                             (dfie_dt . "Nov 16, 2026 5:34 PM") (dfie_tpt . 1))))
+         (epm (gdocs--date-chip-epm '(2026 11 18) previous))
+         (date (alist-get 'dat_df epm)))
+    (should (= (alist-get 'tv_s (alist-get 'tv (alist-get 'dfie_ts date)))
+               (+ 1794850440.0 (* 2 86400))))
+    (should (equal (alist-get 'dfie_dt date) "Nov 18, 2026 5:34 PM"))))
+
+(defun gdocs-test--table-state ()
+  "Return a state whose tab holds a one-row table and no final newline."
+  (let ((table (gdocs--emit-table-body-and-ops
+                (list :kind :table
+                      :rows (list (list (list (gdocs-dm-make-run "A"))
+                                        (list (gdocs-dm-make-run "B")))))
+                7)))
+    (gdocs-test--one-tab-state (concat "Intro\n" (car table) "\nTail") (cdr table))))
+
+(ert-deftest gdocs-test-tab-edits-table-cells-in-place ()
+  "Cell text changes in place; a changed table structure replaces the table."
+  (let ((state (gdocs-test--table-state)))
+    (should (equal (plist-get (gdocs-test--state-plan state "| A | B |" "| A | Bee |")
+                              :commands)
+                   '(((ty . "is") (ibi . 14) (s . "ee")))))
+    (let ((plan (gdocs-test--state-plan state "| A | B |" "| A | B |\n| C | D |")))
+      (should (equal (alist-get 's (car (gdocs-test--commands-of plan "is")))
+                     (concat (string gdocs--ot-table-open gdocs--ot-row-end
+                                     gdocs--ot-cell-end)
+                             "A\n" (string gdocs--ot-cell-end) "B\n"
+                             (string gdocs--ot-row-end gdocs--ot-cell-end)
+                             "C\n" (string gdocs--ot-cell-end) "D\n"
+                             (string gdocs--ot-table-close) "\n")))
+      (should (gdocs-test--commands-of plan "as" "tbl"))
+      (should (equal (car (last (plist-get plan :commands)))
+                     '((ty . "ds") (si . 7) (ei . 15)))))))
+
+(ert-deftest gdocs-test-utf16-positions-convert-both-ways ()
+  "Google counts positions in UTF-16 units; the package counts characters."
+  (let ((body "Smile 😀 here\nTail\n"))
+    (should (equal (gdocs--ops-to-char-positions
+                    '(((ty . "as") (st . "text") (si . 10) (ei . 13) (sm)))
+                    body)
+                   '(((ty . "as") (st . "text") (si . 9) (ei . 12) (sm)))))
+    (should (equal (gdocs--commands-to-utf16
+                    '(((ty . "is") (ibi . 9) (s . "x😀"))
+                      ((ty . "ds") (si . 11) (ei . 14)))
+                    body)
+                   '(((ty . "is") (ibi . 10) (s . "x😀"))
+                     ((ty . "ds") (si . 13) (ei . 16)))))
+    (let ((ops (list (list '(ty . "is") '(ibi . 3)))))
+      (should (eq (gdocs--ops-to-char-positions ops "plain") ops)))))
+
+(ert-deftest gdocs-test-list-binding-without-id-ends-the-list ()
+  "A list binding without `ls_id' takes the paragraph out of its list."
+  (let* ((body "One\nTwo\n")
+         (ops (list (gdocs-test--insert-op body)
+                    (gdocs-test--list-definition-op '(:id "kix.list" :glyph :bullet))
+                    '((ty . "as") (st . "list") (si . 4) (ei . 4) (sm (ls_id . "kix.list")))
+                    '((ty . "as") (st . "list") (si . 8) (ei . 8) (sm (ls_id . "kix.list")))
+                    '((ty . "as") (st . "list") (si . 8) (ei . 8) (sm (ls_id)))))
+         (paragraphs (gdocs-dm-paragraphs (gdocs-dm-from-ops 1 "d" nil body ops))))
+    (should (equal (mapcar (lambda (paragraph) (plist-get paragraph :kind)) paragraphs)
+                   '(:list :para)))))
+
+(ert-deftest gdocs-test-render-reads-back-exactly ()
+  "Text that Org would read as markup is rendered so that it reads back."
+  (dolist (runs (list (list (gdocs-dm-make-run "- not a list item"))
+                      (list (gdocs-dm-make-run "x = a_b + c^d"))
+                      (list (gdocs-dm-make-run "a *b* c"))
+                      (list (gdocs-dm-make-run "i += 4; j = 2" '(:verbatim)))
+                      (list (gdocs-dm-make-run "Follow")
+                            (gdocs-dm-make-run " this link " '(:underline) "https://x.example")
+                            (gdocs-dm-make-run "directly"))
+                      (list (gdocs-dm-make-run "bold" '(:bold))
+                            (gdocs-dm-make-run "\tafter a tab"))))
+    (let* ((org (gdocs-dm-to-org (list :paragraphs (list (list :kind :para :runs runs)))))
+           (back (car (gdocs-dm-paragraphs (gdocs-dm-from-org org)))))
+      (should (equal (gdocs-dm-runs-text (plist-get back :runs))
+                     (gdocs-dm-runs-text runs))))))
 
 (ert-deftest gdocs-test-tab-prediction-detects-unexpected-content ()
   "A fresh state matches the prediction only when it decodes as planned."
@@ -5566,7 +5784,7 @@ that a removed preflight guard would be observed as an unexpected success."
                    (gdocs--emit-list-style-op
                     "list.custom" 0 (gdocs-test--line-end-pos body 1))))
          (binding-sm (alist-get 'sm binding)))
-    (setcdr (assq 'b_gt level) 10)
+    (setcdr (assq 'b_gt level) 11)
     (setcdr (assq 'b_gs level) "◆")
     (setcdr (assq 'b_gf level) "%0)")
     (setcdr (assq 'b_ifl level) 27.0)
