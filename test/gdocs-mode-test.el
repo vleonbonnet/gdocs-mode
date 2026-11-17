@@ -1165,6 +1165,79 @@ commented item and a link; `t.kid', a child of the original tab, is empty."
     (should (equal (car commands) '((ty . "is") (ibi . 8) (s . " next"))))
     (should (eq (alist-get 'ts_it (alist-get 'sm (nth 1 commands))) :json-false))))
 
+(defun gdocs-test--dropdown-state ()
+  "Return a state whose tab holds a status dropdown and a person placeholder."
+  (let ((chip (string gdocs--ot-chip-codepoint)))
+    (gdocs-test--one-tab-state
+     (concat chip " Task\nOwner: " chip "\n")
+     `(((ty . "ae") (et . "dropdown-definition") (id . "kix.def")
+        (epm (ddefe-ddi (cv (op . "set")
+                            (opValue . [((di-v . "Open") (di-id . "item.open") (di-dv . "[Open]"))
+                                        ((di-v . "Done") (di-id . "item.done") (di-dv . "[Done]"))])))
+             (ddefe-t . "Status")))
+       ((ty . "ae") (et . "dropdown") (id . "kix.dd")
+        (epm (dde-sii . "item.open") (dde-fdv . "[Open]") (dde_di . "kix.def")))
+       ((ty . "te") (id . "kix.dd") (spi . 1))
+       ((ty . "ae") (et . "placeholder") (id . "kix.ph")
+        (epm (phe_pt . 1) (phe_dt . "Person")))
+       ((ty . "te") (id . "kix.ph") (spi . 15))))))
+
+(defconst gdocs-test--open-chip
+  "[[gdocs-chip:dropdown:kix.dd][\u200b[\u200bOpen\u200b]\u200b]]"
+  "The Org link of the dropdown in `gdocs-test--dropdown-state'.")
+
+(ert-deftest gdocs-test-dropdown-and-placeholder-chips-render ()
+  "Dropdown and placeholder chips render as chip links that read back."
+  (let* ((state (gdocs-test--dropdown-state))
+         (body (car (gdocs--render-tab-tree (plist-get state :tabs) 7 "d"))))
+    (should (string-search (concat gdocs-test--open-chip " Task\n") body))
+    (should (string-search "Owner: [[gdocs-chip:placeholder:kix.ph][Person]]\n" body))
+    (should-not (string-search (string gdocs--ot-chip-codepoint) body))
+    (should (equal (plist-get (gdocs-test--state-plan state "Task" "Tasks") :commands)
+                   '(((ty . "is") (ibi . 7) (s . "s")))))))
+
+(ert-deftest gdocs-test-dropdown-option-changes-in-place ()
+  "A new option updates the dropdown entity, as Google Docs does."
+  (let ((state (gdocs-test--dropdown-state)))
+    (dolist (option (list "\u200b[\u200bDone\u200b]\u200b" "done" "Done"))
+      (let ((plan (gdocs-test--state-plan
+                   state gdocs-test--open-chip
+                   (format "[[gdocs-chip:dropdown:kix.dd][%s]]" option))))
+        (should (equal (plist-get plan :commands)
+                       '(((ty . "ue") (id . "kix.dd") (et . "dropdown")
+                          (epm (dde-sii . "item.done") (dde-fdv . "[Done]"))))))
+        (should (equal (plist-get plan :expect-ids) '("kix.dd" "kix.ph")))))
+    (should-error (gdocs-test--state-plan
+                   state gdocs-test--open-chip "[[gdocs-chip:dropdown:kix.dd][Later]]")
+                  :type 'user-error)))
+
+(ert-deftest gdocs-test-dropdown-copy-creates-a-dropdown ()
+  "A copied dropdown link creates a dropdown of the same definition."
+  (let* ((plan (gdocs-test--state-plan (gdocs-test--dropdown-state) "Task"
+                                       "Task [[gdocs-chip:dropdown:kix.dd][Done]]"))
+         (entity (car (gdocs-test--commands-of plan "ae"))))
+    (should (equal (alist-get 'et entity) "dropdown"))
+    (should (equal (alist-get 'epm entity)
+                   '((dde-sii . "item.done") (dde-fdv . "[Done]") (dde_di . "kix.def"))))
+    (should (member (alist-get 'id entity) (plist-get plan :created-ids)))))
+
+(ert-deftest gdocs-test-placeholder-is-filled-and-created ()
+  "A placeholder is filled by a chip that replaces it, and can be created."
+  (let* ((state (gdocs-test--dropdown-state))
+         (filled (gdocs-test--state-plan
+                  state "[[gdocs-chip:placeholder:kix.ph][Person]]"
+                  "[[gdocs-chip:person:jane@example.com][Jane Doe]]"))
+         (created (gdocs-test--state-plan state "Task" "Task [[gdocs-chip:placeholder:new][Date]]")))
+    (should (equal (car (plist-get filled :commands))
+                   '((ty . "de") (id . "kix.ph") (et . "placeholder"))))
+    (should (equal (alist-get 'epm (car (gdocs-test--commands-of filled "ae")))
+                   '((per_n . "Jane Doe") (per_e . "jane@example.com"))))
+    (should (equal (plist-get filled :removed-ids) '("kix.ph")))
+    (should (equal (alist-get 'epm (car (gdocs-test--commands-of created "ae")))
+                   '((phe_pt . 3) (phe_dt . "Date"))))
+    (should-error (gdocs-test--state-plan state "Task" "Task [[gdocs-chip:placeholder:new][Place]]")
+                  :type 'user-error)))
+
 (defun gdocs-test--table-state ()
   "Return a state whose tab holds a one-row table and no final newline."
   (let ((table (gdocs--emit-table-body-and-ops

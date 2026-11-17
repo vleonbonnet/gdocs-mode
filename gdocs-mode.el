@@ -1610,7 +1610,10 @@ caller's `gdocs-auth-function' is used."
      ("inline" . :recognized-not-editable)
      ("date" . :recognized-not-editable)
      ("person" . :recognized-not-editable)
-     ("first-party-link" . :recognized-not-editable))
+     ("first-party-link" . :recognized-not-editable)
+     ("dropdown" . :recognized-not-editable)
+     ("dropdown-definition" . :recognized-not-editable)
+     ("placeholder" . :recognized-not-editable))
     (:attribute
      ("text" . :recognized)
      ("link" . :recognized)
@@ -2401,10 +2404,38 @@ fallback for older payloads."
       (plist-get object :label)))
 
 (defconst gdocs--chip-entity-types
-  '(("date" . :chip-date) ("person" . :chip-person) ("first-party-link" . :chip-file))
+  '(("date" . :chip-date) ("person" . :chip-person) ("first-party-link" . :chip-file)
+    ("dropdown" . :chip-dropdown) ("placeholder" . :chip-placeholder))
   "Google entity types decoded as chips, with their object kinds.
 A `first-party-link' entity is a file chip: a link to a Google Drive
-file shown with the file's title.")
+file shown with the file's title.  A `dropdown' entity shows one option
+of a `dropdown-definition' entity.  A `placeholder' entity asks for a
+person or a date, and is filled by replacing it with that chip.")
+
+(defconst gdocs--chip-link-kinds
+  '(("date" . :chip-date) ("person" . :chip-person) ("file" . :chip-file)
+    ("dropdown" . :chip-dropdown) ("placeholder" . :chip-placeholder))
+  "Kind names of chip links, see `gdocs--chip-link-prefix', with object kinds.")
+
+(defconst gdocs--placeholder-types '(("Person" . 1) ("Date" . 3))
+  "Google's type numbers for placeholder chips, by the label they show.")
+
+(defun gdocs--labelled-chip-object (op)
+  "Decode dropdown or placeholder chip definition OP, or nil.
+The text the chip shows is its `:chip-value'.  A dropdown also records
+its `:definition', the `dropdown-definition' entity that lists its
+options."
+  (let* ((epm (alist-get 'epm op))
+         (dropdown (equal (alist-get 'et op) "dropdown"))
+         (label (alist-get (if dropdown 'dde-fdv 'phe_dt) epm)))
+    (when (and (stringp (alist-get 'id op)) (gdocs--valid-chip-label-p label))
+      (append (list :kind :inline-object
+                    :object-kind (if dropdown :chip-dropdown :chip-placeholder)
+                    :entity-id (alist-get 'id op)
+                    :label label
+                    :ymd nil
+                    :chip-value label)
+              (and dropdown (list :definition (alist-get 'dde_di epm)))))))
 
 (defun gdocs--file-chip-object (op)
   "Decode file chip definition OP, a `first-party-link' entity, or nil.
@@ -2434,9 +2465,10 @@ calendar date for date chips, the contact name for person chips, the
 URL for file chips), which is what push matching compares; `:label'
 retains Google's display text for the Org rendering.  A changed semantic
 value is reported as a changed object rather than silently rewritten."
-  (if (equal (alist-get 'et op) "first-party-link")
-      (gdocs--file-chip-object op)
-    (gdocs--date-person-chip-object op)))
+  (pcase (alist-get 'et op)
+    ("first-party-link" (gdocs--file-chip-object op))
+    ((or "dropdown" "placeholder") (gdocs--labelled-chip-object op))
+    (_ (gdocs--date-person-chip-object op))))
 
 (defun gdocs--date-person-chip-object (op)
   "Decode a date or person chip definition OP, see `gdocs--chip-entity-object'."
@@ -2483,7 +2515,7 @@ parse returns nil so the marker fails closed."
                               (1+ (length gdocs--chip-link-prefix)))))))
       (when (and (stringp full)
                  (string-match
-                  "\\`\\(date\\|person\\|file\\):\\([^[:space:]]+\\)\\'" full))
+                  "\\`\\(date\\|person\\|file\\|dropdown\\|placeholder\\):\\([^[:space:]]+\\)\\'" full))
         (let* ((kind (match-string 1 full))
                (entity-id (match-string 2 full))
                (begin (org-element-property :contents-begin el))
@@ -2504,6 +2536,15 @@ parse returns nil so the marker fails closed."
                                                 (nth 0 ymd)
                                                 (nth 1 ymd)
                                                 (nth 2 ymd))))))
+              ((or "dropdown" "placeholder")
+               (and (gdocs--valid-inline-object-id-p entity-id)
+                    (let ((label (gdocs--unescape-org-inline desc t)))
+                      (list :kind :inline-object
+                            :object-kind (alist-get kind gdocs--chip-link-kinds nil nil #'equal)
+                            :entity-id entity-id
+                            :label label
+                            :ymd nil
+                            :chip-value label))))
               ("file"
                (let ((target (gdocs--file-chip-target entity-id)))
                  (and target
@@ -2546,6 +2587,13 @@ the URL itself."
              gdocs--chip-link-prefix
              (plist-get object :entity-id)
              (or (plist-get object :label) "")))
+    ((or :chip-dropdown :chip-placeholder)
+     ;; Dropdown options often hold brackets, escaped as in a description.
+     (format "[[%s:%s:%s][%s]]"
+             gdocs--chip-link-prefix
+             (car (rassq (plist-get object :object-kind) gdocs--chip-link-kinds))
+             (plist-get object :entity-id)
+             (gdocs--escape-org-inline (plist-get object :chip-value) t)))
     (:chip-file
      ;; A title may hold brackets; it is escaped as a link description.
      (format "[[%s:file:%s:%s][%s]]"
@@ -3891,7 +3939,7 @@ or heading, stays inline in its paragraph."
          (out (list :kind kind :runs runs)))
     (when inline-object
       (dolist (key '(:entity-id :object-kind :content-id :width :height
-                                :label :title :ymd :chip-value :ot-position))
+                                :label :title :ymd :chip-value :definition :ot-position))
         (when (plist-member inline-object key)
           (setq out (plist-put out key (plist-get inline-object key))))))
     (when (and (eq kind :heading) heading)
@@ -6515,8 +6563,7 @@ comparison; decoder-only inline-object metadata does not."
                     (and (stringp (plist-get object :content-id))
                          (numberp (plist-get object :width))
                          (numberp (plist-get object :height))))
-                   ((memq (plist-get object :object-kind)
-                          '(:chip-date :chip-person :chip-file))
+                   ((rassq (plist-get object :object-kind) gdocs--chip-entity-types)
                     (gdocs--valid-chip-label-p
                      (plist-get object :chip-value)))
                    (t nil)))
@@ -7503,6 +7550,58 @@ The pairs are in ascending order."
       (setq previous-i (1+ (car anchor)) previous-j (1+ (cdr anchor))))
     (nreverse pairs)))
 
+(defun gdocs--dropdown-cell-id (cell)
+  "Return the entity id of CELL when it holds a dropdown chip, or nil."
+  (and (eq (plist-get (nth 3 cell) :object-kind) :chip-dropdown)
+       (plist-get (nth 3 cell) :entity-id)))
+
+(defun gdocs--hunk-parts (hunk before after)
+  "Split diff HUNK of cell vectors BEFORE and AFTER around dropdown updates.
+A dropdown chip whose entity stays but whose text changes is an update of
+that entity, not a deletion and a creation.  Return a list of parts
+\(FROM TO AFTER-FROM AFTER-TO), each a smaller hunk, where a part that
+ends with `:update' covers one updated chip.  Empty parts are dropped."
+  (let ((parts nil)
+        (from (nth 0 hunk)) (to (nth 1 hunk))
+        (after-from (nth 2 hunk)) (after-to (nth 3 hunk)))
+    (catch 'done
+      (while t
+        (let* ((pair (cl-loop for i from from below to
+                              for id = (gdocs--dropdown-cell-id (aref before i))
+                              thereis (and id
+                                           (cl-loop for j from after-from below after-to
+                                                    when (equal (gdocs--dropdown-cell-id
+                                                                 (aref after j))
+                                                                id)
+                                                    return (cons i j))))))
+          (unless pair
+            (when (or (< from to) (< after-from after-to))
+              (push (list from to after-from after-to) parts))
+            (throw 'done nil))
+          (when (or (< from (car pair)) (< after-from (cdr pair)))
+            (push (list from (car pair) after-from (cdr pair)) parts))
+          (push (list (car pair) (1+ (car pair)) (cdr pair) (1+ (cdr pair)) :update) parts)
+          (setq from (1+ (car pair)) after-from (1+ (cdr pair))))))
+    (nreverse parts)))
+
+(defun gdocs--dropdown-update-edit (index offset old new entities)
+  "Return the edit that changes the option of a dropdown chip in place.
+OLD and NEW are the chip's cells before and after, at OFFSET in
+paragraph INDEX; ENTITIES is the document's entity table.  The edit
+replaces the cell with NEW naming the option exactly, and its `:update'
+is the `ue' operation that Google Docs itself sends."
+  (let* ((identity (nth 3 new))
+         (id (plist-get identity :entity-id))
+         (option (gdocs--dropdown-option (gdocs--dropdown-definition id entities)
+                                         (plist-get identity :chip-value)))
+         (cell (list (nth 0 old) (nth 1 old) (nth 2 old)
+                     (plist-put (copy-sequence identity) :chip-value
+                                (alist-get 'di-dv option)))))
+    (list :index index :offset offset :delete 1 :insert (vector cell)
+          :update `((ty . "ue") (id . ,id) (et . "dropdown")
+                    (epm (dde-sii . ,(alist-get 'di-id option))
+                         (dde-fdv . ,(alist-get 'di-dv option)))))))
+
 (defun gdocs--paragraph-text-edits (index before after entities &optional lead)
   "Return the in-place edits that turn paragraph BEFORE into AFTER.
 INDEX is the paragraph's position among the decoded tab paragraphs and
@@ -7523,10 +7622,21 @@ table is replaced whole."
               (added (seq-subseq after-cells (nth 2 hunk) (nth 3 hunk))))
           (when (or (funcall structural removed) (funcall structural added))
             (throw 'restructure :restructure))
-          (push (list :index index :offset (+ (or lead 0) (nth 0 hunk))
-                      :delete (length removed)
-                      :insert (vconcat (gdocs--created-cells (append added nil) entities)))
-                edits)))
+          (dolist (part (gdocs--hunk-parts hunk before-cells after-cells))
+            (let ((offset (+ (or lead 0) (nth 0 part))))
+              (if (eq (car (last part)) :update)
+                  (push (gdocs--dropdown-update-edit
+                         index offset (aref before-cells (nth 0 part))
+                         (aref after-cells (nth 2 part)) entities)
+                        edits)
+                (push (list :index index :offset offset
+                            :delete (- (nth 1 part) (nth 0 part))
+                            :insert (vconcat (gdocs--created-cells
+                                              (append (seq-subseq after-cells (nth 2 part)
+                                                                  (nth 3 part))
+                                                      nil)
+                                              entities)))
+                      edits))))))
       (dolist (span (gdocs--cells-restyles before-cells after-cells hunks))
         (push (list :index index :offset (+ (or lead 0) (nth 0 span)) :length (nth 1 span)
                     :from (nth 2 span) :to (nth 3 span))
@@ -7876,6 +7986,9 @@ save.  Entities left without an attachment are deleted, see
           (push (list :ot-start start :ot-end (+ start (plist-get edit :length) -1)
                       :delete-count 0 :restyle t)
                 ranges))
+         ((plist-get edit :update)
+          (setq commands (append commands (list (plist-get edit :update))))
+          (push (list :ot-start start :ot-end start :delete-count 0 :restyle t) ranges))
          ((plist-member edit :offset)
           (let ((deleted (plist-get edit :delete)))
             (when (length< body start)
@@ -8193,6 +8306,24 @@ must reuse an image already uploaded to the document."
                  (setf (alist-get 'i_ht (alist-get 'ee_eo copy))
                        (float (plist-get identity :height)))
                  copy)))
+            (:chip-dropdown
+             (let* ((definition (gdocs--dropdown-definition local-id entities))
+                    (option (gdocs--dropdown-option definition (plist-get identity :chip-value))))
+               `((dde-sii . ,(alist-get 'di-id option))
+                 (dde-fdv . ,(alist-get 'di-dv option))
+                 (dde_di . ,(alist-get 'id definition)))))
+            (:chip-placeholder
+             (let* ((label (plist-get identity :chip-value))
+                    (type (or (and previous (equal (alist-get 'et previous) "placeholder")
+                                   (equal (alist-get 'phe_dt (alist-get 'epm previous)) label)
+                                   (alist-get 'phe_pt (alist-get 'epm previous)))
+                              (gethash label (plist-get entities :placeholders))
+                              (alist-get label gdocs--placeholder-types nil nil #'equal))))
+               (unless type
+                 (user-error "gdocs: Push refused: a placeholder chip asks for %s, not %S"
+                             (string-join (mapcar #'car gdocs--placeholder-types) " or ")
+                             label))
+               `((phe_pt . ,type) (phe_dt . ,label))))
             (:chip-file
              (let* ((url (plist-get identity :chip-value))
                     (mime (or (alist-get 'fple-mt (gethash url (plist-get entities :files)))
@@ -8201,10 +8332,50 @@ must reuse an image already uploaded to the document."
                  (fple-t . ,(plist-get identity :title))
                  ,@(and mime `((fple-mt . ,mime))))))
             (_ (user-error "gdocs: Push refused: this kind of remote object cannot be created")))))
-    (cons (plist-put (copy-sequence identity) :entity-id id)
+    (cons (let ((created (plist-put (copy-sequence identity) :entity-id id)))
+            ;; A dropdown shows its option's own text, whatever was typed.
+            (if (eq kind :chip-dropdown)
+                (plist-put created :chip-value (alist-get 'dde-fdv epm))
+              created))
           `((ty . "ae")
             (et . ,(or (car (rassq kind gdocs--chip-entity-types)) "inline"))
             (id . ,id) (epm . ,epm)))))
+
+(defun gdocs--dropdown-definition (id entities)
+  "Return the `dropdown-definition' operation that ID names or uses.
+ID is a dropdown chip's entity id, or the id of a definition itself.
+ENTITIES is the document's entity table, see `gdocs--doc-entities'."
+  (let* ((by-id (plist-get entities :by-id))
+         (op (gethash id by-id))
+         (definition (if (equal (alist-get 'et op) "dropdown")
+                         (gethash (alist-get 'dde_di (alist-get 'epm op)) by-id)
+                       op)))
+    (unless (equal (alist-get 'et definition) "dropdown-definition")
+      (user-error "gdocs: Push refused: a new dropdown chip must copy an existing one, [[gdocs-chip:dropdown:ENTITY][OPTION]], from the same document"))
+    definition))
+
+(defun gdocs--dropdown-options (definition)
+  "Return the options of dropdown DEFINITION, an `ae' operation."
+  (append (alist-get 'opValue (alist-get 'cv (alist-get 'ddefe-ddi (alist-get 'epm definition))))
+          nil))
+
+(defun gdocs--dropdown-option (definition value)
+  "Return the option of dropdown DEFINITION that the chip text VALUE names.
+VALUE matches an option's text exactly, or without the brackets and
+spaces around it, ignoring case.  Signal a `user-error' that lists the
+options when none matches."
+  (let* ((options (gdocs--dropdown-options definition))
+         (bare (lambda (text)
+                 (downcase (string-trim (or text "") "[][[:space:]]+" "[][[:space:]]+")))))
+    (or (seq-find (lambda (option) (equal (alist-get 'di-dv option) value)) options)
+        (seq-find (lambda (option)
+                    (or (equal (funcall bare (alist-get 'di-dv option)) (funcall bare value))
+                        (equal (funcall bare (alist-get 'di-v option)) (funcall bare value))))
+                  options)
+        (user-error "gdocs: Push refused: %S is not an option of the dropdown %S; its options are %s"
+                    value (alist-get 'ddefe-t (alist-get 'epm definition))
+                    (mapconcat (lambda (option) (format "%S" (alist-get 'di-dv option)))
+                               options ", ")))))
 
 (defun gdocs--file-chip-mime-type (url)
   "Return the Google file type of URL for a new file chip, or nil.
@@ -8222,11 +8393,13 @@ URL the chip has no type, as Google writes for a calendar event."
 It is a plist of hash tables: `:by-id' maps an entity id to its `ae'
 operation, `:emails' a person chip's name to its email, `:images' an
 uploaded image's content id to its `ae' operation, `:files' a file
-chip's URL to its entity properties, and `:taken' holds every id in use."
+chip's URL to its entity properties, `:placeholders' a placeholder
+chip's label to its type, and `:taken' holds every id in use."
   (let ((by-id (make-hash-table :test #'equal))
         (emails (make-hash-table :test #'equal))
         (images (make-hash-table :test #'equal))
         (files (make-hash-table :test #'equal))
+        (placeholders (make-hash-table :test #'equal))
         (taken (make-hash-table :test #'equal)))
     (dolist (tab (or (plist-get state :tabs) (list state)))
       (dolist (op (or (plist-get tab :ops) (plist-get tab :ot-ops)))
@@ -8241,8 +8414,12 @@ chip's URL to its entity properties, and `:taken' holds every id in use."
               ("inline" (let ((content (alist-get 'i_cid (alist-get 'ee_eo epm))))
                           (when (stringp content) (puthash content op images))))
               ("first-party-link" (when (stringp (alist-get 'fple-u epm))
-                                    (puthash (alist-get 'fple-u epm) epm files))))))))
-    (list :by-id by-id :emails emails :images images :files files :taken taken)))
+                                    (puthash (alist-get 'fple-u epm) epm files)))
+              ("placeholder" (when (stringp (alist-get 'phe_dt epm))
+                               (puthash (alist-get 'phe_dt epm) (alist-get 'phe_pt epm)
+                                        placeholders))))))))
+    (list :by-id by-id :emails emails :images images :files files
+          :placeholders placeholders :taken taken)))
 
 (defun gdocs--created-cells (cells entities)
   "Return CELLS with each object cell turned into a new entity.
