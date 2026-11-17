@@ -1253,6 +1253,51 @@ commented item and a link; `t.kid', a child of the original tab, is empty."
     (should-error (gdocs-test--state-plan state "Task" "Task [[gdocs-chip:placeholder:new][Place]]")
                   :type 'user-error)))
 
+(defun gdocs-test--heading-state ()
+  "Return a state with a linked and an unlinked heading.
+A link also points to an id that no heading has yet."
+  (let ((body "Top\nSee here\nTarget\nTail\n"))
+    (gdocs-test--one-tab-state
+     body
+     (list (gdocs-test--paragraph-op body '(:kind :heading :level 1 :line 1))
+           '((ty . "as") (st . "paragraph") (si . 4) (ei . 4) (sm (ps_hdid . "h.a")))
+           (gdocs-test--paragraph-op body '(:kind :heading :level 1 :line 3))
+           (gdocs-test--link-range-op body "here" "?tab=t.work#heading=h.b")
+           (gdocs-test--link-range-op body "See" "?tab=t.work#heading=h.a")))))
+
+(ert-deftest gdocs-test-linked-heading-shows-its-id ()
+  "Only a heading that a link points to shows its id in a drawer."
+  (let ((body (car (gdocs--render-tab-tree (plist-get (gdocs-test--heading-state) :tabs) 7 "d"))))
+    (should (string-search "** Top\n:PROPERTIES:\n:GDOC_HEADING: h.a\n:END:\n" body))
+    (should (string-search "** Target\n\n" body))
+    (should (equal (plist-get (car (gdocs-dm-paragraphs
+                                    (gdocs-dm-from-org "* Top\n:PROPERTIES:\n:GDOC_HEADING: h.a\n:END:\n")))
+                              :heading-id)
+                   "h.a"))))
+
+(ert-deftest gdocs-test-heading-id-push ()
+  "A heading id in the Org view is given to a heading that lacks it."
+  (let* ((state (gdocs-test--heading-state))
+         (drawer "\n:PROPERTIES:\n:GDOC_HEADING: h.b\n:END:\n")
+         (existing (gdocs-test--state-plan state "** Target\n" (concat "** Target" drawer)))
+         (added (gdocs-test--state-plan state "Tail\n" (concat "Tail\n\n** New one" drawer))))
+    (should (equal (plist-get existing :commands)
+                   '(((ty . "as") (st . "paragraph") (si . 20) (ei . 20) (sm (ps_hdid . "h.b"))))))
+    (should (equal (plist-get (nth 2 (plist-get existing :expect)) :heading-id) "h.b"))
+    (should (equal (car (last (plist-get added :commands)))
+                   '((ty . "as") (st . "paragraph") (si . 33) (ei . 33) (sm (ps_hdid . "h.b")))))
+    (should-error (gdocs-test--state-plan
+                   state "** Target\n" "** Target\n:PROPERTIES:\n:GDOC_HEADING: h.a\n:END:\n")
+                  :type 'user-error)))
+
+(ert-deftest gdocs-test-paragraph-reset-uses-heading-level-zero ()
+  "Google ignores `ps_hd_i', so a heading is reset to level 0 and its id cleared."
+  (let ((sm (gdocs--copied-paragraph-sm '((ps_hd . 1) (ps_hdid . "h.a") (ps_il . 36.0)) nil)))
+    (should (equal (alist-get 'ps_hd sm) 0))
+    (should (equal (alist-get 'ps_hdid sm) ""))
+    (should (eq (alist-get 'ps_il_i sm) t))
+    (should-not (assq 'ps_hd_i sm))))
+
 (defun gdocs-test--table-state ()
   "Return a state whose tab holds a one-row table and no final newline."
   (let ((table (gdocs--emit-table-body-and-ops

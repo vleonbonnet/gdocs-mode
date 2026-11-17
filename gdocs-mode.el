@@ -4667,6 +4667,32 @@ whitespace and boundary policy."
                                      already-wrapped)))))))))
       out)))
 
+(defvar gdocs--heading-link-targets nil
+  "Heading ids that a link in the document being rendered points to.
+A heading with one of these ids shows it in a property drawer, see
+`gdocs--heading-drawer'.")
+
+(defun gdocs--heading-drawer (paragraph)
+  "Return the property drawer of heading PARAGRAPH, or the empty string.
+A heading that a link points to shows its Google heading id as
+`GDOC_HEADING', so a push can give it back to a heading that was
+recreated, and links keep working.  Other headings show none."
+  (let ((id (or (plist-get paragraph :heading-id) (plist-get paragraph :anchor))))
+    (if (and (stringp id) (member id gdocs--heading-link-targets))
+        (concat "\n:PROPERTIES:\n:GDOC_HEADING: " id "\n:END:")
+      "")))
+
+(defun gdocs--heading-link-ids (tabs)
+  "Return the sorted heading ids that links in TABS point to."
+  (let ((ids nil))
+    (dolist (tab tabs)
+      (dolist (op (plist-get tab :ops))
+        (when (and (equal (alist-get 'ty op) "as") (equal (alist-get 'st op) "link"))
+          (let ((url (gdocs--sm-link-url (alist-get 'sm op))))
+            (when (and url (string-match "[#&]heading=\\(h\\.[[:alnum:]]+\\)" url))
+              (push (match-string 1 url) ids))))))
+    (sort (delete-dups ids) :lessp #'string<)))
+
 (defun gdocs--render-heading-stars (level)
   "Return N stars for heading LEVEL, at least one.
 A tab's headings are shifted below the tab's own heading, so LEVEL may be
@@ -4758,7 +4784,7 @@ ORDINAL applies to numbered list items only — see `gdocs--render-list-bullet'.
       (:heading
        (let* ((level (or (plist-get para :level) 1))
               (stars (gdocs--render-heading-stars level)))
-         (concat stars " " text)))
+         (concat stars " " text (gdocs--heading-drawer para))))
       (:list
        (let* ((glyph (plist-get para :glyph))
               (nest (or (plist-get para :nest) 0)))
@@ -5969,7 +5995,10 @@ is intentionally excluded.  Nothing silently disappears."
             (level (plist-get props :level))
             (runs (gdocs--org-headline-runs el))
             (kind :heading)
-            (para (list :kind kind :level level :runs runs))
+            (heading-id (plist-get props :GDOC_HEADING))
+            (para (append (list :kind kind :level level :runs runs)
+                          (and (stringp heading-id)
+                               (list :heading-id (string-trim heading-id)))))
             (para (if source-spans
                       (gdocs--org-annotate-paragraph
                        para (gdocs--org-element-line-number el))
@@ -6694,6 +6723,8 @@ rendered docs.  Malformed tables are never equal."
                   (plist-get p2 :level)))
          (equal (plist-get p1 :nest) (plist-get p2 :nest))
          (equal (plist-get p1 :glyph) (plist-get p2 :glyph))
+         ;; Only an Org view carries a heading id, see `gdocs--heading-drawer'.
+         (equal (plist-get p1 :heading-id) (plist-get p2 :heading-id))
          (if (eq kind :table)
              (gdocs--table-equal-p p1 p2)
            (let ((r1 (gdocs--paragraph-runs-for-equality p1))
@@ -7719,7 +7750,11 @@ table whose rows or cells change is replaced whole."
                                           anchor before after entities located))))
               (cond
                ((and located (not (eq paragraph-edits :restructure)))
-                (setq edits (append paragraph-edits edits)))
+                (setq edits (append paragraph-edits edits))
+                (when-let* ((id (gdocs--heading-id-change after (nth anchor raw) raw)))
+                  (push (list :index anchor :heading-id id
+                              :offset (length (plist-get entry :cells)))
+                        edits)))
                ((gdocs--paragraph-equal-p before after))
                ((or located (eq (plist-get before :kind) :table))
                 ;; Replace the paragraph whole: remove it, and add the new
@@ -7808,7 +7843,8 @@ deletes first: the last added paragraph takes the final newline too."
       ;; The inserted newline now ends the old last paragraph.
       (when (gdocs--style-at context :paragraph final)
         (push `((ty . "as") (st . "paragraph") (si . ,position) (ei . ,position)
-                (sm . ,(gdocs--style-at context :paragraph final)))
+                (sm . ,(seq-remove (lambda (entry) (memq (car entry) '(ps_hd_i ps_hdid_i)))
+                                   (gdocs--style-at context :paragraph final))))
               commands))
       (when (gdocs--style-at context :list final)
         (push `((ty . "as") (st . "list") (si . ,position) (ei . ,position)
@@ -7873,8 +7909,10 @@ deletes first: the last added paragraph takes the final newline too."
                   (alist-get 'ps_hd_i paragraph-sm) :json-false))
           (when (or paragraph-sm current-paragraph)
             (push `((ty . "as") (st . "paragraph") (si . ,newline) (ei . ,newline)
-                    (sm . ,(gdocs--copied-sm current-paragraph paragraph-sm)))
+                    (sm . ,(gdocs--copied-paragraph-sm current-paragraph paragraph-sm)))
                   commands))
+          (when-let* ((id (gdocs--heading-id-change paragraph nil (plist-get context :raw))))
+            (push (gdocs--heading-id-command newline id) commands))
           (setq at (1+ newline))))
     ;; Entity and list definitions come before the text that uses them.
     (let ((ordered (nreverse commands)))
@@ -7893,7 +7931,7 @@ An addition after the last paragraph starts one past the tab's text."
   "Return the order of EDIT among edits at one position, lowest first.
 The characters at a position are restyled or replaced, and paragraphs
 removed from it, before paragraphs are added in front of it."
-  (cond ((plist-member edit :length) 0)
+  (cond ((or (plist-member edit :length) (plist-member edit :heading-id)) 0)
         ((plist-member edit :offset) 1)
         ((plist-member edit :remove) 2)
         (t 3)))
@@ -7990,6 +8028,11 @@ save.  Entities left without an attachment are deleted, see
           (push (list :ot-start start :ot-end (+ start (plist-get edit :length) -1)
                       :delete-count 0 :restyle t)
                 ranges))
+         ((plist-get edit :heading-id)
+          (setq commands (append commands
+                                 (list (gdocs--heading-id-command
+                                        start (plist-get edit :heading-id)))))
+          (push (list :ot-start start :ot-end start :delete-count 0 :restyle t) ranges))
          ((plist-get edit :update)
           (setq commands (append commands (list (plist-get edit :update))))
           (push (list :ot-start start :ot-end start :delete-count 0 :restyle t) ranges))
@@ -8081,10 +8124,13 @@ followed by the empty paragraph its newline makes, unless it ends the
 tab.  `gdocs--tab-prediction-matches-p' compares a fresh state with it."
   (let ((by-index (make-hash-table))
         (added (make-hash-table))
+        (heading-ids (make-hash-table))
         (removed nil)
         (out nil))
     (dolist (edit edits)
-      (cond ((plist-member edit :add)
+      (cond ((plist-member edit :heading-id)
+             (puthash (plist-get edit :index) (plist-get edit :heading-id) heading-ids))
+            ((plist-member edit :add)
              (puthash (plist-get edit :index)
                       (append (gethash (plist-get edit :index) added)
                               (plist-get edit :add))
@@ -8095,8 +8141,10 @@ tab.  `gdocs--tab-prediction-matches-p' compares a fresh state with it."
     (cl-flet ((emit-added (index)
                 (cl-loop for (item . rest) on (gethash index added)
                          for paragraph = (plist-get item :paragraph)
-                         do (push (list :class (gdocs--prediction-class paragraph)
-                                        :cells (gdocs--prediction-cells (plist-get item :cells)))
+                         do (push (append (list :class (gdocs--prediction-class paragraph)
+                                                :cells (gdocs--prediction-cells (plist-get item :cells)))
+                                          (and (plist-get paragraph :heading-id)
+                                               (list :heading-id (plist-get paragraph :heading-id))))
                                   out)
                          when (and (eq (plist-get paragraph :kind) :table)
                                    (or rest (length> raw index)))
@@ -8131,7 +8179,9 @@ tab.  `gdocs--tab-prediction-matches-p' compares a fresh state with it."
                                        (gdocs--prediction-cells (plist-get edit :insert))
                                        (nthcdr (+ offset (plist-get edit :delete))
                                                cells))))))
-             (list :class (gdocs--prediction-class paragraph) :cells cells))
+             (append (list :class (gdocs--prediction-class paragraph) :cells cells)
+                     (and (gethash index heading-ids)
+                          (list :heading-id (gethash index heading-ids)))))
            out))
       (emit-added (length raw)))
     (nreverse out)))
@@ -8139,7 +8189,7 @@ tab.  `gdocs--tab-prediction-matches-p' compares a fresh state with it."
 (defun gdocs--tab-prediction-matches-p (prediction state tab-id doc-id)
   "Return non-nil when TAB-ID of STATE decodes to PREDICTION.
 DOC-ID names the document.  Text, objects and Org-visible styles must
-match paragraph by paragraph."
+match paragraph by paragraph, and so must the heading ids the plan gives."
   (let* ((scoped (gdocs--state-for-tab state tab-id))
          (raw (gdocs-dm-paragraphs
                (gdocs--tab-model
@@ -8151,6 +8201,8 @@ match paragraph by paragraph."
           (lambda (paragraph expected)
             (and (equal (plist-get expected :class)
                         (gdocs--prediction-class paragraph))
+                 (or (null (plist-get expected :heading-id))
+                     (equal (plist-get expected :heading-id) (plist-get paragraph :anchor)))
                  (equal (plist-get expected :cells)
                         (gdocs--prediction-cells (gdocs--paragraph-cells paragraph)))))
           raw prediction))))
@@ -8437,6 +8489,22 @@ is the document's entity table."
               cell))
           cells))
 
+(defun gdocs--heading-id-change (paragraph remote raw)
+  "Return the heading id that local PARAGRAPH gives REMOTE, or nil.
+PARAGRAPH is a heading from the Org view and REMOTE the decoded paragraph
+it changes, or nil for a new one; RAW are all decoded tab paragraphs.  An
+id is given only when the Org drawer names one the remote heading lacks.
+An id another heading of the tab already has is refused."
+  (let ((id (plist-get paragraph :heading-id)))
+    (when (and id (eq (plist-get paragraph :kind) :heading)
+               (not (equal id (plist-get remote :anchor))))
+      (when (seq-some (lambda (other)
+                        (and (not (eq other remote)) (equal (plist-get other :anchor) id)))
+                      raw)
+        (user-error "gdocs: Push refused: the heading id %s is already used by another heading of the tab"
+                    id))
+      id)))
+
 (defun gdocs--tab-list-map (decoded new prefix suffix pairs-in-mid)
   "Return a hash table from local Org list ids to remote list ids.
 DECODED and NEW are aligned at their PREFIX and SUFFIX paragraphs and at
@@ -8545,6 +8613,26 @@ that list at its level; otherwise it starts a new list, defined once."
                                   (opValue . ,(gdocs--emit-table-col-attrs columns))))))
              (tbls_tblid . ,(gdocs--gen-table-id)))))))
 
+(defun gdocs--heading-id-command (newline id)
+  "Return the command that gives the heading ending at NEWLINE the id ID.
+Google accepts a heading id only on its own in a paragraph style."
+  `((ty . "as") (st . "paragraph") (si . ,newline) (ei . ,newline)
+    (sm (ps_hdid . ,id))))
+
+(defun gdocs--copied-paragraph-sm (current source)
+  "Return paragraph style SOURCE for a newline whose style is now CURRENT.
+Like `gdocs--copied-sm', except for the keys Google gives no `_i' flag:
+a heading level is reset to 0, normal text, and a heading id that SOURCE
+does not set is cleared with an empty string."
+  (let ((sm (seq-remove (lambda (entry) (memq (car entry) '(ps_hd_i ps_hdid_i)))
+                        (gdocs--copied-sm current source))))
+    (when (and (assq 'ps_hd current) (not (assq 'ps_hd source)))
+      (push '(ps_hd . 0) sm))
+    (when (and (assq 'ps_hdid current) (not (assq 'ps_hdid source)))
+      (setq sm (assq-delete-all 'ps_hdid sm))
+      (push '(ps_hdid . "") sm))
+    sm))
+
 (defun gdocs--surgical-remove-commands (edit context)
   "Return the commands of EDIT, which removes whole paragraphs.
 CONTEXT is the plist `gdocs--tab-surgical-commands' builds.
@@ -8581,7 +8669,7 @@ edit adds in place of the removed ones, see
              (source-text (and source (gdocs--style-at context :text source))))
         (when (or paragraph source-paragraph)
           (push `((ty . "as") (st . "paragraph") (si . ,from) (ei . ,from)
-                  (sm . ,(gdocs--copied-sm paragraph source-paragraph)))
+                  (sm . ,(gdocs--copied-paragraph-sm paragraph source-paragraph)))
                 commands))
         (cond ((alist-get 'ls_id source-list)
                (push `((ty . "as") (st . "list") (si . ,from) (ei . ,from)
@@ -8698,7 +8786,8 @@ capability reports.  The result is cached by the tab's operations."
   (let* ((key (secure-hash
                'sha1 (let ((print-length nil) (print-level nil))
                        (prin1-to-string (list (plist-get tab :ops) (plist-get tab :ot-body)
-                                              (plist-get tab :title) depth)))))
+                                              (plist-get tab :title) depth
+                                              gdocs--heading-link-targets)))))
          (cached (gethash key gdocs--tab-content-cache)))
     (or cached
         (let* ((model (copy-sequence (gdocs--tab-dm tab revision doc-id)))
@@ -8722,8 +8811,11 @@ capability reports.  The result is cached by the tab's operations."
           result))))
 
 (defun gdocs--render-tab-tree (tabs revision doc-id &optional comments)
-  "Render TABS as Org content and return (CONTENT . CAPABILITY-REPORTS)."
-  (let (parts reports)
+  "Render TABS as Org content and return (CONTENT . CAPABILITY-REPORTS).
+Headings that links in any tab point to show their id, see
+`gdocs--heading-drawer'."
+  (let ((gdocs--heading-link-targets (gdocs--heading-link-ids tabs))
+        parts reports)
     (dolist (tab tabs)
       (let* ((depth (length (plist-get tab :path)))
              (rendered (gdocs--tab-content tab revision doc-id depth))

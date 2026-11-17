@@ -324,6 +324,7 @@ Paragraphs of any kind can be added or removed whole, at any place in the tab, i
 - A new list item joins the Google list that its Org list continues, with the indentation of that list's items. An Org list that continues no Google list becomes a new Google list.
 - A table whose rows or columns change is replaced whole. Cell text edits stay in place.
 - Removing the last paragraphs of a tab leaves no empty paragraph at its end.
+- A heading that a link in the document points to shows its Google heading id in a drawer, `:GDOC_HEADING: h.example`. A new heading with that drawer gets the id, so links to a heading that was deleted and written again keep working. Adding the drawer to an existing heading gives it the id. An id that another heading of the tab has is refused.
 
 Chips and images can be added, changed and deleted:
 
