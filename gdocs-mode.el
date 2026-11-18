@@ -71,7 +71,10 @@ timestamp-sensitive headers like SAPISIDHASH inside it."
   :group 'gdocs-mode)
 
 (defcustom gdocs-push-backend 'ot-encode
-  "Which strategy to use when pushing local changes.
+  "Which strategy to use when an in-place push is refused.
+A push edits the document in place, see `gdocs--tab-push-async'.  This
+strategy applies only when the in-place plan of a single-tab document
+is refused.
 `plain' diffs the buffer text against the remote OT plain view and
 emits `is'/`ds' ops only — no style information is sent. NOT
 recommended: Google Docs re-parses literal `*…*' / `~…~' markers in
@@ -1384,21 +1387,49 @@ identified by GDOC_TAB properties, never by heading depth alone."
                               result)))))
       (nreverse result))))
 
+(defun gdocs--single-tab-state (state)
+  "Return edit STATE of a single-tab document with its body as tab `t.0'.
+The tab push, see `gdocs--tab-push-async', then edits the body in place.
+The tab is marked `:single', so its Org view is the one a single-tab
+buffer shows, see `gdocs--remote-tab-bodies'.  A STATE that already has
+tabs is returned as is."
+  (if (or (null state) (plist-get state :tabs))
+      state
+    (plist-put (copy-sequence state) :tabs
+               (list (list :id "t.0" :title nil :icon nil :path nil :single t
+                           :ops (plist-get state :ot-ops)
+                           :ot-body (or (plist-get state :ot-body) ""))))))
+
+(defun gdocs--single-tab-p (state)
+  "Return non-nil when STATE is a single-tab document seen as one tab."
+  (plist-get (car (plist-get state :tabs)) :single))
+
 (defun gdocs--remote-tab-bodies (state doc-id)
   "Return an alist of each tab id in STATE and its Org body.
 The bodies are split from the rendered outline the way
-`gdocs--local-tabs' splits a buffer, so they compare with local tabs."
+`gdocs--local-tabs' splits a buffer, so they compare with local tabs.
+A single-tab document's body is rendered as its buffer shows it, with
+Title and Subtitle keywords, see `gdocs--single-tab-state'."
   (let ((tabs (plist-get state :tabs)))
-    (gdocs--local-tabs
-     (car (gdocs--render-tab-tree tabs (plist-get state :revision) doc-id))
-     tabs)))
+    (if (gdocs--single-tab-p state)
+        (list (cons "t.0"
+                    (gdocs-dm-to-org
+                     (gdocs-dm-from-ops (plist-get state :revision) doc-id
+                                        (plist-get state :title)
+                                        (plist-get (car tabs) :ot-body)
+                                        (plist-get (car tabs) :ops)))))
+      (gdocs--local-tabs
+       (car (gdocs--render-tab-tree tabs (plist-get state :revision) doc-id))
+       tabs))))
 
 (defun gdocs--tab-push-plan (doc-id state local-body)
   "Plan one changed tab from LOCAL-BODY against freshly fetched STATE.
 Return nil for an exact no-op.  A multi-tab push saves one changed tab;
 see `gdocs--tab-change-plan' for how its changes are written."
   (let* ((tabs (plist-get state :tabs))
-         (parts (gdocs--local-tabs local-body tabs))
+         (parts (if (gdocs--single-tab-p state)
+                    (list (cons "t.0" local-body))
+                  (gdocs--local-tabs local-body tabs)))
          (remote-parts (gdocs--remote-tab-bodies state doc-id))
          (changes nil))
     (dolist (part parts)
@@ -1508,13 +1539,18 @@ anchor, so it is reported as a warning."
 (defconst gdocs--tab-save-max-attempts 5
   "Maximum /save attempts for one tab edit, counting throttled retries.")
 
-(defun gdocs--tab-push-async (doc-id buf local-rev local-body state owner)
+(defun gdocs--tab-push-async (doc-id buf local-rev local-body state owner
+                                     &optional fallback)
   "Save one changed tab of DOC-ID from LOCAL-BODY against fresh STATE.
 Each attempt is planned from the current remote state.  After every
 response, success or failure, the document is refetched and classified:
 a verified commit finalizes BUF, an untouched document after a transient
 rejection is replanned and retried, and anything else fails closed.
-OWNER is the sync mutex token and is released exactly once."
+OWNER is the sync mutex token and is released exactly once.  A
+single-tab document is pushed as its tab `t.0', see
+`gdocs--single-tab-state'.  When the first plan is refused and FALLBACK
+is non-nil, FALLBACK is called with the reason instead, and it owns the
+push from then on."
   (let ((done nil))
     (cl-labels
         ((finish (err &optional noop)
@@ -1523,25 +1559,33 @@ OWNER is the sync mutex token and is released exactly once."
              (gdocs--sync-release owner)
              (cond (err (gdocs-log 'warn "Push %s: %s" doc-id err))
                    (noop (gdocs-log 'info "Push: no local changes for %s" doc-id))
-                   (t (gdocs-log 'info "Pushed %s (tab edit, verified)" doc-id)))))
+                   (t (gdocs-log 'info "Pushed %s (in-place edit, verified)" doc-id)))))
          (buffer-unchanged-p ()
            (and (buffer-live-p buf)
                 (with-current-buffer buf
                   (equal local-body (gdocs--buffer-body-as-plain)))))
          (attempt (current n)
            (condition-case sig
-               (let ((change (gdocs--tab-push-plan doc-id current local-body)))
+               (let ((change (condition-case refusal
+                                 (gdocs--tab-push-plan doc-id current local-body)
+                               (user-error
+                                (if (and fallback (= n 1))
+                                    (progn (setq done t)
+                                           (funcall fallback (error-message-string refusal))
+                                           (throw 'gdocs--tab-push-handed-over nil))
+                                  (signal (car refusal) (cdr refusal)))))))
                  (cond
                   ((null change)
-                   (if (buffer-unchanged-p)
-                       (progn
-                         (with-current-buffer buf
-                           (gdocs--finalize-push-props
-                            (plist-get current :revision) local-body))
-                         (finish nil t))
-                     (finish "local buffer changed during push")))
+                   ;; The remote matches the body captured at dispatch; a
+                   ;; later edit stays dirty against that baseline.
+                   (when (buffer-live-p buf)
+                     (with-current-buffer buf
+                       (gdocs--finalize-push-props
+                        (plist-get current :revision) local-body)))
+                   (finish nil t))
                   ((not (equal local-rev (format "%s" (plist-get current :revision))))
-                   (finish "remote revision changed; pull before pushing"))
+                   (finish (format "refusing push: remote rev %s != local %s; pull before pushing"
+                                   (plist-get current :revision) local-rev)))
                   ((not (buffer-unchanged-p))
                    (finish "local buffer changed before save"))
                   (t (send current change n))))
@@ -1562,6 +1606,8 @@ OWNER is the sync mutex token and is released exactly once."
                   (gdocs--fetch-edit-state-async
                    doc-id
                    (lambda (fresh fetch-err)
+                     (when (gdocs--single-tab-p current)
+                       (setq fresh (gdocs--single-tab-state fresh)))
                      (condition-case sig
                          (let ((outcome
                                 (if fetch-err :conflict
@@ -1605,7 +1651,8 @@ OWNER is the sync mutex token and is released exactly once."
                              (finish (format "tab save outcome unknown (%s); pull before retrying"
                                              (or fetch-err err "unexpected remote state"))))))
                        (error (finish (error-message-string sig))))))))))))
-      (attempt state 1))))
+      (catch 'gdocs--tab-push-handed-over
+        (attempt state 1)))))
 
 (defun gdocs--recon-op-types (ops)
   "Return alist (TY . COUNT) summarising op type frequencies in OPS."
@@ -8056,17 +8103,19 @@ table whose rows or cells change is replaced whole."
 (defun gdocs--style-source-for-class (table index class attributes)
   "Return the OT position of the character text with ATTRIBUTES copies.
 The text is in a new paragraph of CLASS added near paragraph INDEX of
-TABLE; paragraphs of CLASS nearest to it are searched first."
-  (let ((index (min index (1- (length table))))
-        (predicate #'gdocs--attributes-similar-p))
-    (or (let ((entry (aref table index)))
-          (and (equal class (plist-get entry :class))
-               (gdocs--style-source-in
-                table index
-                (number-sequence 0 (1- (length (plist-get entry :cells))))
-                attributes predicate)))
-        (gdocs--style-source-nearby table index attributes predicate class)
-        (gdocs--style-source-nearby table index attributes predicate nil))))
+TABLE; paragraphs of CLASS nearest to it are searched first.  An empty
+TABLE, the body of an empty document or tab, has no source."
+  (when (length> table 0)
+    (let ((index (min index (1- (length table))))
+          (predicate #'gdocs--attributes-similar-p))
+      (or (let ((entry (aref table index)))
+            (and (equal class (plist-get entry :class))
+                 (gdocs--style-source-in
+                  table index
+                  (number-sequence 0 (1- (length (plist-get entry :cells))))
+                  attributes predicate)))
+          (gdocs--style-source-nearby table index attributes predicate class)
+          (gdocs--style-source-nearby table index attributes predicate nil)))))
 
 (defun gdocs--class-newline (table index class &optional test)
   "Return the OT position of the newline nearest INDEX in TABLE ending CLASS.
@@ -8189,6 +8238,11 @@ deletes first: the last added paragraph takes the final newline too."
                     commands)))
           (when (eq (car class) :heading)
             (setf (alist-get 'ps_hd paragraph-sm) (cadr class)
+                  (alist-get 'ps_hd_i paragraph-sm) :json-false))
+          ;; A single-tab document shows Title and Subtitle as keywords.
+          (when (memq (plist-get paragraph :kind) '(:title :subtitle))
+            (setf (alist-get 'ps_hd paragraph-sm)
+                  (if (eq (plist-get paragraph :kind) :title) 100 101)
                   (alist-get 'ps_hd_i paragraph-sm) :json-false))
           (when (or paragraph-sm current-paragraph)
             (push `((ty . "as") (st . "paragraph") (si . ,newline) (ei . ,newline)
@@ -10113,15 +10167,18 @@ anyway."
 ;;; Public commands — push
 
 (defun gdocs--current-body-hash ()
-  "SHA-256 of the buffer's pushable body and its unsent comment changes.
+  "SHA-256 of the buffer's pushable body and its unsent metadata changes.
 
 Synchronization metadata, including `GDOC_TITLE', is excluded. A body
 `#+title:' remains part of the hashed text for single-tab documents;
 the multi-tab document title is metadata.  Unsent comment changes, see
-`gdocs--comment-intents-digest', make the buffer dirty, so a sync sends
+`gdocs--comment-intents-digest', and a new multi-tab title, see
+`gdocs--local-title-intent', make the buffer dirty, so a sync sends
 them; without them the hash is the body's alone, as a push records it."
-  (let ((body (gdocs--buffer-body-as-plain))
-        (digest (gdocs--comment-intents-digest)))
+  (let* ((body (gdocs--buffer-body-as-plain))
+         (comments (gdocs--comment-intents-digest))
+         (title (gdocs--local-title-intent))
+         (digest (and (or comments title) (prin1-to-string (list comments title)))))
     (secure-hash 'sha256 (if digest (concat body "\0" digest) body))))
 
 (defun gdocs--valid-content-hash-p (hash)
@@ -11734,6 +11791,69 @@ A multi-tab document gives each tab's body, see `gdocs--remote-tab-bodies'."
       (gdocs--remote-tab-bodies state doc-id)
     (gdocs--ot-remote-org-body doc-id html state)))
 
+(defun gdocs--equivalent-revision (doc-id before before-html after after-html)
+  "Return AFTER's revision when DOC-ID reads the same as in BEFORE, or nil.
+BEFORE and AFTER are edit states and BEFORE-HTML and AFTER-HTML their
+pages.  A comment post or a rename raises the revision without changing
+the text; the buffer can then take the new revision."
+  (and after
+       (condition-case nil
+           (equal (gdocs--remote-org-view doc-id before before-html)
+                  (gdocs--remote-org-view doc-id after after-html))
+         (error nil))
+       (plist-get after :revision)))
+
+(defun gdocs--push-title-async (doc-id buf title callback)
+  "Rename DOC-ID to TITLE, the name BUF gives it, before a body push.
+The rename is sent only while the document has the name BUF last synced,
+`GDOC_TITLE'; a name changed in Google Docs too is a conflict, and
+nothing is sent.  The rename is confirmed by fetching the page again,
+then recorded in BUF, see `gdocs--record-title'.  CALLBACK = (funcall
+CB ERR BEFORE AFTER), as for `gdocs--push-comments-async'."
+  (gdocs--fetch-edit-page-async
+   doc-id
+   (lambda (state html err)
+     (let ((baseline (and (buffer-live-p buf)
+                          (with-current-buffer buf
+                            (gdocs--top-property-value "GDOC_TITLE"))))
+           (remote (and state (plist-get state :title)))
+           (record (lambda ()
+                     (when (buffer-live-p buf)
+                       (with-current-buffer buf (gdocs--record-title title))))))
+       (cond
+        (err (funcall callback err nil nil))
+        ((equal remote title)
+         (funcall record)
+         (funcall callback nil nil nil))
+        ((not (equal remote baseline))
+         (funcall callback
+                  (format "the document was also renamed to %S in Google Docs; pull, then set its title again"
+                          remote)
+                  nil nil))
+        (t
+         (gdocs--rename-post-async
+          doc-id state title
+          (lambda (post-err)
+            (if post-err
+                (funcall callback (format "rename: %s" post-err) nil nil)
+              (gdocs--fetch-edit-page-async
+               doc-id
+               (lambda (after after-html fetch-err)
+                 (cond
+                  (fetch-err
+                   (funcall callback (format "rename not confirmed: %s" fetch-err) nil nil))
+                  ((not (equal (plist-get after :title) title))
+                   (funcall callback
+                            (format "rename not confirmed: the document is named %S"
+                                    (plist-get after :title))
+                            nil nil))
+                  (t
+                   (funcall record)
+                   (gdocs-log 'info "Renamed %s to %S" doc-id title)
+                   (funcall callback nil (plist-get state :revision)
+                            (gdocs--equivalent-revision
+                             doc-id state html after after-html)))))))))))))))
+
 (defun gdocs--push-comments-async (doc-id buf intents callback)
   "Send comment INTENTS of BUF to DOC-ID, see `gdocs--local-comment-intents'.
 Fetch the edit page and the threads first; each post resends a thread
@@ -11775,12 +11895,9 @@ equivalent revision after them, or nil."
                       (lambda (after after-html fetch-err)
                         (funcall
                          callback err before
-                         (and (not fetch-err) after
-                              (condition-case nil
-                                  (equal (gdocs--remote-org-view doc-id state html)
-                                         (gdocs--remote-org-view doc-id after after-html))
-                                (error nil))
-                              (plist-get after :revision))))))))))))))))))
+                         (and (not fetch-err)
+                              (gdocs--equivalent-revision
+                               doc-id state html after after-html))))))))))))))))))
 
 (defun gdocs-debug-comments-fetch (&optional doc-id)
   "Interactive: dump the /docos/p/sync response + parsed comment threads.
@@ -13817,7 +13934,8 @@ revision was stale.
 The command returns after dispatch.  A package-wide synchronization lock skips
 overlapping work and remains held until the asynchronous chain finishes.
 Failures are logged as warnings.  Comment changes in the `* Comments'
-subtree are sent first, see `gdocs--local-comment-intents'.  A successful
+subtree, see `gdocs--local-comment-intents', and a new multi-tab
+`#+title:', see `gdocs--push-title-async', are sent first.  A successful
 save or verified no-op updates GDOC_REVISION, GDOC_CONTENT_HASH, and
 GDOC_SYNCED_AT and marks the buffer
 synced.  After an ambiguous post-dispatch failure, refetch and compare the
@@ -13838,35 +13956,51 @@ writing a final hash baseline."
             (unless (and local-rev (not (string-empty-p local-rev)))
               (user-error "gdocs: no GDOC_REVISION on this buffer — pull first"))
             (let* ((found (gdocs--local-comment-intents))
-                   (intents (car found)))
+                   (intents (car found))
+                   (title (gdocs--local-title-intent)))
               (when (> (cdr found) 0)
                 (gdocs-log 'warn
                            "Push %s: %d new comment thread%s not sent; a new thread needs an anchor in the text, add it in Google Docs"
                            doc-id (cdr found) (if (= (cdr found) 1) " is" "s are")))
-              (if (null intents)
+              (if (not (or intents title))
                   (gdocs--push-remotely-async-1
                    doc-id buf local-rev local-body owner)
-                ;; Comments do not change the document revision, so they
-                ;; are sent first; the body push then runs as usual.
-                (gdocs--push-comments-async
-                 doc-id buf intents
-                 (lambda (err before after)
-                   (when err
-                     (gdocs-log 'warn "Push %s: comments: %s" doc-id err))
-                   ;; The posts raised the revision without changing the
-                   ;; text: a buffer in sync before them is in sync after.
-                   (when (and after (equal local-rev (format "%s" before))
-                              (buffer-live-p buf))
-                     (setq local-rev (format "%s" after))
-                     (with-current-buffer buf
-                       (gdocs--put-top-property "GDOC_REVISION" local-rev)))
-                   (condition-case sig
-                       (gdocs--push-remotely-async-1
-                        doc-id buf local-rev local-body owner)
-                     (error
-                      (gdocs--sync-release owner)
-                      (gdocs-log 'warn "Push %s: %s" doc-id
-                                 (error-message-string sig))))))))
+                ;; Comments and the name are sent first; the body push
+                ;; then runs as usual.
+                (cl-labels
+                    ((step-done (what err before after)
+                       (when err
+                         (gdocs-log 'warn "Push %s: %s: %s" doc-id what err))
+                       ;; The step raised the revision without changing the
+                       ;; text: a buffer in sync before it is in sync after.
+                       (when (and after (equal local-rev (format "%s" before))
+                                  (buffer-live-p buf))
+                         (setq local-rev (format "%s" after))
+                         (with-current-buffer buf
+                           (gdocs--put-top-property "GDOC_REVISION" local-rev))))
+                     (body ()
+                       (condition-case sig
+                           (gdocs--push-remotely-async-1
+                            doc-id buf local-rev local-body owner)
+                         (error
+                          (gdocs--sync-release owner)
+                          (gdocs-log 'warn "Push %s: %s" doc-id
+                                     (error-message-string sig)))))
+                     (rename ()
+                       (if (null title)
+                           (body)
+                         (gdocs--push-title-async
+                          doc-id buf title
+                          (lambda (err before after)
+                            (step-done "rename" err before after)
+                            (body))))))
+                  (if (null intents)
+                      (rename)
+                    (gdocs--push-comments-async
+                     doc-id buf intents
+                     (lambda (err before after)
+                       (step-done "comments" err before after)
+                       (rename)))))))
             (setq dispatched t))
         (unless dispatched
           (gdocs--sync-release owner))))))
@@ -13909,54 +14043,60 @@ completion or error."
              (funcall release "missing token/ouid/rev"))
             ((plist-get state :tabs)
              (setq done t)
+             ;; The document's name, the `#+title:' line, is sent before,
+             ;; see `gdocs--push-title-async'.
              (condition-case sig
-                 (if (with-current-buffer buf
-                       (save-excursion
-                         (goto-char (point-min))
-                         (and (re-search-forward
-                               "^#\\+title:[ \t]*\\(.*\\)$" nil t)
-                              (equal (match-string-no-properties 1)
-                                     (plist-get state :title)))))
-                     (gdocs--tab-push-async
-                      doc-id buf local-rev local-body state owner)
-                   (progn
-                     (gdocs--sync-release owner)
-                     (gdocs-log 'warn
-                                "Push %s: document title changed locally; rename separately"
-                                doc-id)))
+                 (gdocs--tab-push-async
+                  doc-id buf local-rev local-body state owner)
                (error
                 (gdocs--sync-release owner)
                 (gdocs-log 'warn "Push %s: %s" doc-id
                            (error-message-string sig)))))
             (t
-             (condition-case sig
-                 (let* ((remote-body
-                         (gdocs--ot-remote-org-body doc-id html state))
-                        (plan (gdocs--push-plan-for-diff
-                               state local-body remote-body)))
-                   ;; STATE and HTML came from the current /edit fetch above;
-                   ;; preflight decodes their raw ops again rather than trusting
-                   ;; any capability summary serialized in the buffer.
-                   (gdocs--push-preflight state local-body plan)
-                   (cond
-                    ((eq (plist-get plan :kind) :noop)
-                     (when (buffer-live-p buf)
-                       (with-current-buffer buf
-                         (gdocs--finalize-push-props remote-rev local-body)))
-                     (when (funcall release nil)
-                       (gdocs-log 'info "Push: no local changes for %s" doc-id)))
-                    ((not (string= local-rev (format "%s" remote-rev)))
-                     (funcall release
-                              (format
-                               "refusing push: remote rev %s != local %s"
-                               remote-rev local-rev)))
-                    (t
-                     (gdocs--apply-push-async
-                      doc-id state local-body remote-body buf
-                      (lambda (_rev e2)
-                        (funcall release e2))))))
-               (error
-                (funcall release (error-message-string sig))))))))))))
+             ;; A single-tab body is edited in place like a tab, so comment
+             ;; anchors and styles Org does not show stay.  What that plan
+             ;; refuses falls back to `gdocs-push-backend'.
+             (gdocs--tab-push-async
+              doc-id buf local-rev local-body (gdocs--single-tab-state state) owner
+              (lambda (reason)
+                (gdocs-log 'info "Push %s: in-place edit refused (%s); using %s"
+                           doc-id reason gdocs-push-backend)
+                (gdocs--push-single-tab-whole doc-id buf local-rev local-body
+                                              state html release)))))))))))
+
+(defun gdocs--push-single-tab-whole (doc-id buf local-rev local-body state html release)
+  "Push LOCAL-BODY of BUF to single-tab DOC-ID with `gdocs-push-backend'.
+STATE and HTML are the fresh edit state and page, and LOCAL-REV the
+buffer's revision.  RELEASE ends the push, with an error or nil."
+  (let ((remote-rev (plist-get state :revision)))
+    (condition-case sig
+        (let* ((remote-body
+                (gdocs--ot-remote-org-body doc-id html state))
+               (plan (gdocs--push-plan-for-diff
+                      state local-body remote-body)))
+          ;; STATE and HTML came from the current /edit fetch above;
+          ;; preflight decodes their raw ops again rather than trusting
+          ;; any capability summary serialized in the buffer.
+          (gdocs--push-preflight state local-body plan)
+          (cond
+           ((eq (plist-get plan :kind) :noop)
+            (when (buffer-live-p buf)
+              (with-current-buffer buf
+                (gdocs--finalize-push-props remote-rev local-body)))
+            (when (funcall release nil)
+              (gdocs-log 'info "Push: no local changes for %s" doc-id)))
+           ((not (string= local-rev (format "%s" remote-rev)))
+            (funcall release
+                     (format
+                      "refusing push: remote rev %s != local %s"
+                      remote-rev local-rev)))
+           (t
+            (gdocs--apply-push-async
+             doc-id state local-body remote-body buf
+             (lambda (_rev e2)
+               (funcall release e2))))))
+      (error
+       (funcall release (error-message-string sig))))))
 
 (defun gdocs-debug-push-state (&optional doc-id out-file)
   "Dump everything `gdocs-push-remotely' sees into OUT-FILE for inspection.
@@ -14069,110 +14209,205 @@ without logging raw content."
 ;; concurrently changed revision, and verifies the committed result by
 ;; refetching it.
 
-(defconst gdocs-drive-rename-base
-  "https://drivefrontend-pa.clients6.google.com/drive/v3/files"
-  "Cookie-authenticated Drive file endpoint used by the editors frontend.
-
-The documented googleapis.com Drive API requires OAuth; the editors'
-own frontend proxy accepts the browser's SAPISIDHASH authorization
-derived from the same cookie jar the /save protocol uses.")
-
 (defcustom gdocs-drive-oauth-token nil
   "Optional OAuth access token with the Drive `drive.file' scope.
 
 When non-nil, document renames use `Authorization: Bearer' on the
-Google Drive API, which is the reliable path (Google's current
-frontends reject cookie-only Drive API calls with 401/403).  When nil,
-the rename falls back to the browser's SAPISIDHASH authorization and
-silently gives up after the first rejection."
+Google Drive API.  When nil, they use the request the Docs editor sends,
+with the browser's cookies, see `gdocs--rename-in-editor-async'."
   :type '(choice (const :tag "None" nil) string)
   :group 'gdocs-mode)
 
-(defvar gdocs--drive-rename-gave-up nil
-  "Non-nil after a cookie-authenticated rename was rejected once.
-Avoids log-spamming the failure on every publish for the session.")
+(defun gdocs--chrome-url (doc-id state)
+  "Return the URL of DOC-ID's document settings endpoint for STATE.
+The Docs editor posts the document's title there."
+  (format "%s%s/chrome?id=%s&token=%s&ouid=%s&includes_info_params=true&cros_files=false&nded=false&tab=%s"
+          gdocs--export-base doc-id doc-id
+          (url-hexify-string (or (plist-get state :token) ""))
+          (or (plist-get state :ouid) "")
+          (url-hexify-string gdocs-docs-tab)))
 
-(defun gdocs--cookie-value (name)
-  "Return cookie NAME's value from the auth function's Cookie header, or nil."
-  (let ((cookie (cdr (assoc "Cookie" (gdocs--auth-headers)))))
-    (and (stringp cookie)
-         (string-match (concat "\\(?:^\\|;\\s-*\\)"
-                               (regexp-quote name) "=\\([^;]+\\)")
-                       cookie)
-         (match-string 1 cookie))))
+(defun gdocs--rename-post-async (doc-id state title callback)
+  "Post TITLE as the name of DOC-ID, as the Docs editor does.
+STATE is a fresh edit state, which holds the session token.  The body is
+`title=TITLE'; Google answers an empty object.  CALLBACK = (funcall CB
+ERR), ERR nil when Google accepted the request."
+  (if (not (and (plist-get state :token) (plist-get state :ouid)))
+      (funcall callback "the edit page has no session token")
+    (gdocs--curl-async
+     (gdocs--chrome-url doc-id state) "POST"
+     (cons '("Content-Type" . "application/x-www-form-urlencoded;charset=utf-8")
+           (gdocs--docos-headers doc-id))
+     (concat "title=" (url-hexify-string title))
+     (lambda (_raw code err)
+       (funcall callback
+                (cond (err err)
+                      ((and (integerp code) (>= code 200) (< code 300)) nil)
+                      (t (format "HTTP %s" code))))))))
 
-(defun gdocs--sapisidhash-header ()
-  "Build the SAPISIDHASH Authorization header, or nil without a SAPISID.
-The hash is bound to the docs.google.com origin because that is the
-origin the browser session (and therefore the SAPISID cookie) is
-associated with."
-  (let ((sapisid (gdocs--cookie-value "SAPISID")))
-    (when (and sapisid (not (string-empty-p sapisid)))
-      (let* ((ts (format-time-string "%s"))
-             (origin "https://docs.google.com")
-             (hash (secure-hash 'sha1 (concat ts " " origin " " sapisid))))
-        (format "SAPISIDHASH %s_%s" ts hash)))))
+(defun gdocs--rename-in-editor-async (doc-id title callback)
+  "Rename DOC-ID to TITLE with the Docs editor's request, then check it.
+The edit page is fetched for its session token, the title is posted,
+see `gdocs--rename-post-async', and the page is fetched again: the
+rename is confirmed when its title is TITLE.  CALLBACK = (funcall CB
+TITLE ERR)."
+  (gdocs--fetch-edit-state-async
+   doc-id
+   (lambda (state err)
+     (if err
+         (funcall callback nil err)
+       (gdocs--rename-post-async
+        doc-id state title
+        (lambda (post-err)
+          (if post-err
+              (funcall callback nil post-err)
+            (gdocs--fetch-edit-state-async
+             doc-id
+             (lambda (after fetch-err)
+               (cond
+                (fetch-err (funcall callback nil (format "rename not confirmed: %s" fetch-err)))
+                ((equal (plist-get after :title) title) (funcall callback title nil))
+                (t (funcall callback nil
+                            (format "rename not confirmed: the document is named %S"
+                                    (plist-get after :title))))))))))))))
 
 (defun gdocs-rename-remotely (doc-id title callback)
   "Rename the Drive document DOC-ID to TITLE asynchronously.
 CALLBACK is called exactly once as `(funcall CALLBACK TITLE ERR)'.
 
-With `gdocs-drive-oauth-token' the rename uses the documented Drive API
-and reliably succeeds.  Without a token the browser's SAPISIDHASH
-authorization is attempted; Google currently rejects it (the cookie
-session lacks the Drive scope), so the first rejection sets
-`gdocs--drive-rename-gave-up' and later renames skip the request with a
-nil CALLBACK result and a \"not available\" error."
-  (cond
-   (gdocs-drive-oauth-token
-    (let* ((url (format "https://www.googleapis.com/drive/v3/files/%s"
-                        doc-id))
-           (headers (append
-                     `(("Content-Type" . "application/json; charset=utf-8")
-                       ("Authorization" . ,(concat "Bearer "
-                                                   gdocs-drive-oauth-token)))
-                     (gdocs--auth-headers)))
-           (data (encode-coding-string (json-encode `((name . ,title)))
-                                       'utf-8)))
-      (gdocs--curl-async url "PATCH" headers data
-                         (lambda (_raw code err)
-                           (cond
-                            (err (funcall callback nil err))
-                            ((and (integerp code) (>= code 200) (< code 300))
-                             (funcall callback title nil))
-                            (t
-                             (funcall callback nil (format "HTTP %s" code))))))))
-   (gdocs--drive-rename-gave-up
-    (funcall callback nil "Drive rename unavailable without gdocs-drive-oauth-token"))
-   (t
-    (let* ((url (format "%s/%s?fields=name" gdocs-drive-rename-base doc-id))
-           (headers (append
-                     `(("Content-Type" . "application/json; charset=utf-8")
-                       ("Origin" . "https://docs.google.com")
-                       ("X-Goog-AuthUser" . "0")
-                       ("Referer" . "https://docs.google.com/")
-                       ("User-Agent" . ,gdocs-default-user-agent))
-                     (gdocs--auth-headers)
-                     (let ((auth (gdocs--sapisidhash-header)))
-                       (and auth (list (cons "Authorization" auth))))))
-           (data (encode-coding-string (json-encode `((name . ,title))) 'utf-8)))
-      (gdocs--curl-async url "PATCH" headers data
-                         (lambda (_raw code err)
-                           (cond
-                            (err (funcall callback nil err))
-                            ((and (integerp code) (>= code 200) (< code 300))
-                             (funcall callback title nil))
-                            ;; Cookie-authenticated Drive calls are
-                            ;; forbidden on Google's current frontends;
-                            ;; don't retry on every publish.
-                            ((memq code '(401 403))
-                             (setq gdocs--drive-rename-gave-up t)
-                             (funcall
-                              callback
-                              nil
-                              "Drive rename requires gdocs-drive-oauth-token (cookie authorization rejected)"))
-                            (t
-                             (funcall callback nil (format "HTTP %s" code))))))))))
+With `gdocs-drive-oauth-token' the rename uses the documented Drive API.
+Without one it sends the request the Docs editor sends, with the
+browser's cookies, and confirms it, see `gdocs--rename-in-editor-async'."
+  (let ((title (string-trim (or title ""))))
+    (cond
+     ((string-empty-p title)
+      (funcall callback nil "a document title cannot be empty"))
+     (gdocs-drive-oauth-token
+      (let* ((url (format "https://www.googleapis.com/drive/v3/files/%s"
+                          doc-id))
+             (headers (append
+                       `(("Content-Type" . "application/json; charset=utf-8")
+                         ("Authorization" . ,(concat "Bearer "
+                                                     gdocs-drive-oauth-token)))
+                       (gdocs--auth-headers)))
+             (data (encode-coding-string (json-serialize `((name . ,title)))
+                                         'utf-8)))
+        (gdocs--curl-async url "PATCH" headers data
+                           (lambda (_raw code err)
+                             (cond
+                              (err (funcall callback nil err))
+                              ((and (integerp code) (>= code 200) (< code 300))
+                               (funcall callback title nil))
+                              (t
+                               (funcall callback nil (format "HTTP %s" code))))))))
+     (t (gdocs--rename-in-editor-async doc-id title callback)))))
+
+(defun gdocs--multi-tab-title-line ()
+  "Return the bounds of a multi-tab buffer's `#+title:' line, or nil.
+In a multi-tab buffer that line names the document, see
+`gdocs--ot-decode-pipeline'; its value is group 1 of the match data."
+  (when (gdocs--top-property-value "GDOC_TABS")
+    (save-excursion
+      (goto-char (point-min))
+      (when (re-search-forward "^#\\+title:[ \t]*\\(.*?\\)[ \t]*$" nil t)
+        (cons (match-beginning 0) (match-end 0))))))
+
+(defun gdocs--record-title (title)
+  "Record TITLE as the current buffer's document name.
+It goes in `GDOC_TITLE', in the `#+title:' line of a multi-tab buffer,
+and in the name of a buffer that visits no file."
+  (gdocs--put-top-property "GDOC_TITLE" title)
+  (when-let* ((line (gdocs--multi-tab-title-line)))
+    (save-excursion
+      (goto-char (car line))
+      (delete-region (car line) (cdr line))
+      (insert "#+title: " title)))
+  (unless (buffer-file-name)
+    (rename-buffer (format "%s.org" title) t)))
+
+(defun gdocs--local-title-intent ()
+  "Return the new name a multi-tab buffer gives its document, or nil.
+Its `#+title:' line names the document; it asks for a rename when it
+differs from `GDOC_TITLE', the name at the last sync."
+  (when-let* ((line (gdocs--multi-tab-title-line))
+              (title (save-excursion
+                       (goto-char (car line))
+                       (looking-at "^#\\+title:[ \t]*\\(.*?\\)[ \t]*$")
+                       (match-string-no-properties 1))))
+    (unless (or (string-empty-p title)
+                (equal title (gdocs--top-property-value "GDOC_TITLE")))
+      title)))
+
+(defun gdocs-rename (title)
+  "Rename the current buffer's Google Doc to TITLE.
+The buffer's `GDOC_TITLE', the `#+title:' line of a multi-tab buffer,
+and the name of a buffer that visits no file follow."
+  (interactive
+   (list (read-string "New document title: "
+                      (gdocs--top-property-value "GDOC_TITLE"))))
+  (let ((doc-id (gdocs--get-doc-id nil))
+        (buf (current-buffer)))
+    (gdocs-rename-remotely
+     doc-id title
+     (lambda (renamed err)
+       (if err
+           (gdocs-log 'warn "Rename %s: %s" doc-id err)
+         (when (buffer-live-p buf)
+           (with-current-buffer buf
+             (gdocs--record-title renamed)))
+         (gdocs-log 'info "Renamed %s to %S" doc-id renamed))))))
+
+(defcustom gdocs-create-account 0
+  "Index of the signed-in Google account that new documents belong to.
+It is the N of the browser's `/u/N/' URLs; 0 is the default account,
+the one `docs.new' uses.  Without it, Google may create the document in
+another signed-in account."
+  :type 'natnum
+  :group 'gdocs-mode)
+
+(defun gdocs--create-url ()
+  "Return the URL whose GET creates a new Google Doc, as `docs.new' does.
+The answer is the new document's editor page.  The document belongs to
+the account `gdocs-create-account'."
+  (format "https://docs.google.com/document/u/%d/create" gdocs-create-account))
+
+(defun gdocs--created-doc-id (html)
+  "Return the id of the document whose editor page is HTML, or nil."
+  (and (stringp html)
+       (string-match "\"docs-ci\":\"\\([-_A-Za-z0-9]+\\)\"" html)
+       (match-string 1 html)))
+
+(defun gdocs--create-async (title callback)
+  "Create a Google Doc, named TITLE when it is not empty.
+CALLBACK = (funcall CB DOC-ID ERR).  A document that was created but
+could not be renamed has both a DOC-ID and an ERR."
+  (gdocs--make-request-async
+   (gdocs--create-url) "GET" nil 'buffer-string
+   (lambda (html err)
+     (let ((doc-id (and (not err) (gdocs--created-doc-id html))))
+       (cond
+        (err (funcall callback nil err))
+        ((null doc-id) (funcall callback nil "the new document's page has no id"))
+        ((string-empty-p (string-trim (or title "")))
+         (funcall callback doc-id nil))
+        (t (gdocs-rename-remotely
+            doc-id title
+            (lambda (_renamed rename-err)
+              (funcall callback doc-id
+                       (and rename-err (format "rename: %s" rename-err)))))))))))
+
+(defun gdocs-create (title)
+  "Create a Google Doc named TITLE and open it, see `gdocs-open'.
+An empty TITLE keeps Google's \"Untitled document\"."
+  (interactive (list (read-string "Title of the new document: ")))
+  (gdocs--create-async
+   title
+   (lambda (doc-id err)
+     (when err
+       (gdocs-log 'warn "Create %s: %s" (or doc-id title) err))
+     (when doc-id
+       (gdocs-log 'info "Created %s%s/edit" gdocs--export-base doc-id)
+       (gdocs-open doc-id)))))
 
 (defun gdocs--doc-body-title (doc)
   "Return DOC's body title (the first Title-kind paragraph's text), or nil."

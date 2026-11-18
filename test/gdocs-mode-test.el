@@ -2378,6 +2378,39 @@ string payloads are represented by their lengths."
     (concat ")]}'\n"
             (json-encode (vector (vector "sr" bundles 1700000000000))))))
 
+(ert-deftest gdocs-test-single-tab-empty-doc-gets-its-first-paragraphs ()
+  "A new, empty single-tab document takes text, and a Title keeps its style."
+  (let* ((state (gdocs--single-tab-state (list :revision 1 :ot-body "" :ot-ops nil)))
+         (plan (plist-get (gdocs--tab-push-plan "d" state "#+title: Plan\n\nFirst\n")
+                          :plan))
+         (commands (plist-get plan :commands)))
+    (should (equal (car commands) '((ty . "is") (ibi . 1) (s . "Plan\nFirst"))))
+    (should (equal (seq-filter (lambda (command) (equal (alist-get 'st command) "paragraph"))
+                               commands)
+                   '(((ty . "as") (st . "paragraph") (si . 5) (ei . 5)
+                      (sm (ps_hd . 100))))))))
+
+(ert-deftest gdocs-test-single-tab-edit-inside-a-comment-anchor-is-in-place ()
+  "Text typed inside commented text of a single-tab doc keeps the comment.
+The old whole-document replacement would have dropped the anchor."
+  (let* ((body "Title line\nAlpha beta gamma\n")
+         (ops (list (gdocs-test--insert-op body)
+                    '((ty . "as") (st . "paragraph") (si . 11) (ei . 11)
+                      (sm (ps_hd . 100) (ps_hd_i . :json-false)))
+                    (gdocs-test--anchor-op 23 27 "kix.comment")))
+         (state (gdocs--single-tab-state
+                 (list :revision 4 :title "Doc" :ot-body body :ot-ops ops)))
+         (shown (cdr (car (gdocs--remote-tab-bodies state "d"))))
+         (change (gdocs--tab-push-plan
+                  "d" state (string-replace "gamma" "gamXma" shown)))
+         (plan (plist-get change :plan)))
+    ;; The single tab shows as the buffer does: the Title as a keyword.
+    (should (equal shown "#+title: Title line\n\nAlpha beta gamma\n"))
+    (should (equal (plist-get change :tab-id) "t.0"))
+    (should (equal (plist-get plan :commands) '(((ty . "is") (ibi . 26) (s . "X")))))
+    (should (equal (plist-get plan :expect-ids) '("kix.comment")))
+    (should-not (gdocs--tab-push-plan "d" state shown))))
+
 (defun gdocs-test--anchor-op (start end id)
   "Construct a synthetic `doco_anchor' style op.
 END is the inclusive final OT position."
@@ -4103,7 +4136,6 @@ END is the inclusive final OT position."
 (ert-deftest gdocs-test-rename-uses-bearer-when-token-configured ()
   "With an OAuth token the rename PATCHes the Drive API with Bearer auth."
   (let* ((gdocs-drive-oauth-token "token-123")
-         (gdocs--drive-rename-gave-up nil)
          (captured nil)
          (gdocs-auth-function (lambda () (list (cons "Cookie" "x=1")))))
     (cl-letf (((symbol-function 'gdocs--curl-async)
@@ -4120,25 +4152,125 @@ END is the inclusive final OT position."
         (should (string-match-p "Bearer token-123"
                                 (prin1-to-string (nth 2 captured))))))))
 
-(ert-deftest gdocs-test-rename-without-token-stops-after-rejection ()
-  "The cookie-authenticated rename gives up after the first 401/403."
-  (let* ((gdocs-drive-oauth-token nil)
-         (gdocs--drive-rename-gave-up nil)
-         (gdocs-auth-function (lambda () (list (cons "Cookie" "SAPISID=s"))))
-         (attempts 0))
-    (cl-letf (((symbol-function 'gdocs--curl-async)
-               (lambda (_url _method _headers _body callback)
-                 (cl-incf attempts)
-                 (funcall callback nil 403 nil))))
-      (let ((first :pending))
-        (gdocs-rename-remotely "doc-id" "T" (lambda (_t err) (setq first err)))
-        (should first)
-        (should (string-match-p "requires gdocs-drive-oauth-token" first)))
-      ;; The second call short-circuits without a request.
-      (let ((second :pending))
-        (gdocs-rename-remotely "doc-id" "T" (lambda (_t err) (setq second err)))
-        (should (string-match-p "unavailable" second)))
-      (should (= attempts 1)))))
+(defmacro gdocs-test--with-editor-pages (titles requests &rest body)
+  "Run BODY with edit pages named by TITLES, one per fetch, recording REQUESTS.
+Each request to Google is pushed to REQUESTS as (URL METHOD BODY)."
+  (declare (indent 2))
+  `(let ((pages ,titles))
+     (cl-letf (((symbol-function 'gdocs--fetch-edit-state-async)
+                (lambda (_doc callback)
+                  (funcall callback (list :token "tok:1" :ouid "42" :revision 5
+                                          :title (pop pages))
+                           nil)))
+               ((symbol-function 'gdocs--fetch-edit-page-async)
+                (lambda (_doc callback)
+                  (funcall callback (list :token "tok:1" :ouid "42" :revision 5
+                                          :title (pop pages))
+                           "html" nil)))
+               ((symbol-function 'gdocs--docos-headers) (lambda (&rest _) nil))
+               ((symbol-function 'gdocs--curl-async)
+                (lambda (url method _headers data callback)
+                  (push (list url method data) ,requests)
+                  (funcall callback ")]}'\n{}" 200 nil))))
+       ,@body)))
+
+(ert-deftest gdocs-test-rename-uses-the-editor-request-and-confirms-it ()
+  "Without a token a rename posts the title as the Docs editor does."
+  (let ((gdocs-drive-oauth-token nil)
+        (requests nil)
+        (result nil))
+    (gdocs-test--with-editor-pages '("Old" "New & name") requests
+      (gdocs-rename-remotely "doc" " New & name "
+                             (lambda (&rest args) (setq result args))))
+    (should (equal result '("New & name" nil)))
+    (should (equal requests
+                   `((,(concat gdocs--export-base "doc/chrome?id=doc&token=tok%3A1&ouid=42"
+                               "&includes_info_params=true&cros_files=false&nded=false&tab=t.0")
+                      "POST" "title=New%20%26%20name"))))
+    ;; A page that still shows another name means the rename did not hold.
+    (gdocs-test--with-editor-pages '("Old" "Old") requests
+      (gdocs-rename-remotely "doc" "New" (lambda (&rest args) (setq result args))))
+    (should (equal result '(nil "rename not confirmed: the document is named \"Old\"")))
+    (gdocs-rename-remotely "doc" "  " (lambda (&rest args) (setq result args)))
+    (should (equal result '(nil "a document title cannot be empty")))))
+
+(ert-deftest gdocs-test-create-reads-the-new-id-and-names-it ()
+  "Creating a document reads its id from the editor page, then renames it."
+  (let ((gdocs-drive-oauth-token nil)
+        (requests nil)
+        (result nil))
+    (should (equal (gdocs--created-doc-id "x,\"docs-ci\":\"1aB-c_9\",y") "1aB-c_9"))
+    (gdocs-test--with-editor-pages '("Untitled document" "Plan") requests
+      (cl-letf (((symbol-function 'gdocs--make-request-async)
+                 (lambda (url method _data _parser callback)
+                   (push (list url method nil) requests)
+                   (funcall callback "<html>\"docs-ci\":\"1new\"</html>" nil))))
+        (gdocs--create-async "Plan" (lambda (&rest args) (setq result args)))))
+    (should (equal result '("1new" nil)))
+    (should (equal (mapcar #'cadr (reverse requests)) '("GET" "POST")))
+    (should (equal (car (car (last requests)))
+                   "https://docs.google.com/document/u/0/create"))))
+
+(defmacro gdocs-test--with-multi-tab-buffer (&rest body)
+  "Run BODY in a multi-tab buffer named \"Old\" at revision 5."
+  (declare (indent 0))
+  `(with-temp-buffer
+     (insert ":PROPERTIES:\n:GDOC_ID: d\n:GDOC_TITLE: Old\n:GDOC_REVISION: 5\n"
+             ":GDOC_TABS: 1\n:END:\n#+title: Old\n\n* Tab\n:PROPERTIES:\n"
+             ":GDOC_TAB: t.0\n:END:\nText\n")
+     (org-mode)
+     ,@body))
+
+(ert-deftest gdocs-test-multi-tab-title-edit-is-a-rename ()
+  "Editing a multi-tab `#+title:' makes the buffer dirty and renames on push."
+  (gdocs-test--with-multi-tab-buffer
+    (let ((clean (gdocs--current-body-hash))
+          (requests nil)
+          (result nil))
+      (should-not (gdocs--local-title-intent))
+      (goto-char (point-min))
+      (re-search-forward "^#\\+title: Old")
+      (replace-match "#+title: New" t t)
+      (should (equal (gdocs--local-title-intent) "New"))
+      (should-not (equal clean (gdocs--current-body-hash)))
+      (gdocs-test--with-editor-pages '("Old" "New") requests
+        (cl-letf (((symbol-function 'gdocs--equivalent-revision) (lambda (&rest _) 7)))
+          (gdocs--push-title-async "d" (current-buffer) "New"
+                                   (lambda (&rest args) (setq result args)))))
+      (should (equal result '(nil 5 7)))
+      (should (equal (nth 2 (car requests)) "title=New"))
+      (should (equal (gdocs--top-property-value "GDOC_TITLE") "New"))
+      (should-not (gdocs--local-title-intent))
+      (should (equal clean (gdocs--current-body-hash))))))
+
+(ert-deftest gdocs-test-multi-tab-rename-refuses-a-remote-rename ()
+  "A name changed in Google Docs too is a conflict: nothing is sent."
+  (gdocs-test--with-multi-tab-buffer
+    (let ((requests nil) (result nil))
+      (gdocs-test--with-editor-pages '("Theirs") requests
+        (gdocs--push-title-async "d" (current-buffer) "Mine"
+                                 (lambda (&rest args) (setq result args))))
+      (should-not requests)
+      (should (string-match-p "also renamed to \"Theirs\"" (car result)))
+      (should (equal (gdocs--top-property-value "GDOC_TITLE") "Old")))))
+
+(ert-deftest gdocs-test-push-renames-before-the-body ()
+  "A push with a new title renames first, then pushes from the new revision."
+  (gdocs-test--with-multi-tab-buffer
+    (goto-char (point-min))
+    (re-search-forward "^#\\+title: Old")
+    (replace-match "#+title: New" t t)
+    (let ((calls nil))
+      (cl-letf (((symbol-function 'gdocs--push-title-async)
+                 (lambda (_doc-id _buf title callback)
+                   (push (list :rename title) calls)
+                   (funcall callback nil 5 6)))
+                ((symbol-function 'gdocs--push-remotely-async-1)
+                 (lambda (_doc-id _buf rev _body owner)
+                   (push (list :body rev) calls)
+                   (gdocs--sync-release owner))))
+        (gdocs-push-remotely))
+      (should (equal (nreverse calls) '((:rename "New") (:body "6")))))))
 
 (ert-deftest gdocs-test-publish-preview-discloses-fallbacks-and-blocks ()
   "Publication analysis surfaces lossy conversions and blocking content."
@@ -5831,25 +5963,29 @@ re-emits the last paragraph so its paragraph style is written again."
                      "old-hash"))
       (should (equal gdocs--last-synced-hash "old-baseline")))))
 
-(ert-deftest gdocs-test-public-async-image-bearing-push-is-refused ()
-  "The public async push entry point refuses images before /save.
+(ert-deftest gdocs-test-public-async-image-push-edits-in-place ()
+  "A single-tab push replaces an image paragraph in place, not the document.
 
-`gdocs-push-remotely' reports asynchronous failures through its warning log
-and has no public completion callback. Wrap the low-level callback anyway so
-that a removed preflight guard would be observed as an unexpected success."
+The image is deleted with its own character and the new text inserted;
+the rest of the body, and anything anchored in it, is not rewritten.
+The configured backend, which would replace the whole document, is not
+used."
   (let* ((fixture (gdocs-test--inline-case "one-image-between-paragraphs"))
          (body (plist-get fixture :body))
          (ops (plist-get fixture :ops))
          (state (list :revision 17 :token "token" :ouid "ouid"
                       :ot-body body :ot-ops ops))
+         (after-body "Before\nChanged\nAfter\n")
+         (after (list :revision 18 :token "token" :ouid "ouid"
+                      :ot-body after-body
+                      :ot-ops (cons (gdocs-test--insert-op after-body)
+                                    (seq-filter (lambda (op)
+                                                  (equal (alist-get 'ty op) "ae"))
+                                                ops))))
          (html (gdocs-test--html-for-ops 17 ops))
-         (error-message nil)
-         (failure-report-count 0)
-         (fetch-callback-count 0)
-         (save-called nil)
-         (transport-called nil)
-         (completion-callback-count 0)
-         (success-callback nil)
+         (warnings nil)
+         (commands nil)
+         (apply-called nil)
          (gdocs-push-backend 'ot-encode)
          (gdocs--sync-mutex nil))
     (with-temp-buffer
@@ -5859,54 +5995,36 @@ that a removed preflight guard would be observed as an unexpected success."
               ":END:\n\n"
               "Before\nChanged\nAfter\n")
       (org-mode)
-      ;; Do not inherit either an error or an invocation flag from another
-      ;; operation: these values belong exclusively to this public call.
-      (setq error-message nil
-            failure-report-count 0
-            fetch-callback-count 0
-            save-called nil
-            transport-called nil
-            completion-callback-count 0
-            success-callback nil)
-      (let ((original-apply (symbol-function 'gdocs--apply-push-async)))
-        (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
-                   (lambda (_doc callback)
-                     (cl-incf fetch-callback-count)
-                     (funcall callback state html nil)))
-                  ((symbol-function 'gdocs--save-request-async)
-                   (lambda (_doc _state _commands callback)
-                     (setq save-called t)
-                     ;; If the guard is removed, complete the synthetic save
-                     ;; so the wrapped callback exposes a false success.
-                     (funcall callback
-                              '((metadata . ((serverRevision . 18)))) nil)))
-                  ((symbol-function 'gdocs--curl-async)
-                   (lambda (&rest _args) (setq transport-called t)))
-                  ((symbol-function 'gdocs-log)
-                   (lambda (level format-string &rest args)
-                     (when (eq level 'warn)
-                       (cl-incf failure-report-count)
-                       (setq error-message (apply #'format format-string args)))))
-                  ((symbol-function 'gdocs--apply-push-async)
-                   (lambda (doc-id push-state local-body remote-body buffer callback)
-                     (funcall original-apply
-                              doc-id push-state local-body remote-body buffer
-                              (lambda (revision err)
-                                (cl-incf completion-callback-count)
-                                (when (and revision (null err))
-                                  (setq success-callback t))
-                                (funcall callback revision err))))))
-          (gdocs-push-remotely "synthetic-image-document"))))
-    (should (= fetch-callback-count 1))
-    (should (= failure-report-count 1))
-    (should (string-match-p "refusing push" error-message))
-    (should (string-match-p "inline image" error-message))
-    (should (string-match-p "pull remains available" error-message))
-    (should-not save-called)
-    (should-not transport-called)
-    (should (= completion-callback-count 0))
-    (should-not success-callback)
-    (should-not gdocs--sync-mutex)))
+      (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
+                 (lambda (_doc callback) (funcall callback state html nil)))
+                ((symbol-function 'gdocs--save-request-async)
+                 (lambda (_doc _state sent callback)
+                   (setq commands sent)
+                   (funcall callback nil nil)))
+                ((symbol-function 'gdocs--fetch-edit-state-async)
+                 (lambda (_doc callback) (funcall callback after nil)))
+                ((symbol-function 'gdocs--apply-push-async)
+                 (lambda (&rest _) (setq apply-called t)))
+                ((symbol-function 'gdocs-log)
+                 (lambda (level format-string &rest args)
+                   (when (eq level 'warn)
+                     (push (apply #'format format-string args) warnings)))))
+        (gdocs-push-remotely "synthetic-image-document"))
+      (should-not warnings)
+      (should-not apply-called)
+      ;; The image paragraph is removed whole with its entity, and the new
+      ;; paragraph inserted; Before and After stay.
+      (should (equal (seq-filter (lambda (command)
+                                   (member (alist-get 'ty command) '("ds" "de")))
+                                 commands)
+                     '(((ty . "de") (id . "kix.synthetic-image-one") (et . "inline"))
+                       ((ty . "ds") (si . 8) (ei . 9)))))
+      (should (equal (alist-get 's (seq-find (lambda (command)
+                                               (equal (alist-get 'ty command) "is"))
+                                             commands))
+                     "Changed\n"))
+      (should (equal (org-entry-get (point-min) "GDOC_REVISION") "18"))
+      (should-not gdocs--sync-mutex))))
 
 (ert-deftest gdocs-test-capability-preflight-allows-supported-text-only ()
   "A supported text-only incremental edit passes capability preflight."
@@ -8349,7 +8467,8 @@ that a removed preflight guard would be observed as an unexpected success."
       (should-not gdocs--sync-mutex)))
   (let ((gdocs--sync-mutex t)
         (called nil)
-        (arguments nil))
+        (arguments nil)
+        (in-place nil))
     (cl-letf (((symbol-function 'gdocs--fetch-edit-page-async)
                (lambda (_doc callback)
                  (funcall callback
@@ -8359,12 +8478,20 @@ that a removed preflight guard would be observed as an unexpected success."
                           "synthetic-html" nil)))
               ((symbol-function 'gdocs--ot-remote-org-body)
                (lambda (&rest _args) "remote"))
+              ;; A single-tab body is pushed in place as tab `t.0'; when
+              ;; that plan is refused, the configured backend takes over.
+              ((symbol-function 'gdocs--tab-push-async)
+               (lambda (_doc _buf _rev _body state _owner fallback)
+                 (setq in-place (mapcar (lambda (tab) (plist-get tab :id))
+                                        (plist-get state :tabs)))
+                 (funcall fallback "refused")))
               ((symbol-function 'gdocs--apply-push-async)
                (lambda (_doc _state local remote _buffer callback)
                  (setq called t arguments (list local remote))
                  (funcall callback 8 nil))))
       (gdocs--push-remotely-async-1
        "synthetic-id" nil "7" "local" gdocs--sync-mutex)
+      (should (equal in-place '("t.0")))
       (should called)
       (should (equal arguments '("local" "remote")))
       (should-not gdocs--sync-mutex))))

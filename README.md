@@ -42,11 +42,7 @@ A thread with an unambiguous anchor gets a reserved `[fn:gdocs-comment-N]`
 reference in the text. Only these references and the generated subtree are  
 stripped before a body push; ordinary numeric and named Org footnotes remain  
 content. Pull fails visibly if the remote body already uses the reserved namespace.
-- **Push** — converts the local Org buffer back to Google Docs format and
-writes it remotely. The configured `gdocs-push-backend` determines whether the
-push is a full replacement/re-encoding, a model-level incremental update, or a
-legacy plain-text diff. A push does not always update existing sections in
-place.
+- **Push** — writes the changes of the local Org buffer to the remote document in place: only the changed characters are deleted, inserted or restyled, see [Usage](#usage). In a single-tab document, a change that the in-place plan cannot express falls back to `gdocs-push-backend`, see [Push backends](#push-backends).
 - **Auto-sync** — a periodic timer (`run-with-timer`) polls the remote revision
 every `gdocs-auto-sync-interval` seconds. Its decision table is:
 
@@ -74,7 +70,7 @@ in Org opens it through `gdocs-mode` instead of the browser.
 
 ### Push backends
 
-`gdocs-push-backend` defaults to `ot-encode`:
+A push edits the document in place, see [Usage](#usage). The backends below apply only when the in-place plan of a single-tab document is refused; the push then logs the reason. `gdocs-push-backend` defaults to `ot-encode`:
 
 | Backend | Behavior |
 |---------|----------|
@@ -177,7 +173,7 @@ as an explicit remote placeholder such as:
 #+gdocs_inline_object: image kix.example 468x102 content-id=s-blob-v1-IMAGE-example
 ```
 
-The placeholder is metadata, not prose and not an Org image link. Its entity ID, object kind, content ID, and dimensions form its stable identity. Do not edit, remove, move, or recreate it and then push: a full-replacement push is refused rather than silently deleting the remote image. A safe incremental edit may proceed only when the remote image is matched to its unchanged local placeholder and the edit range is proven not to touch it. In a single-tab document, image creation, deletion, movement, duplication, metadata changes, and ambiguous entity-to-placeholder associations remain refused. A push to a multi-tab document can delete and copy images, see [Usage](#usage).
+The placeholder is metadata, not prose and not an Org image link. Its entity ID, object kind, content ID, and dimensions form its stable identity. Do not edit, remove, move, or recreate it and then push: a full-replacement push is refused rather than silently deleting the remote image. A safe incremental edit may proceed only when the remote image is matched to its unchanged local placeholder and the edit range is proven not to touch it. A push can delete and copy images, see [Usage](#usage); a fallback full replacement in a single-tab document refuses any image change.
 
 Smart chips follow the same policy with `date`/`person`/`file`/`dropdown`/`placeholder` object  
 kinds. They render as Org chip links such as  
@@ -188,9 +184,9 @@ kinds. They render as Org chip links such as
 `[[gdocs-chip:placeholder:kix.example][Person]]`; Org hides the target and shows  
 only the description. The chip's semantic value (calendar date, contact name, file URL and title, dropdown option, or placeholder label)  
 is the editable-identity field: an unchanged chip is preserved by incremental  
-edits that do not touch it. In a single-tab document, creating, deleting,  
-moving, or editing a chip is refused before any `/save`. A push to a multi-tab  
-document can create, change and delete chips, see [Usage](#usage).
+edits that do not touch it. A push can create, change and delete chips, see  
+[Usage](#usage); a fallback full replacement in a single-tab document refuses  
+any chip change.
 
 ## Requirements
 
@@ -306,6 +302,8 @@ a documented OAuth-capable API.
 | Command               | What it does                                                   |
 |-----------------------|----------------------------------------------------------------|
 | `gdocs-open`          | Open a Google Docs URL or document ID (or the link at point).  |
+| `gdocs-create`        | Create a Google Doc with a title and open it.                  |
+| `gdocs-rename`        | Rename the current buffer's Google Doc.                        |
 | `gdocs-pull-locally`  | Fetch remote content and rewrite the local buffer.             |
 | `gdocs-push-remotely` | Push local Org changes back to the remote document.            |
 | `gdocs-out-of-date`   | Check whether the remote document has advanced.                |
@@ -336,9 +334,9 @@ performs an initial pull. `gdocs-mode` auto-enables in any Org buffer that
 carries a `GDOC_ID` property, and the mode line shows an indicator while it is
 active.
 
-For a document with multiple tabs, pull puts every tab in the same Org buffer. Each tab is a heading with a `GDOC_TAB` property; nested tabs become nested headings, and headings within a tab are shifted below its heading. The document name appears once as the file's `#+title:`. A tab emoji appears both in its heading and in `GDOC_TAB_ICON`. The document's original tab may have an icon and may sit anywhere in the tab order. An empty tab pulls as an empty heading. Opening a URL with `?tab=…` moves to that tab after pull. Single-tab documents keep their existing unwrapped layout.
+For a document with multiple tabs, pull puts every tab in the same Org buffer. Each tab is a heading with a `GDOC_TAB` property; nested tabs become nested headings, and headings within a tab are shifted below its heading. The document name appears once as the file's `#+title:`; editing that line renames the document on the next push. A tab emoji appears both in its heading and in `GDOC_TAB_ICON`. The document's original tab may have an icon and may sit anywhere in the tab order. An empty tab pulls as an empty heading. Opening a URL with `?tab=…` moves to that tab after pull. Single-tab documents keep their existing unwrapped layout.
 
-Push to a multi-tab document saves one changed tab per push. Changes inside existing paragraphs, including headings, list items and table cells, are written in place: only the changed characters are deleted, inserted or restyled. Colors, fonts, comments, bookmarks, chips, and paragraph and list formatting stay on the text they belong to. Google gives inserted text the style of the character before it, so new text that should look different copies the full style of the nearest text with the same link and code formatting. Org may show a paragraph with less styling than it has, for example without an underline that Org cannot express; text inserted next to text that looks the same in Org takes that text's real style.
+A push writes changes in place, in a single-tab document as in each tab of a multi-tab one; a single-tab document is handled as its one tab. A push to a multi-tab document saves one changed tab per push. Changes inside existing paragraphs, including headings, list items and table cells, are written in place: only the changed characters are deleted, inserted or restyled. Colors, fonts, comments, bookmarks, chips, and paragraph and list formatting stay on the text they belong to. Google gives inserted text the style of the character before it, so new text that should look different copies the full style of the nearest text with the same link and code formatting. Org may show a paragraph with less styling than it has, for example without an underline that Org cannot express; text inserted next to text that looks the same in Org takes that text's real style.
 
 A restyle of a paragraph's whole text, such as striking a whole list item, also restyles its newline and its bullet, as the Google Docs editor does.
 
@@ -395,6 +393,14 @@ These properties are maintained on the top-level node of every synced buffer:
 | `GDOC_SYNCED_AT` | Timestamp of the last successful pull, push, or verified no-op.|
 | `GDOC_TABS` | Number of tabs in the pulled multi-tab document. |
 
+### Creating and renaming documents
+
+`M-x gdocs-create` asks for a title, creates a Google Doc as `docs.new` does, names it and opens it. The document belongs to the signed-in account `gdocs-create-account`, the N of the browser's `/u/N/` URLs. Without an explicit account, Google can put it in another signed-in account.
+
+`M-x gdocs-rename` renames the current buffer's document; `GDOC_TITLE`, the `#+title:` line of a multi-tab buffer and a file-less buffer's name follow. In a multi-tab buffer, editing the `#+title:` line also renames the document: it makes the buffer dirty, and the push renames it before the body, but only while Google still has the name of the last sync. If the document was renamed in Google Docs too, nothing is renamed and the push warns.
+
+A rename sends the request the Docs editor sends, with the browser's cookies, and is confirmed by fetching the page again. With `gdocs-drive-oauth-token` set, it uses the Drive API instead.
+
 ## Configuration
 
 | Variable                  | Default     | Purpose                                                  |
@@ -403,6 +409,8 @@ These properties are maintained on the top-level node of every synced buffer:
 | `gdocs-push-backend`      | `ot-encode` | Push strategy; see [Push backends](#push-backends).      |
 | `gdocs-verify-after-save` | `t`         | Refetch after a committed OT save and verify the body.   |
 | `gdocs-docs-tab`          | `"t.0"`     | Google Docs tab identifier for `/save` and comment requests. |
+| `gdocs-create-account`    | `0`         | Signed-in account (`/u/N/`) that `gdocs-create` creates documents in. |
+| `gdocs-drive-oauth-token` | `nil`       | Optional OAuth token; renames then use the Drive API.    |
 | `gdocs-publish-registry-file` | `~/.emacs.d/gdocs-publish-registry.el` | Source-file → document publication registry. |
 | `gdocs-auto-sync-interval`| `5`         | Seconds between periodic background sync checks.         |
 | `gdocs-log-level`         | `warn`      | One of `debug`, `info`, `warn`, `error`.                |
@@ -475,6 +483,6 @@ used for reads but do not support `/save`; there is no hardened credential story
 yet.
 - **Format fidelity is best-effort.** Headings, paragraphs, inline emphasis, lists, tables, and code blocks round-trip.
 - **Disclosed fallbacks, not silent loss.** Blocks the remote model cannot represent (quote/verse/center/example/special blocks, footnote definitions, horizontal rules, fixed-width lines) keep their text as ordinary content with a disclosed fallback instead of disappearing. Inline leaves (timestamps, entities, LaTeX fragments, footnote references, macros) are literalized in prose. Source-block language, the partial checkbox state `[-]`, and rich Google-only formatting such as font sizes have no faithful round trip.
-- **Inline images are placeholders.** Image bytes are never downloaded or uploaded. In a multi-tab document, push can delete an image or copy one already in the document. In a single-tab document, push only keeps images untouched.
+- **Inline images are placeholders.** Image bytes are never downloaded or uploaded. A push can delete an image or copy one already in the document.
 - **Comments**: a push sends new replies and resolves or reopens threads. It cannot start a new thread, edit or delete a comment, or post as anyone but you. Suggestions and column layouts remain out of scope.
 - **Rate limiting.** Google's `/save` endpoint rejects malformed or excessively bursty requests; the mode persists a session SID to look like a single stable client.  The endpoint reads that SID as a signed 64-bit integer and permanently refuses one with the top bit set (HTTP 550 / err 13), so the mode only generates SIDs below 2^63 and replaces an out-of-range SID it finds in `gdocs-session-file`.
