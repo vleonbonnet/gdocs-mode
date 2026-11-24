@@ -970,11 +970,25 @@ See `gdocs--local-comment-intents'."
 
 ;;; Public commands — pull
 
+(defun gdocs--model-chunk-parts-ops (parts)
+  "Return the ops of PARTS, the `parts' array of a modelChunk assignment.
+Google's /edit page wraps a chunk's ops as
+{\"parts\":[{\"commands\":[OP …]}, …],\"revision\":N}; each part's ops
+follow the previous part's."
+  (let (ops)
+    (dolist (part parts)
+      (when (consp part)
+        (setq ops (append ops (or (alist-get 'commands part)
+                                  (alist-get 'chunk part))))))
+    ops))
+
 (defun gdocs--parse-model-chunks-raw (html)
   "Iterate every `DOCS_modelChunk = …' assignment in HTML and return a
 list of (CHUNK-OPS . REVISION) pairs in document order. Large docs are
 split across multiple chunks; reading only the first under-reports both
-the body and the ops stream."
+the body and the ops stream.  An assignment carries its ops either as
+{\"chunk\":[OP …]} or, in the current /edit page, as
+{\"parts\":[{\"commands\":[OP …]}]}."
   (when html
     (let (out)
       (with-temp-buffer
@@ -985,7 +999,9 @@ the body and the ops stream."
               (let* ((json-array-type 'list)
                      (json-object-type 'alist)
                      (obj (json-read))
-                     (chunk (cdr (assq 'chunk obj)))
+                     (chunk (or (alist-get 'chunk obj)
+                                (gdocs--model-chunk-parts-ops
+                                 (alist-get 'parts obj))))
                      (revision (cdr (assq 'revision obj))))
                 (when chunk
                   (push (cons chunk revision) out)))
@@ -9243,6 +9259,12 @@ existing Title/Subtitle behavior."
          (ot-body (plist-get state :ot-body))
          (edit-title (plist-get state :title))
          (tabs (plist-get state :tabs))
+         ;; No ops and no body means the page carried no model chunks this
+         ;; package can read.  Rendering that as an empty document would
+         ;; show a blank buffer and invite a push over the real content.
+         (_decoded (unless (or ops ot-body tabs)
+                     (error "gdocs: could not decode the document model of %s"
+                            doc-id)))
          (doc (unless tabs (gdocs-dm-from-ops revision doc-id edit-title
                                               (or ot-body "") ops)))
          (rendered-tabs (and tabs (gdocs--render-tab-tree tabs revision doc-id)))

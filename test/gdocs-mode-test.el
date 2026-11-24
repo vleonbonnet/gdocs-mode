@@ -2491,6 +2491,39 @@ END is the inclusive final OT position."
     (should (= (plist-get parsed :revision) 1))
     (should (equal (plist-get parsed :ot-body) ""))))
 
+(ert-deftest gdocs-test-parse-parts-model-chunks ()
+  "Chunks that wrap their ops in parts[].commands parse like chunk ops."
+  (let* ((assign
+          (lambda (revision &rest parts)
+            (format "<script>DOCS_modelChunk = %s; DOCS_modelChunk = undefined;</script>"
+                    (json-serialize
+                     `((parts . ,(vconcat
+                                  (mapcar (lambda (ops)
+                                            `((commands . ,(vconcat ops))))
+                                          parts)))
+                       (revision . ,revision))))))
+         (html (concat
+                (funcall assign 5
+                         (list (gdocs-test--insert-op "first part\n"))
+                         (list (gdocs-test--insert-op "second part\n")))
+                (funcall assign 6
+                         (list (gdocs-test--insert-op "next chunk\n")))))
+         (raw (gdocs--parse-model-chunks-raw html))
+         (full (gdocs--parse-model-chunk-full html))
+         (parsed (gdocs--parse-model-chunk html)))
+    (should (length= raw 2))
+    (should (length= (plist-get full :ops) 3))
+    (should (= (plist-get parsed :revision) 6))
+    (should (equal (plist-get parsed :ot-body)
+                   "first part\nsecond part\nnext chunk\n"))))
+
+(ert-deftest gdocs-test-pull-refuses-undecodable-model ()
+  "A page whose model can't be decoded is an error, not an empty document."
+  (let* ((html "<html><script>DOCS_modelChunk = {\"unknown\":[]};</script></html>")
+         (state (gdocs--parse-edit-state-html html)))
+    (should-not (plist-get state :ot-body))
+    (should-error (gdocs--ot-decode-pipeline "synthetic" html state))))
+
 (ert-deftest gdocs-test-structural-codepoint-mapping ()
   "Plain text drops structure while retaining exact OT positions."
   (let* ((ot (concat "A" (string gdocs--ot-table-open) "B"
