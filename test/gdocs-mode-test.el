@@ -3386,6 +3386,19 @@ END is the inclusive final OT position."
                    (gdocs-test--model-view round-trip)))
     (should (equal org (gdocs-dm-to-org round-trip)))))
 
+(ert-deftest gdocs-test-table-cell-trailing-newlines-round-trip ()
+  "A newline that ends a cell reads back without its boundary escape.
+Org trims the space after the last escape of a cell."
+  (dolist (text '("ends with a newline\n" "two at the end\n\n" "a\n\nb"))
+    (let* ((doc (gdocs-dm-make-doc
+                 :paragraphs
+                 (list (list :kind :table :cols 2
+                             :rows (list (list (list (gdocs-dm-make-run text))
+                                               (list (gdocs-dm-make-run "next"))))))))
+           (round-trip (gdocs-dm-from-org (gdocs-dm-to-org doc))))
+      (should (equal (gdocs-test--model-view doc)
+                     (gdocs-test--model-view round-trip))))))
+
 (ert-deftest gdocs-test-table-mixed-newlines-normalize-to-one-newline ()
   "CRLF, lone CR, and LF each become one reversible table-cell newline."
   (let* ((text "crlf\r\ncr\rlf\nend")

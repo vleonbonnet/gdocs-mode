@@ -5498,15 +5498,17 @@ a different document-model value."
                 (string-to-char gdocs--org-table-escape-sentinel)))
         (push gdocs--org-table-escape-sentinel out)
         (setq i (+ i 2)))
-       ((and (<= (+ i (length gdocs--org-table-boundary-qualifier) 1) n)
+       ((and (<= (+ i (length gdocs--org-table-boundary-qualifier)) n)
              (string= gdocs--org-table-boundary-qualifier
                       (substring text i
                                  (+ i (length
                                        gdocs--org-table-boundary-qualifier))))
-             (= (aref text (+ i (length
-                                 gdocs--org-table-boundary-qualifier)))
-                ?\s))
-        (setq i (+ i (length gdocs--org-table-boundary-qualifier) 1)))
+             ;; Org trims the space after a boundary that ends the cell.
+             (or (= (+ i (length gdocs--org-table-boundary-qualifier)) n)
+                 (= (aref text (+ i (length
+                                     gdocs--org-table-boundary-qualifier)))
+                    ?\s)))
+        (setq i (min n (+ i (length gdocs--org-table-boundary-qualifier) 1))))
        ((or (and (<= (+ i (length gdocs--org-table-pipe-qualifier)) n)
                  (string= gdocs--org-table-pipe-qualifier
                           (substring text i
